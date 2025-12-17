@@ -1,0 +1,173 @@
+=============================================
+Author:        AAVA
+Created on:   
+Description:   Convert Azure Synapse stored procedures into equivalent Databricks PySpark code
+=============================================
+
+# Databricks PySpark Script: Load Sales Fact Table (Converted from Synapse Stored Procedure)
+# ------------------------------------------------------------------------------------------
+# Loads cleaned sales transactions from staging to Fact_Sales Delta table.
+# Performs data quality checks, audit logging, and error handling.
+# Handles invalid data, logs failures, and optimizes for Delta Lake.
+# ------------------------------------------------------------------------------------------
+
+import uuid
+from datetime import datetime
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+
+# ------------------------------------------
+# 1. Variable Assignments (Metadata & Audit)
+# ------------------------------------------
+batch_id = str(uuid.uuid4())
+start_time = datetime.utcnow()
+proc_name = "sp_load_sales_fact"
+rows_inserted = 0
+rows_rejected = 0
+error_message = None
+
+# Helper function for audit logging
+def log_audit(batch_id, proc_name, start_time, status, message, end_time=None, rows_inserted=None, rows_rejected=None):
+    audit_data = {
+        "Batch_ID": batch_id,
+        "Procedure_Name": proc_name,
+        "Start_Time": start_time,
+        "End_Time": end_time,
+        "Rows_Inserted": rows_inserted,
+        "Rows_Rejected": rows_rejected,
+        "Status": status,
+        "Message": message
+    }
+    df = spark.createDataFrame([audit_data])
+    df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable("dw.Audit_Log")
+
+# Helper function for DQ failure logging
+def log_dq_failures(invalid_rows_df, batch_id):
+    if invalid_rows_df is not None and invalid_rows_df.count() > 0:
+        dq_failures_df = (
+            invalid_rows_df
+            .withColumn("Logged_Timestamp", F.current_timestamp())
+            .withColumn("Batch_ID", F.lit(batch_id))
+            .select(
+                F.col("Transaction_ID"),
+                F.col("Reason").alias("Failure_Reason"),
+                F.col("Logged_Timestamp"),
+                F.col("Batch_ID")
+            )
+        )
+        dq_failures_df.write.format("delta").mode("append").saveAsTable("dw.DQ_Failures")
+
+# Start Audit Logging
+log_audit(batch_id, proc_name, start_time, status="STARTED", message="Sales Fact Load Initiated")
+
+try:
+    # ------------------------------------------
+    # 2. Load Staging Data
+    # ------------------------------------------
+    stg_sales_df = spark.table("stg.Sales_Transactions")
+    dim_customer_df = spark.table("dw.Dim_Customer")
+    dim_date_df = spark.table("dw.Dim_Date")
+
+    # ------------------------------------------
+    # 3. Data Quality Checks
+    # ------------------------------------------
+    # Invalid: Missing Customer_ID
+    invalid_missing_customer = (
+        stg_sales_df
+        .filter(F.col("Customer_ID").isNull())
+        .select(F.col("Transaction_ID"), F.lit("Missing CustomerID").alias("Reason"))
+    )
+    # Invalid: Quantity <= 0 (including null)
+    invalid_quantity = (
+        stg_sales_df
+        .filter((F.col("Quantity").isNull()) | (F.col("Quantity") <= 0))
+        .select(F.col("Transaction_ID"), F.lit("Invalid Quantity").alias("Reason"))
+    )
+    # Union all invalids
+    invalid_rows_df = invalid_missing_customer.unionByName(invalid_quantity).dropDuplicates(["Transaction_ID"])
+
+    # ------------------------------------------
+    # 4. Remove Invalid Rows from Staging
+    # ------------------------------------------
+    # Get valid transactions
+    invalid_ids = [row["Transaction_ID"] for row in invalid_rows_df.collect()]
+    if invalid_ids:
+        valid_sales_df = stg_sales_df.filter(~F.col("Transaction_ID").isin(invalid_ids))
+        rows_rejected = len(invalid_ids)
+    else:
+        valid_sales_df = stg_sales_df
+        rows_rejected = 0
+
+    # ------------------------------------------
+    # 5. Transform & Load Cleaned Data into Fact Table
+    # ------------------------------------------
+    # Join with dimension tables
+    transformed_df = (
+        valid_sales_df
+        .join(dim_customer_df, on="Customer_ID", how="inner")
+        .join(dim_date_df, valid_sales_df["Sales_Date"].cast(T.DateType()) == dim_date_df["Date_Value"], how="inner")
+        .select(
+            valid_sales_df["Transaction_ID"],
+            valid_sales_df["Customer_ID"],
+            valid_sales_df["Product_ID"],
+            valid_sales_df["Sales_Date"],
+            valid_sales_df["Quantity"],
+            valid_sales_df["Unit_Price"],
+            (valid_sales_df["Quantity"] * valid_sales_df["Unit_Price"]).alias("Total_Sales_Amount"),
+            dim_date_df["Region_ID"],
+            dim_customer_df["Customer_Segment"],
+            F.current_timestamp().alias("Load_Timestamp"),
+            F.lit(batch_id).alias("Batch_ID")
+        )
+    )
+
+    # Write to Delta Fact Table (append mode)
+    transformed_df.write.format("delta").mode("append").saveAsTable("dw.Fact_Sales")
+    rows_inserted = transformed_df.count()
+
+    # ------------------------------------------
+    # 6. Truncate Staging Table
+    # ------------------------------------------
+    # Delta Lake: Overwrite with empty DataFrame
+    empty_stg_df = stg_sales_df.limit(0)
+    empty_stg_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("stg.Sales_Transactions")
+
+    # ------------------------------------------
+    # 7. Log Validation Failures
+    # ------------------------------------------
+    log_dq_failures(invalid_rows_df, batch_id)
+
+    # ------------------------------------------
+    # 8. End Audit Log
+    # ------------------------------------------
+    end_time = datetime.utcnow()
+    log_audit(
+        batch_id,
+        proc_name,
+        start_time,
+        status="COMPLETED",
+        message=f"Inserted {rows_inserted} rows; Rejected {rows_rejected} rows.",
+        end_time=end_time,
+        rows_inserted=rows_inserted,
+        rows_rejected=rows_rejected
+    )
+
+except Exception as e:
+    end_time = datetime.utcnow()
+    error_message = str(e)
+    log_audit(
+        batch_id,
+        proc_name,
+        start_time,
+        status="FAILED",
+        message=error_message,
+        end_time=end_time,
+        rows_inserted=rows_inserted,
+        rows_rejected=rows_rejected
+    )
+    raise
+
+# ------------------------------------------
+# 9. API Cost Reporting
+# ------------------------------------------
+apiCost: 0.2500 USD
