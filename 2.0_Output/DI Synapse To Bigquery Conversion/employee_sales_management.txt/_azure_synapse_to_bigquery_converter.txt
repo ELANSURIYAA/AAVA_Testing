@@ -1,0 +1,140 @@
+=============================================
+Author:        AAVA
+Created on:   
+Description:   Loads sales fact table with data quality validation and audit logging, migrated from Azure Synapse to BigQuery.
+=============================================
+
+-- BigQuery SQL Script: Sales Fact Table Loading with Data Quality Validation and Audit Logging
+
+CREATE OR REPLACE PROCEDURE dw.sp_load_sales_fact()
+BEGIN
+  -- Variable declarations
+  DECLARE batch_id STRING DEFAULT GENERATE_UUID();
+  DECLARE start_time DATETIME DEFAULT CURRENT_DATETIME();
+  DECLARE end_time DATETIME;
+  DECLARE rows_inserted INT64 DEFAULT 0;
+  DECLARE rows_rejected INT64 DEFAULT 0;
+  DECLARE error_message STRING DEFAULT '';
+  DECLARE proc_name STRING DEFAULT 'dw.sp_load_sales_fact';
+
+  -- Start Audit Logging
+  INSERT INTO dw.Audit_Log (
+    Batch_ID,
+    Procedure_Name,
+    Start_Time,
+    Status,
+    Message
+  )
+  VALUES (
+    batch_id,
+    proc_name,
+    start_time,
+    'STARTED',
+    'Sales Fact Load Initiated'
+  );
+
+  -- Temporary table for validation failures (using temp table via scripting)
+  CREATE TEMP TABLE InvalidRows AS
+  SELECT CAST(NULL AS INT64) AS Transaction_ID, CAST(NULL AS STRING) AS Reason
+  WHERE FALSE;
+
+  -- Basic Data Quality Checks
+  INSERT INTO InvalidRows (Transaction_ID, Reason)
+  SELECT Transaction_ID, 'Missing CustomerID'
+  FROM stg.Sales_Transactions
+  WHERE Customer_ID IS NULL;
+
+  INSERT INTO InvalidRows (Transaction_ID, Reason)
+  SELECT Transaction_ID, 'Invalid Quantity'
+  FROM stg.Sales_Transactions
+  WHERE Quantity <= 0;
+
+  -- Delete Invalid Rows from Staging for This Batch
+  DELETE FROM stg.Sales_Transactions
+  WHERE Transaction_ID IN (SELECT Transaction_ID FROM InvalidRows);
+
+  SET rows_rejected = (SELECT COUNT(*) FROM InvalidRows);
+
+  -- Load Cleaned Data into Fact Table
+  INSERT INTO dw.Fact_Sales (
+    Transaction_ID,
+    Customer_ID,
+    Product_ID,
+    Sales_Date,
+    Quantity,
+    Unit_Price,
+    Total_Sales_Amount,
+    Region_ID,
+    Customer_Segment,
+    Load_Timestamp,
+    Batch_ID
+  )
+  WITH transformed AS (
+    SELECT
+      s.Transaction_ID,
+      s.Customer_ID,
+      s.Product_ID,
+      s.Sales_Date,
+      s.Quantity,
+      s.Unit_Price,
+      s.Quantity * s.Unit_Price AS Total_Sales_Amount,
+      d.Region_ID,
+      c.Customer_Segment,
+      CURRENT_DATETIME() AS Load_Timestamp,
+      batch_id AS Batch_ID
+    FROM stg.Sales_Transactions s
+    INNER JOIN dw.Dim_Customer c
+      ON s.Customer_ID = c.Customer_ID
+    INNER JOIN dw.Dim_Date d
+      ON DATE(s.Sales_Date) = d.Date_Value
+  )
+  SELECT *
+  FROM transformed;
+
+  SET rows_inserted = (SELECT COUNT(*) FROM transformed);
+
+  -- Truncate Staging Table (BigQuery does not support TRUNCATE, so use DELETE)
+  DELETE FROM stg.Sales_Transactions WHERE TRUE;
+
+  -- Log Validation Failures
+  INSERT INTO dw.DQ_Failures (
+    Transaction_ID,
+    Failure_Reason,
+    Logged_Timestamp,
+    Batch_ID
+  )
+  SELECT 
+    Transaction_ID,
+    Reason,
+    CURRENT_DATETIME(),
+    batch_id
+  FROM InvalidRows;
+
+  -- End Audit Log
+  SET end_time = CURRENT_DATETIME();
+
+  UPDATE dw.Audit_Log
+  SET 
+    End_Time = end_time,
+    Rows_Inserted = rows_inserted,
+    Rows_Rejected = rows_rejected,
+    Status = 'COMPLETED',
+    Message = CONCAT('Inserted ', CAST(rows_inserted AS STRING), ' rows; Rejected ', CAST(rows_rejected AS STRING), ' rows.')
+  WHERE Batch_ID = batch_id;
+
+EXCEPTION WHEN ERROR THEN
+  SET end_time = CURRENT_DATETIME();
+  SET error_message = @@error.message;
+
+  UPDATE dw.Audit_Log
+  SET 
+    End_Time = end_time,
+    Status = 'FAILED',
+    Message = error_message
+  WHERE Batch_ID = batch_id;
+
+END;
+
+-- End of BigQuery Procedure
+
+API Cost Consumed in dollars: 0.0047 USD
