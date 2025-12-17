@@ -1,0 +1,172 @@
+CREATE OR ALTER PROCEDURE dw.sp_load_sales_fact
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE 
+        @batch_id UNIQUEIDENTIFIER = NEWID(),
+        @start_time DATETIME = SYSDATETIME(),
+        @end_time DATETIME,
+        @rows_inserted INT = 0,
+        @rows_rejected INT = 0,
+        @error_message NVARCHAR(4000),
+        @proc_name NVARCHAR(128) = OBJECT_NAME(@@PROCID);
+
+    BEGIN TRY
+        -------------------------------------------------------------------------
+        -- 1. Start Audit Logging
+        -------------------------------------------------------------------------
+        INSERT INTO dw.Audit_Log
+        (
+            Batch_ID,
+            Procedure_Name,
+            Start_Time,
+            Status,
+            Message
+        )
+        VALUES
+        (
+            @batch_id,
+            @proc_name,
+            @start_time,
+            'STARTED',
+            'Sales Fact Load Initiated'
+        );
+
+        -------------------------------------------------------------------------
+        -- 2. Temporary Table for Validation Failures
+        -------------------------------------------------------------------------
+        IF OBJECT_ID('tempdb..#InvalidRows') IS NOT NULL DROP TABLE #InvalidRows;
+
+        CREATE TABLE #InvalidRows
+        (
+            Transaction_ID BIGINT,
+            Reason NVARCHAR(255)
+        );
+
+        -------------------------------------------------------------------------
+        -- 3. Basic Data Quality Checks
+        -------------------------------------------------------------------------
+        INSERT INTO #InvalidRows (Transaction_ID, Reason)
+        SELECT Transaction_ID, 'Missing CustomerID'
+        FROM stg.Sales_Transactions
+        WHERE Customer_ID IS NULL;
+
+        INSERT INTO #InvalidRows (Transaction_ID, Reason)
+        SELECT Transaction_ID, 'Invalid Quantity'
+        FROM stg.Sales_Transactions
+        WHERE Quantity <= 0;
+
+        -------------------------------------------------------------------------
+        -- 4. Delete Invalid Rows from Staging for This Batch
+        -------------------------------------------------------------------------
+        DELETE s
+        FROM stg.Sales_Transactions s
+        INNER JOIN #InvalidRows i
+            ON s.Transaction_ID = i.Transaction_ID;
+
+        SET @rows_rejected = @@ROWCOUNT;
+
+        -------------------------------------------------------------------------
+        -- 5. Load Cleaned Data into Fact Table
+        -------------------------------------------------------------------------
+        ;WITH transformed AS (
+            SELECT
+                s.Transaction_ID,
+                s.Customer_ID,
+                s.Product_ID,
+                s.Sales_Date,
+                s.Quantity,
+                s.Unit_Price,
+                s.Quantity * s.Unit_Price AS Total_Sales_Amount,
+                d.Region_ID,
+                c.Customer_Segment,
+                SYSDATETIME() AS Load_Timestamp,
+                @batch_id AS Batch_ID
+            FROM stg.Sales_Transactions s
+            INNER JOIN dw.Dim_Customer c
+                ON s.Customer_ID = c.Customer_ID
+            INNER JOIN dw.Dim_Date d
+                ON CAST(s.Sales_Date AS DATE) = d.Date_Value
+        )
+        INSERT INTO dw.Fact_Sales
+        (
+            Transaction_ID,
+            Customer_ID,
+            Product_ID,
+            Sales_Date,
+            Quantity,
+            Unit_Price,
+            Total_Sales_Amount,
+            Region_ID,
+            Customer_Segment,
+            Load_Timestamp,
+            Batch_ID
+        )
+        SELECT *
+        FROM transformed;
+
+        SET @rows_inserted = @@ROWCOUNT;
+
+        -------------------------------------------------------------------------
+        -- 6. Archive or Truncate Staging Table (optional)
+        -------------------------------------------------------------------------
+        TRUNCATE TABLE stg.Sales_Transactions;
+
+        -------------------------------------------------------------------------
+        -- 7. Log Validation Failures
+        -------------------------------------------------------------------------
+        INSERT INTO dw.DQ_Failures
+        (
+            Transaction_ID,
+            Failure_Reason,
+            Logged_Timestamp,
+            Batch_ID
+        )
+        SELECT 
+            Transaction_ID,
+            Reason,
+            SYSDATETIME(),
+            @batch_id
+        FROM #InvalidRows;
+
+        -------------------------------------------------------------------------
+        -- 8. End Audit Log
+        -------------------------------------------------------------------------
+        SET @end_time = SYSDATETIME();
+
+        UPDATE dw.Audit_Log
+        SET 
+            End_Time = @end_time,
+            Rows_Inserted = @rows_inserted,
+            Rows_Rejected = @rows_rejected,
+            Status = 'COMPLETED',
+            Message = CONCAT('Inserted ', @rows_inserted, ' rows; Rejected ', @rows_rejected, ' rows.')
+        WHERE Batch_ID = @batch_id;
+
+    END TRY
+    BEGIN CATCH
+        -------------------------------------------------------------------------
+        -- 9. Error Handling
+        -------------------------------------------------------------------------
+        SET @end_time = SYSDATETIME();
+        SET @error_message = ERROR_MESSAGE();
+
+        UPDATE dw.Audit_Log
+        SET 
+            End_Time = @end_time,
+            Status = 'FAILED',
+            Message = @error_message
+        WHERE Batch_ID = @batch_id;
+
+        -- Optional: Rethrow for pipeline monitoring
+        THROW;
+    END CATCH;
+
+    -------------------------------------------------------------------------
+    -- 10. Final Cleanup
+    -------------------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#InvalidRows') IS NOT NULL DROP TABLE #InvalidRows;
+
+END;
+GO
