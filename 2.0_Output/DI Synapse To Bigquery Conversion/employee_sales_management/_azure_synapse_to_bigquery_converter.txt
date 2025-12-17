@@ -1,0 +1,162 @@
+```
+=============================================
+Author:        AAVA
+Created on:   
+Description:   Sales fact table loading procedure with data quality validation and audit logging, migrated from Azure Synapse to Google BigQuery SQL
+=============================================
+
+-- BigQuery SQL Script: Sales Fact Table Loading with Data Quality Validation and Audit Logging
+
+CREATE OR REPLACE PROCEDURE dw_sp_load_sales_fact()
+BEGIN
+  -- Declare variables
+  DECLARE batch_id STRING DEFAULT GENERATE_UUID();
+  DECLARE start_time DATETIME DEFAULT CURRENT_DATETIME();
+  DECLARE end_time DATETIME;
+  DECLARE rows_inserted INT64 DEFAULT 0;
+  DECLARE rows_rejected INT64 DEFAULT 0;
+  DECLARE error_message STRING DEFAULT '';
+  DECLARE proc_name STRING DEFAULT 'dw_sp_load_sales_fact';
+
+  -- 1. Start Audit Logging
+  INSERT INTO dw.Audit_Log (
+    Batch_ID,
+    Procedure_Name,
+    Start_Time,
+    Status,
+    Message
+  )
+  VALUES (
+    batch_id,
+    proc_name,
+    start_time,
+    'STARTED',
+    'Sales Fact Load Initiated'
+  );
+
+  -- 2. Data Quality Validation: Identify Invalid Rows
+  -- Use CTE for invalid rows instead of temp table
+  WITH InvalidRows AS (
+    SELECT Transaction_ID, 'Missing CustomerID' AS Reason
+    FROM stg.Sales_Transactions
+    WHERE Customer_ID IS NULL
+
+    UNION ALL
+
+    SELECT Transaction_ID, 'Invalid Quantity' AS Reason
+    FROM stg.Sales_Transactions
+    WHERE Quantity <= 0
+  ),
+
+  -- 3. Cleaned Sales Transactions for Fact Load
+  Cleaned_Sales AS (
+    SELECT s.*
+    FROM stg.Sales_Transactions s
+    LEFT JOIN InvalidRows i
+      ON s.Transaction_ID = i.Transaction_ID
+    WHERE i.Transaction_ID IS NULL
+  ),
+
+  -- 4. Transformed Data for Fact Table
+  Transformed AS (
+    SELECT
+      s.Transaction_ID,
+      s.Customer_ID,
+      s.Product_ID,
+      s.Sales_Date,
+      s.Quantity,
+      s.Unit_Price,
+      s.Quantity * s.Unit_Price AS Total_Sales_Amount,
+      d.Region_ID,
+      c.Customer_Segment,
+      CURRENT_DATETIME() AS Load_Timestamp,
+      batch_id AS Batch_ID
+    FROM Cleaned_Sales s
+    INNER JOIN dw.Dim_Customer c
+      ON s.Customer_ID = c.Customer_ID
+    INNER JOIN dw.Dim_Date d
+      ON DATE(s.Sales_Date) = d.Date_Value
+  )
+
+  -- 5. Load Cleaned Data into Fact Table
+  INSERT INTO dw.Fact_Sales (
+    Transaction_ID,
+    Customer_ID,
+    Product_ID,
+    Sales_Date,
+    Quantity,
+    Unit_Price,
+    Total_Sales_Amount,
+    Region_ID,
+    Customer_Segment,
+    Load_Timestamp,
+    Batch_ID
+  )
+  SELECT *
+  FROM Transformed;
+
+  -- 6. Count Inserted Rows
+  SET rows_inserted = (SELECT COUNT(*) FROM Transformed);
+
+  -- 7. Delete Invalid Rows from Staging Table
+  DELETE FROM stg.Sales_Transactions
+  WHERE Transaction_ID IN (SELECT Transaction_ID FROM InvalidRows);
+
+  -- 8. Count Rejected Rows
+  SET rows_rejected = (SELECT COUNT(*) FROM InvalidRows);
+
+  -- 9. Archive or Truncate Staging Table (optional: here, truncate)
+  DELETE FROM stg.Sales_Transactions WHERE TRUE;
+
+  -- 10. Log Validation Failures
+  INSERT INTO dw.DQ_Failures (
+    Transaction_ID,
+    Failure_Reason,
+    Logged_Timestamp,
+    Batch_ID
+  )
+  SELECT
+    Transaction_ID,
+    Reason,
+    CURRENT_DATETIME(),
+    batch_id
+  FROM InvalidRows;
+
+  -- 11. End Audit Log
+  SET end_time = CURRENT_DATETIME();
+
+  UPDATE dw.Audit_Log
+  SET
+    End_Time = end_time,
+    Rows_Inserted = rows_inserted,
+    Rows_Rejected = rows_rejected,
+    Status = 'COMPLETED',
+    Message = CONCAT('Inserted ', CAST(rows_inserted AS STRING), ' rows; Rejected ', CAST(rows_rejected AS STRING), ' rows.')
+  WHERE Batch_ID = batch_id;
+
+EXCEPTION WHEN ERROR THEN
+  -- 12. Error Handling
+  SET end_time = CURRENT_DATETIME();
+  SET error_message = @@error.message;
+
+  UPDATE dw.Audit_Log
+  SET
+    End_Time = end_time,
+    Status = 'FAILED',
+    Message = error_message
+  WHERE Batch_ID = batch_id;
+
+END;
+
+-- Notes:
+-- - All table references are generic; adjust dataset names as needed.
+-- - CTEs replace temp tables for intermediate computations.
+-- - Data type conversions: UNIQUEIDENTIFIER → STRING, DATETIME → DATETIME, NVARCHAR → STRING, BIGINT/INT → INT64.
+-- - Error handling uses BigQuery scripting EXCEPTION block.
+-- - Partition and cluster target tables for performance.
+-- - Ensure audit and DQ_Failures tables exist with compatible schemas.
+
+-- End of BigQuery SQL migration for employee_sales_management (dw.sp_load_sales_fact)
+
+API Cost Consumed in dollars: 0.0047 USD
+```
