@@ -1,0 +1,1 @@
+Outputs for workflow: DI Azure Synapse To Bigquery Doc&Analyze
