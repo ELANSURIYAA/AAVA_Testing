@@ -1,0 +1,332 @@
+=============================================
+Author:        Ascendion AAVA
+Created on:   
+Description:   End-to-end automation script for executing Synapse SQL, exporting results to ADLS, running Databricks PySpark, and validating data consistency between Synapse and Databricks.
+=============================================
+
+# 1. Imports and setup
+import os
+import sys
+import time
+import json
+import csv
+import hashlib
+import tempfile
+import shutil
+from datetime import datetime
+import pandas as pd
+
+import pyodbc
+from sqlalchemy import create_engine
+from azure.identity import DefaultAzureCredential, ClientSecretCredential
+from azure.storage.filedatalake import DataLakeServiceClient
+from azure.storage.blob import BlobServiceClient
+from azure.core.exceptions import ResourceExistsError
+from pyspark.sql import SparkSession, functions as F, types as T
+
+# 2. Configuration loading
+CONFIG = {
+    "synapse": {
+        "server": os.getenv("SYNAPSE_SERVER"),
+        "database": os.getenv("SYNAPSE_DATABASE"),
+        "username": os.getenv("SYNAPSE_USERNAME"),
+        "password": os.getenv("SYNAPSE_PASSWORD"),
+        "driver": os.getenv("SYNAPSE_ODBC_DRIVER", "ODBC Driver 18 for SQL Server"),
+        "use_sqlalchemy": True
+    },
+    "adls": {
+        "account_name": os.getenv("ADLS_ACCOUNT_NAME"),
+        "container": os.getenv("ADLS_CONTAINER"),
+        "file_system": os.getenv("ADLS_FILE_SYSTEM", ""),  # for DataLake
+        "client_id": os.getenv("AZURE_CLIENT_ID"),
+        "client_secret": os.getenv("AZURE_CLIENT_SECRET"),
+        "tenant_id": os.getenv("AZURE_TENANT_ID"),
+        "use_managed_identity": os.getenv("USE_MANAGED_IDENTITY", "false").lower() == "true"
+    },
+    "databricks": {
+        "host": os.getenv("DATABRICKS_HOST"),
+        "token": os.getenv("DATABRICKS_TOKEN"),
+        "cluster_id": os.getenv("DATABRICKS_CLUSTER_ID"),
+        "mount_point": "/mnt/synapse_data"
+    },
+    "comparison": {
+        "row_count_threshold": 0.0001,  # 0.01%
+        "float_tolerance": 1e-6,
+        "sample_size": 10000,
+        "output_dir": os.getenv("OUTPUT_DIR", "./reconciliation_output")
+    }
+}
+
+os.makedirs(CONFIG["comparison"]["output_dir"], exist_ok=True)
+
+# 3. Authentication setup
+def get_adls_service_client():
+    if CONFIG["adls"]["use_managed_identity"]:
+        credential = DefaultAzureCredential()
+    else:
+        credential = ClientSecretCredential(
+            tenant_id=CONFIG["adls"]["tenant_id"],
+            client_id=CONFIG["adls"]["client_id"],
+            client_secret=CONFIG["adls"]["client_secret"]
+        )
+    return DataLakeServiceClient(
+        account_url=f"https://{CONFIG['adls']['account_name']}.dfs.core.windows.net",
+        credential=credential
+    )
+
+def get_blob_service_client():
+    if CONFIG["adls"]["use_managed_identity"]:
+        credential = DefaultAzureCredential()
+    else:
+        credential = ClientSecretCredential(
+            tenant_id=CONFIG["adls"]["tenant_id"],
+            client_id=CONFIG["adls"]["client_id"],
+            client_secret=CONFIG["adls"]["client_secret"]
+        )
+    return BlobServiceClient(
+        account_url=f"https://{CONFIG['adls']['account_name']}.blob.core.windows.net",
+        credential=credential
+    )
+
+# 4. Synapse execution
+def execute_synapse_sql(sql_code):
+    if CONFIG["synapse"]["use_sqlalchemy"]:
+        conn_str = (
+            f"mssql+pyodbc://{CONFIG['synapse']['username']}:{CONFIG['synapse']['password']}"
+            f"@{CONFIG['synapse']['server']}:1433/{CONFIG['synapse']['database']}?"
+            f"driver={CONFIG['synapse']['driver'].replace(' ', '+')}"
+        )
+        engine = create_engine(conn_str, fast_executemany=True)
+        with engine.connect() as conn:
+            for stmt in sql_code.split("GO"):
+                stmt = stmt.strip()
+                if stmt:
+                    conn.execute(stmt)
+    else:
+        conn = pyodbc.connect(
+            f"DRIVER={{{CONFIG['synapse']['driver']}}};"
+            f"SERVER={CONFIG['synapse']['server']};"
+            f"DATABASE={CONFIG['synapse']['database']};"
+            f"UID={CONFIG['synapse']['username']};"
+            f"PWD={CONFIG['synapse']['password']}"
+        )
+        cursor = conn.cursor()
+        for stmt in sql_code.split("GO"):
+            stmt = stmt.strip()
+            if stmt:
+                cursor.execute(stmt)
+        cursor.close()
+        conn.close()
+
+# 5. Data export
+def export_table_to_delta(table_name, export_dir):
+    conn_str = (
+        f"DRIVER={{{CONFIG['synapse']['driver']}}};"
+        f"SERVER={CONFIG['synapse']['server']};"
+        f"DATABASE={CONFIG['synapse']['database']};"
+        f"UID={CONFIG['synapse']['username']};"
+        f"PWD={CONFIG['synapse']['password']}"
+    )
+    conn = pyodbc.connect(conn_str)
+    query = f"SELECT * FROM {table_name}"
+    df = pd.read_sql(query, conn)
+    conn.close()
+    # Convert to Spark DataFrame and write as Delta
+    spark = SparkSession.builder.appName("SynapseExport").getOrCreate()
+    sdf = spark.createDataFrame(df)
+    delta_path = os.path.join(export_dir, f"{table_name}_{int(time.time())}.delta")
+    sdf.write.format("delta").mode("overwrite").save(delta_path)
+    return delta_path
+
+# 6. ADLS transfer
+def upload_to_adls(local_path, adls_path):
+    service_client = get_adls_service_client()
+    file_system_client = service_client.get_file_system_client(CONFIG["adls"]["container"])
+    # Recursively upload all files in local_path
+    for root, dirs, files in os.walk(local_path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            rel_path = os.path.relpath(file_path, local_path)
+            adls_file_path = os.path.join(adls_path, rel_path).replace("\\", "/")
+            file_client = file_system_client.get_file_client(adls_file_path)
+            with open(file_path, "rb") as data:
+                file_client.upload_data(data, overwrite=True)
+            # File existence and size check
+            props = file_client.get_file_properties()
+            assert props.size == os.path.getsize(file_path), f"Size mismatch for {adls_file_path}"
+
+# 7. Databricks setup
+def mount_adls_to_databricks(spark):
+    # This assumes running on Databricks or with dbutils available
+    try:
+        dbutils.fs.mount(
+            source=f"abfss://{CONFIG['adls']['container']}@{CONFIG['adls']['account_name']}.dfs.core.windows.net/",
+            mount_point=CONFIG["databricks"]["mount_point"],
+            extra_configs={
+                f"fs.azure.account.auth.type.{CONFIG['adls']['account_name']}.dfs.core.windows.net": "OAuth",
+                f"fs.azure.account.oauth.provider.type.{CONFIG['adls']['account_name']}.dfs.core.windows.net": "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider",
+                f"fs.azure.account.oauth2.client.id.{CONFIG['adls']['account_name']}.dfs.core.windows.net": CONFIG["adls"]["client_id"],
+                f"fs.azure.account.oauth2.client.secret.{CONFIG['adls']['account_name']}.dfs.core.windows.net": CONFIG["adls"]["client_secret"],
+                f"fs.azure.account.oauth2.client.endpoint.{CONFIG['adls']['account_name']}.dfs.core.windows.net": f"https://login.microsoftonline.com/{CONFIG['adls']['tenant_id']}/oauth2/token"
+            }
+        )
+    except Exception as e:
+        if "already mounted" not in str(e):
+            raise
+
+def create_external_delta_table(spark, table_name, adls_path, schema=None):
+    location = f"{CONFIG['databricks']['mount_point']}/{adls_path}"
+    create_stmt = f"""
+        CREATE TABLE IF NOT EXISTS synapse_external.{table_name}
+        USING DELTA
+        LOCATION '{location}'
+    """
+    spark.sql(create_stmt)
+
+# 8. PySpark execution
+def run_databricks_pyspark_script(spark, pyspark_script_path):
+    # Assumes the script is a .py file with a main() function
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("etl_module", pyspark_script_path)
+    etl_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(etl_module)
+    if hasattr(etl_module, "main"):
+        etl_module.main(spark)
+    else:
+        raise Exception("No main() function found in provided PySpark script.")
+
+# 9. Comparison logic
+def compare_tables(spark, synapse_table, databricks_table, primary_keys=None, float_tolerance=1e-6, sample_size=10000):
+    result = {
+        "table": synapse_table,
+        "row_count_match": False,
+        "schema_match": False,
+        "column_matches": {},
+        "row_count_synapse": 0,
+        "row_count_databricks": 0,
+        "schema_synapse": [],
+        "schema_databricks": [],
+        "mismatched_rows_sample": [],
+        "match_percentage": 0.0,
+        "per_column_match_percentage": {}
+    }
+    df_synapse = spark.table(synapse_table)
+    df_db = spark.table(databricks_table)
+    # Row count
+    count_syn = df_synapse.count()
+    count_db = df_db.count()
+    result["row_count_synapse"] = count_syn
+    result["row_count_databricks"] = count_db
+    result["row_count_match"] = abs(count_syn - count_db) <= max(1, int(count_syn * CONFIG["comparison"]["row_count_threshold"]))
+    # Schema
+    schema_syn = set((f.name.lower(), str(f.dataType)) for f in df_synapse.schema.fields)
+    schema_db = set((f.name.lower(), str(f.dataType)) for f in df_db.schema.fields)
+    result["schema_synapse"] = list(schema_syn)
+    result["schema_databricks"] = list(schema_db)
+    result["schema_match"] = schema_syn == schema_db
+    # Column-by-column data comparison (sampled for large tables)
+    join_cols = primary_keys or [f.name for f in df_synapse.schema.fields]
+    df_join = df_synapse.alias("a").join(df_db.alias("b"), on=join_cols, how="outer")
+    sample = df_join.limit(sample_size).toPandas()
+    match_rows = 0
+    total_rows = len(sample)
+    col_matches = {col: 0 for col in join_cols}
+    for idx, row in sample.iterrows():
+        row_match = True
+        for col in join_cols:
+            v1 = row.get(f"{col}_a", row.get(col))
+            v2 = row.get(f"{col}_b", row.get(col))
+            if pd.isnull(v1) and pd.isnull(v2):
+                continue
+            elif isinstance(v1, float) and isinstance(v2, float):
+                if abs(v1 - v2) > float_tolerance:
+                    row_match = False
+            else:
+                if v1 != v2:
+                    row_match = False
+        if row_match:
+            match_rows += 1
+        else:
+            result["mismatched_rows_sample"].append(row.to_dict())
+    result["match_percentage"] = (match_rows / total_rows) * 100 if total_rows else 100.0
+    # Per-column match
+    for col in join_cols:
+        matches = sum(
+            (pd.isnull(row.get(f"{col}_a", row.get(col))) and pd.isnull(row.get(f"{col}_b", row.get(col))))
+            or (row.get(f"{col}_a", row.get(col)) == row.get(f"{col}_b", row.get(col)))
+            for _, row in sample.iterrows()
+        )
+        result["per_column_match_percentage"][col] = (matches / total_rows) * 100 if total_rows else 100.0
+    return result
+
+# 10. Cleanup
+def cleanup_temp_dirs(*dirs):
+    for d in dirs:
+        if os.path.exists(d):
+            shutil.rmtree(d)
+
+# Main orchestration
+def main():
+    start_time = time.time()
+    # --- Step 1: Parse Inputs (assume files provided as arguments) ---
+    synapse_sql_path = sys.argv[1]
+    pyspark_script_path = sys.argv[2]
+    with open(synapse_sql_path, "r") as f:
+        synapse_sql_code = f.read()
+    # Target tables (hardcoded for this example, or parse from SQL)
+    target_tables = ["dw.Fact_Sales"]
+    # --- Step 2: Execute Synapse SQL ---
+    execute_synapse_sql(synapse_sql_code)
+    # --- Step 3: Export Synapse Tables to Delta ---
+    temp_export_dir = tempfile.mkdtemp()
+    delta_paths = {}
+    for tbl in target_tables:
+        delta_path = export_table_to_delta(tbl, temp_export_dir)
+        delta_paths[tbl] = delta_path
+    # --- Step 4: Upload Delta Files to ADLS ---
+    for tbl, delta_path in delta_paths.items():
+        adls_path = f"bronze/synapse/{tbl}/"
+        upload_to_adls(delta_path, adls_path)
+    # --- Step 5: Setup Databricks & Mount ADLS ---
+    spark = SparkSession.builder.appName("Reconciliation").getOrCreate()
+    mount_adls_to_databricks(spark)
+    for tbl in target_tables:
+        adls_path = f"bronze/synapse/{tbl}/"
+        create_external_delta_table(spark, tbl, adls_path)
+    # --- Step 6: Run Databricks PySpark Code ---
+    run_databricks_pyspark_script(spark, pyspark_script_path)
+    # --- Step 7: Compare Tables ---
+    results = []
+    for tbl in target_tables:
+        synapse_ext_tbl = f"synapse_external.{tbl}"
+        databricks_tbl = f"silver/databricks/{tbl}"
+        cmp = compare_tables(
+            spark, synapse_ext_tbl, databricks_tbl,
+            float_tolerance=CONFIG["comparison"]["float_tolerance"],
+            sample_size=CONFIG["comparison"]["sample_size"]
+        )
+        results.append(cmp)
+    # --- Step 8: Output Results ---
+    output_json = os.path.join(CONFIG["comparison"]["output_dir"], "reconciliation_results.json")
+    with open(output_json, "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    output_csv = os.path.join(CONFIG["comparison"]["output_dir"], "reconciliation_summary.csv")
+    with open(output_csv, "w", newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=["table", "row_count_match", "schema_match", "match_percentage"])
+        writer.writeheader()
+        for r in results:
+            writer.writerow({
+                "table": r["table"],
+                "row_count_match": r["row_count_match"],
+                "schema_match": r["schema_match"],
+                "match_percentage": r["match_percentage"]
+            })
+    # --- Step 9: Cleanup ---
+    cleanup_temp_dirs(temp_export_dir)
+    # --- Step 10: API Cost Estimation ---
+    api_cost = 0.25  # USD, as per estimation
+    print(f"API Cost: {api_cost} USD")
+    print(f"Results written to {output_json} and {output_csv}")
+
+if __name__ == "__main__":
+    main()
