@@ -1,0 +1,129 @@
+markdown
+====================================================
+Author:        Ascendion AAVA
+Date:          
+Description:   Documentation for the Azure Synapse stored procedure `dw.sp_load_sales_fact` – Sales Fact Data Load and Validation
+====================================================
+
+## 1. Overview of Pipeline/Component
+
+The stored procedure `dw.sp_load_sales_fact` is designed to automate the ingestion, validation, transformation, and loading of sales transaction data from a staging area (`stg.Sales_Transactions`) into a data warehouse fact table (`dw.Fact_Sales`). It enforces data quality rules, enriches data with dimension lookups, logs audit information, and records data quality failures for further analysis. This process supports regulatory reporting, analytics, and downstream business intelligence use cases.
+
+## 2. Component Structure and Design
+
+- **Component Type:** Azure Synapse SQL Stored Procedure
+- **Primary Modules:**
+  - Audit Logging (start/end, status, row counts)
+  - Data Quality Validation (temporary table for invalid rows)
+  - Data Transformation (joins with dimension tables, computed columns)
+  - Data Loading (inserts into fact table)
+  - Error Handling (try/catch with audit updates)
+  - Cleanup (truncate staging, drop temp tables)
+- **Key Activities:**
+  - **Source:** `stg.Sales_Transactions` (staging sales data)
+  - **Transformations:** 
+    - Data quality checks (missing Customer_ID, invalid Quantity)
+    - Joins with `dw.Dim_Customer` and `dw.Dim_Date`
+    - Derived columns (Total_Sales_Amount, Load_Timestamp, Batch_ID)
+  - **Sink:** `dw.Fact_Sales` (fact table), `dw.DQ_Failures` (data quality log), `dw.Audit_Log` (audit trail)
+- **Control Flow:** 
+  - Uses variables for batch tracking, error handling, and row counts.
+  - All logic is encapsulated in a single stored procedure, typically invoked by a Synapse pipeline activity.
+  - No explicit parameters; batch context is generated internally.
+- **Integration:** 
+  - Can be orchestrated via Synapse Pipelines using a Stored Procedure Activity.
+  - No direct Databricks integration in this code, but can be part of a larger Synapse pipeline.
+
+## 3. Data Flow and Processing Logic
+
+- **Processed Datasets:**
+  - `stg.Sales_Transactions` (source)
+  - `dw.Dim_Customer` (dimension)
+  - `dw.Dim_Date` (dimension)
+  - `dw.Fact_Sales` (target)
+  - `dw.DQ_Failures` (DQ log)
+  - `dw.Audit_Log` (audit)
+
+- **Data Flow:**
+  1. **Audit Start:** Log batch start in `dw.Audit_Log`.
+  2. **Validation:** Identify invalid rows (missing Customer_ID, Quantity <= 0) into `#InvalidRows`.
+  3. **Cleanse:** Remove invalid rows from staging.
+  4. **Transformation:** Join cleansed transactions with customer and date dimensions; compute `Total_Sales_Amount`, add metadata columns.
+  5. **Load:** Insert transformed data into `dw.Fact_Sales`.
+  6. **Cleanup:** Truncate staging table.
+  7. **DQ Logging:** Insert invalid rows into `dw.DQ_Failures`.
+  8. **Audit End:** Update audit log with counts and status.
+  9. **Error Handling:** On error, update audit log with failure status and message.
+
+## 4. Data Mapping (Lineage)
+
+| Target Table Name | Target Column Name     | Source Table Name      | Source Column Name     | Remarks                                                                                   |
+|-------------------|-----------------------|------------------------|-----------------------|-------------------------------------------------------------------------------------------|
+| dw.Fact_Sales     | Transaction_ID        | stg.Sales_Transactions | Transaction_ID        | 1:1 Mapping                                                                               |
+| dw.Fact_Sales     | Customer_ID           | stg.Sales_Transactions | Customer_ID           | 1:1 Mapping (validated non-null, joined with dw.Dim_Customer)                             |
+| dw.Fact_Sales     | Product_ID            | stg.Sales_Transactions | Product_ID            | 1:1 Mapping                                                                               |
+| dw.Fact_Sales     | Sales_Date            | stg.Sales_Transactions | Sales_Date            | 1:1 Mapping (joined with dw.Dim_Date on date value)                                       |
+| dw.Fact_Sales     | Quantity              | stg.Sales_Transactions | Quantity              | 1:1 Mapping (validated > 0)                                                               |
+| dw.Fact_Sales     | Unit_Price            | stg.Sales_Transactions | Unit_Price            | 1:1 Mapping                                                                               |
+| dw.Fact_Sales     | Total_Sales_Amount    | -                      | -                     | Transformation: Quantity * Unit_Price                                                     |
+| dw.Fact_Sales     | Region_ID             | dw.Dim_Date            | Region_ID             | Joined via dw.Dim_Date on Sales_Date                                                      |
+| dw.Fact_Sales     | Customer_Segment      | dw.Dim_Customer        | Customer_Segment      | Joined via dw.Dim_Customer on Customer_ID                                                 |
+| dw.Fact_Sales     | Load_Timestamp        | -                      | -                     | Transformation: SYSDATETIME()                                                             |
+| dw.Fact_Sales     | Batch_ID              | -                      | -                     | Transformation: Generated by NEWID() at batch start                                       |
+| dw.DQ_Failures    | Transaction_ID        | #InvalidRows           | Transaction_ID        | 1:1 Mapping (invalid rows only)                                                           |
+| dw.DQ_Failures    | Failure_Reason        | #InvalidRows           | Reason                | 1:1 Mapping (invalid rows only)                                                           |
+| dw.DQ_Failures    | Logged_Timestamp      | -                      | -                     | Transformation: SYSDATETIME()                                                             |
+| dw.DQ_Failures    | Batch_ID              | -                      | -                     | Transformation: Batch context                                                             |
+| dw.Audit_Log      | Batch_ID              | -                      | -                     | Transformation: Generated by NEWID() at batch start                                       |
+| dw.Audit_Log      | Procedure_Name        | -                      | -                     | Transformation: OBJECT_NAME(@@PROCID)                                                     |
+| dw.Audit_Log      | Start_Time            | -                      | -                     | Transformation: SYSDATETIME() at start                                                    |
+| dw.Audit_Log      | End_Time              | -                      | -                     | Transformation: SYSDATETIME() at end                                                      |
+| dw.Audit_Log      | Rows_Inserted         | -                      | -                     | Transformation: @@ROWCOUNT after insert to dw.Fact_Sales                                  |
+| dw.Audit_Log      | Rows_Rejected         | -                      | -                     | Transformation: @@ROWCOUNT after delete from stg.Sales_Transactions (invalid rows)        |
+| dw.Audit_Log      | Status                | -                      | -                     | Transformation: 'STARTED', 'COMPLETED', or 'FAILED'                                       |
+| dw.Audit_Log      | Message               | -                      | -                     | Transformation: Status message or error message                                            |
+
+## 5. Transformation Logic
+
+- **Data Quality Checks:**
+  - `Customer_ID IS NULL` → flagged as 'Missing CustomerID'
+  - `Quantity <= 0` → flagged as 'Invalid Quantity'
+- **Joins:**
+  - `stg.Sales_Transactions.Customer_ID = dw.Dim_Customer.Customer_ID`
+  - `CAST(stg.Sales_Transactions.Sales_Date AS DATE) = dw.Dim_Date.Date_Value`
+- **Derived/Computed Columns:**
+  - `Total_Sales_Amount = Quantity * Unit_Price`
+  - `Load_Timestamp = SYSDATETIME()`
+  - `Batch_ID = NEWID()`
+- **Audit and DQ Logging:**
+  - Insert/Update to `dw.Audit_Log` with batch metadata, row counts, and status.
+  - Insert to `dw.DQ_Failures` for each invalid row, with reason and timestamp.
+- **Error Handling:**
+  - On error, update audit log with 'FAILED' status and error message, then rethrow.
+
+## 6. Complexity Analysis
+
+| Metric                              | Value                                                                 |
+|--------------------------------------|-----------------------------------------------------------------------|
+| Number of Pipeline Activities        | 1 (single stored procedure, typically 1 pipeline activity)            |
+| Number of Dataflow Transformations   | 3 (validation, joins, computed columns)                               |
+| SQL Scripts or Stored Procedures Used| 1 (this procedure)                                                    |
+| Joins Used                          | 2 (INNER JOIN: Customer, Date)                                        |
+| Lookup Tables or Reference Data      | 2 (dw.Dim_Customer, dw.Dim_Date)                                      |
+| Parameters/Variables/Triggers        | 7+ (batch_id, start_time, end_time, rows_inserted, rows_rejected, etc.)|
+| Number of Output Datasets            | 3 (dw.Fact_Sales, dw.DQ_Failures, dw.Audit_Log)                       |
+| Conditional Logic or if-else Flows   | 2 (validation checks, error handling)                                 |
+| External Dependencies                | Linked Synapse SQL pools, dimension tables                            |
+| Overall Complexity Score             | 35                                                                    |
+
+## 7. Key Outputs
+
+- **Fact Table:** `dw.Fact_Sales` – Cleaned, validated, and enriched sales transactions, ready for analytics and reporting.
+- **Data Quality Log:** `dw.DQ_Failures` – Records of rejected transactions with reasons, supporting data quality monitoring.
+- **Audit Log:** `dw.Audit_Log` – Batch-level metadata for operational monitoring, traceability, and compliance.
+- **Format:** All outputs are in relational table format (Synapse SQL tables), suitable for downstream reporting, regulatory compliance, and advanced analytics.
+
+---
+
+**API Cost:**  
+apiCost: 0.0025 USD
