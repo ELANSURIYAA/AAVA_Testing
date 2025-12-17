@@ -1,0 +1,156 @@
+=============================================
+Author:        AAVA
+Created on:   
+Description:   Convert Azure Synapse stored procedures into equivalent Databricks PySpark code
+=============================================
+
+# Databricks PySpark Script: Sales Fact Load Procedure Conversion
+
+python
+# Import required libraries
+import uuid
+import traceback
+from datetime import datetime
+from pyspark.sql import Row, functions as F
+
+# ---------------------------
+# 1. Variable Assignments
+# ---------------------------
+batch_id = str(uuid.uuid4())
+start_time = datetime.utcnow()
+end_time = None
+rows_inserted = 0
+rows_rejected = 0
+error_message = None
+proc_name = "sp_load_sales_fact"
+
+# ---------------------------
+# 2. Audit Logging Functions
+# ---------------------------
+def log_audit_event(spark, batch_id, proc_name, event_type, status, message, rows_inserted=None, rows_rejected=None, start_time=None, end_time=None):
+    audit_entry = [Row(
+        Batch_ID=batch_id,
+        Procedure_Name=proc_name,
+        Start_Time=start_time,
+        End_Time=end_time,
+        Status=status,
+        Message=message,
+        Rows_Inserted=rows_inserted,
+        Rows_Rejected=rows_rejected,
+        Event_Type=event_type,
+        Logged_Timestamp=datetime.utcnow()
+    )]
+    df = spark.createDataFrame(audit_entry)
+    df.write.format("delta").mode("append").saveAsTable("dw.Audit_Log")
+
+# ---------------------------
+# 3. Main Procedure Logic
+# ---------------------------
+try:
+    # Step 1: Start Audit Logging
+    log_audit_event(
+        spark, batch_id, proc_name, event_type="STARTED", status="STARTED",
+        message="Sales Fact Load Initiated", start_time=start_time
+    )
+
+    # Step 2: Data Quality Checks
+    stg_sales = spark.table("stg.Sales_Transactions")
+    
+    # Identify invalid rows
+    invalid_missing_customer = stg_sales.filter(F.col("Customer_ID").isNull()) \
+        .select(F.col("Transaction_ID"), F.lit("Missing CustomerID").alias("Reason"))
+    invalid_quantity = stg_sales.filter(F.col("Quantity") <= 0) \
+        .select(F.col("Transaction_ID"), F.lit("Invalid Quantity").alias("Reason"))
+    invalid_rows_df = invalid_missing_customer.unionByName(invalid_quantity)
+    
+    # Cache for reuse
+    invalid_rows_df.cache()
+    
+    # Step 3: Delete Invalid Rows from Staging
+    # Get invalid Transaction_IDs
+    invalid_ids = [row.Transaction_ID for row in invalid_rows_df.select("Transaction_ID").distinct().collect()]
+    if invalid_ids:
+        stg_sales_clean = stg_sales.filter(~F.col("Transaction_ID").isin(invalid_ids))
+        rows_rejected = len(invalid_ids)
+    else:
+        stg_sales_clean = stg_sales
+        rows_rejected = 0
+
+    # Step 4: Load Cleaned Data into Fact Table
+    dim_customer = spark.table("dw.Dim_Customer")
+    dim_date = spark.table("dw.Dim_Date")
+
+    # Join and transform
+    transformed = stg_sales_clean \
+        .join(dim_customer, stg_sales_clean.Customer_ID == dim_customer.Customer_ID, "inner") \
+        .join(dim_date, F.to_date(stg_sales_clean.Sales_Date) == dim_date.Date_Value, "inner") \
+        .select(
+            stg_sales_clean.Transaction_ID,
+            stg_sales_clean.Customer_ID,
+            stg_sales_clean.Product_ID,
+            stg_sales_clean.Sales_Date,
+            stg_sales_clean.Quantity,
+            stg_sales_clean.Unit_Price,
+            (stg_sales_clean.Quantity * stg_sales_clean.Unit_Price).alias("Total_Sales_Amount"),
+            dim_date.Region_ID,
+            dim_customer.Customer_Segment,
+            F.lit(datetime.utcnow()).alias("Load_Timestamp"),
+            F.lit(batch_id).alias("Batch_ID")
+        )
+
+    # Write to Fact Table (Delta Lake for ACID)
+    transformed.write.format("delta").mode("append").saveAsTable("dw.Fact_Sales")
+    rows_inserted = transformed.count()
+
+    # Step 5: Archive or Truncate Staging Table
+    # Truncate by overwriting with empty DataFrame
+    empty_stg_sales = stg_sales.limit(0)
+    empty_stg_sales.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable("stg.Sales_Transactions")
+
+    # Step 6: Log Validation Failures
+    if invalid_rows_df.count() > 0:
+        dq_failures = invalid_rows_df.withColumn("Logged_Timestamp", F.lit(datetime.utcnow())) \
+            .withColumn("Batch_ID", F.lit(batch_id)) \
+            .select(
+                F.col("Transaction_ID"),
+                F.col("Reason").alias("Failure_Reason"),
+                F.col("Logged_Timestamp"),
+                F.col("Batch_ID")
+            )
+        dq_failures.write.format("delta").mode("append").saveAsTable("dw.DQ_Failures")
+
+    # Step 7: End Audit Log
+    end_time = datetime.utcnow()
+    log_audit_event(
+        spark, batch_id, proc_name, event_type="COMPLETED", status="COMPLETED",
+        message=f"Inserted {rows_inserted} rows; Rejected {rows_rejected} rows.",
+        rows_inserted=rows_inserted, rows_rejected=rows_rejected,
+        start_time=start_time, end_time=end_time
+    )
+
+except Exception as e:
+    # Step 8: Error Handling
+    end_time = datetime.utcnow()
+    error_message = traceback.format_exc()
+    log_audit_event(
+        spark, batch_id, proc_name, event_type="FAILED", status="FAILED",
+        message=error_message, start_time=start_time, end_time=end_time
+    )
+    raise
+
+# Step 9: Final Cleanup (No temp tables needed in Spark, unpersist cache)
+invalid_rows_df.unpersist()
+
+
+
+# Notes:
+- All table references use Databricks Delta tables for ACID compliance and efficient operations.
+- Audit logging is centralized and written only from the driver.
+- Data quality checks and invalid row handling are performed using DataFrame transformations.
+- Error handling is robust, with audit log updates and exception propagation.
+- Staging table is truncated by overwriting with an empty DataFrame.
+- All logic is modular, readable, and optimized for Spark.
+- Inline comments clarify each step.
+- Handles NULLs and edge cases as per original logic.
+
+API Cost Consumed in dollars: apiCost: 0.0047 USD
