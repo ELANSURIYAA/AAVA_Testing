@@ -1,1 +1,0 @@
-Outputs for DI Azure Synapse To Bigquery Doc&Analyze - employee_sales_management
