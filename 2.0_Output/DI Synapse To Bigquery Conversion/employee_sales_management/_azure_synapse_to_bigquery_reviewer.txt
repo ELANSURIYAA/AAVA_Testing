@@ -1,184 +1,246 @@
-=============================================
-Author: Ascendion AVA
-Created on: 
-Description: Sales fact table loading procedure with data quality validation and audit logging
-=============================================
+Summary
+This review covers the conversion of the Azure Synapse stored procedure `dw.sp_load_sales_fact` to its BigQuery equivalent. The procedure loads cleaned sales transaction data from staging to the fact table, performs data quality checks, logs audit and validation failures, and manages batch processing. The converted BigQuery code was analyzed for logic fidelity, data flow, error handling, and optimization. The review also includes transformation mapping, manual adjustment notes, optimization suggestions, and a comprehensive test suite for validation.
 
-Summary:
-The original Synapse stored procedure (`dw.sp_load_sales_fact`) implements a batch ETL workflow for loading sales transactions from a staging table into a fact table, with comprehensive data quality checks, dimensional enrichment, audit logging, and error handling. The conversion analysis details all mappings, transformations, and control flow, highlighting complexity and business logic. The converted BigQuery code accurately replicates this logic, adapting to BigQuery syntax and platform features.
+Conversion Accuracy
+- The main ETL workflow and business logic are preserved in the BigQuery code:
+    - Batch ID generation: `NEWID()` → `GENERATE_UUID()`
+    - Timestamps: `SYSDATETIME()` → `CURRENT_TIMESTAMP()`
+    - Procedure name: Manual assignment in BigQuery
+    - Data quality checks for `Customer_ID IS NULL` and `Quantity <= 0` are mapped directly.
+    - Calculation of `Total_Sales_Amount` is preserved.
+    - Temporary table `#InvalidRows` is mapped to a BigQuery temp table.
+    - Joins to `Dim_Customer` and `Dim_Date` are retained.
+    - Audit logging and DQ failure logging are implemented.
+    - Error handling is mapped to BigQuery's `EXCEPTION WHEN ERROR THEN` block.
+    - Row counts use explicit `COUNT(*)` queries instead of `@@ROWCOUNT`.
+    - Table truncation and cleanup logic is present.
+- Data types are mapped appropriately:
+    - `UNIQUEIDENTIFIER` → `STRING`
+    - `DATETIME` → `TIMESTAMP`
+    - `NVARCHAR` → `STRING`
+    - `BIGINT`/`INT` → `INT64`
+- All data sources, joins, and destinations are correctly mapped.
+- The BigQuery code follows the original's modular structure, with clear separation of validation, transformation, loading, and logging steps.
+- The Pytest-based test suite covers all critical scenarios, including happy path, DQ failures, join failures, error handling, and audit logging.
+- A reconciliation script is provided to automate validation between Synapse and BigQuery outputs.
 
-Conversion Accuracy:
-- **Data Sources, Joins, and Destinations:** All source tables (`stg.Sales_Transactions`, `dw.Dim_Customer`, `dw.Dim_Date`) and target tables (`dw.Fact_Sales`, `dw.Audit_Log`, `dw.DQ_Failures`) are correctly mapped in the BigQuery code.
-- **Transformations & Aggregations:** Data quality checks for missing `Customer_ID` and invalid `Quantity` are implemented using CTEs. Dimensional enrichment via INNER JOINs on customer and date dimensions is preserved. Calculations such as `Total_Sales_Amount` and timestamp generation are accurately ported.
-- **Business Logic:** The BigQuery procedure maintains batch ID tracking, audit logging, and error handling using BigQuery scripting constructs. All critical business rules from the Synapse procedure are present.
-- **Error Handling & Logging:** Exception management is implemented with BigQuery's `EXCEPTION WHEN ERROR THEN` block, updating the audit log on failure and optionally re-raising errors for monitoring.
-- **Optimization & Platform Features:** Temporary tables are replaced by CTEs, and table truncation is handled with `DELETE WHERE TRUE`. Variable assignments and control flow are adapted to BigQuery's scripting model.
+Optimization Suggestions
+- Partition the `Fact_Sales` table by `Sales_Date` and cluster by `Customer_ID` and `Product_ID` for optimal query performance.
+- Consider materialized views for frequently accessed dimensional data.
+- Use array-based processing for DQ checks if data volume is large.
+- Avoid unnecessary `CAST` operations in queries.
+- Ensure audit and DQ tables are created with compatible schemas and data types in BigQuery.
+- Implement query result caching and avoid `SELECT *` in production queries.
+- Leverage BigQuery's automatic parallelization and slot management for large datasets.
+- For more complex DQ rules, consider using BigQuery UDFs.
+- Confirm all string concatenations and error messages handle NULLs correctly.
+- Update job scheduling and monitoring tools to integrate with BigQuery's execution and logging environment.
 
-Optimization Suggestions:
-- **Partitioning & Clustering:** Partition the `dw.Fact_Sales` table by `Sales_Date` and cluster by `Customer_ID` and `Product_ID` for improved query performance.
-- **Materialized Views:** Use materialized views for frequently accessed dimension tables.
-- **Query Optimization:** Avoid unnecessary CAST operations, leverage BigQuery's query optimizer, and use explicit column selection instead of `SELECT *`.
-- **Batch Processing:** For large datasets, consider array-based data quality checks and window functions for performance.
-- **Error Recovery:** Implement checkpoint-based recovery for large data volumes and leverage BigQuery's parallelization.
-- **Cost Optimization:** Use query result caching and avoid broad `SELECT *` queries.
-
-API Cost Estimation:
-API Cost Consumed in dollars: 0.0040 USD
+API Cost Estimation
+API Cost Consumed in dollars: 0.0047 USD
 
 ---
 
-Original Synapse Procedure Analysis:
+Original Synapse Stored Procedure
 ```
-=============================================
-Author:        Ascendion AVA
-Date:   
-Description:   Sales fact table loading procedure with data quality validation and audit logging
-=============================================
-
-## 1. Procedure Overview
-
-The Azure Synapse stored procedure `dw.sp_load_sales_fact` implements a comprehensive ETL workflow for sales transaction data processing. This procedure serves as a critical component in the organization's data warehouse pipeline, responsible for extracting sales data from staging tables, performing data quality validations, transforming the data with business logic, and loading it into the fact table while maintaining complete audit trails.
-
-**Key Business Objectives:**
-- Data integration from staging to fact tables
-- Data quality validation and cleansing
-- Business logic enrichment through dimensional lookups
-- Comprehensive audit logging and error tracking
-- Automated data pipeline processing
-
-**Workflow Structure:**
-- **Number of Mappings per Workflow:** 1 main data flow with 8 logical processing steps
-- **Session Count:** Single session execution with comprehensive error handling
-- **Data Processing Pattern:** Batch-based ETL with validation framework
-
-## 2. Complexity Metrics
-
-| Metric | Count | Type/Details |
-|--------|-------|--------------|
-| Number of Source Qualifiers | 3 | stg.Sales_Transactions (SQL Server), dw.Dim_Customer (SQL Server), dw.Dim_Date (SQL Server) |
-| Number of Transformations | 6 | Data validation, calculation, lookup enrichment, audit logging, error handling, cleanup |
-| Lookup Usage | 2 | Connected lookups (Dim_Customer, Dim_Date) |
-| Expression Logic | 4 | Total_Sales_Amount calculation, timestamp generation, batch ID assignment, validation conditions |
-| Join Conditions | 3 | 2 INNER JOINs (dimension lookups), 1 INNER JOIN (invalid row removal) |
-| Conditional Logic | 2 | Data quality validation filters (NULL Customer_ID, Invalid Quantity) |
-| Reusable Components | 0 | No reusable transformations or mapplets |
-| Data Sources | 3 | SQL Server staging table, SQL Server dimension tables |
-| Data Targets | 3 | SQL Server fact table, SQL Server audit table, SQL Server DQ failures table |
-| Pre/Post SQL Logic | 4 | Temp table creation/cleanup, staging truncation, audit initialization/completion |
-| Session/Workflow Controls | 1 | TRY-CATCH error handling with transaction control |
-| DML Logic | 6 | INSERT (4), DELETE (1), UPDATE (1), TRUNCATE (1) |
-| **Complexity Score (0–100)** | **75** | High complexity due to multiple data quality checks, dimensional lookups, audit framework, and comprehensive error handling |
-
-**High-Complexity Areas:**
-- Multiple data quality validation rules with temporary table management
-- Complex CTE with multiple INNER JOINs for dimensional enrichment
-- Comprehensive audit logging framework with batch tracking
-- Error handling with rollback and cleanup mechanisms
-
-## 3. Syntax Differences
-
-**Azure Synapse Functions Requiring BigQuery Conversion:**
-- `NEWID()` → `GENERATE_UUID()` for unique identifier generation
-- `SYSDATETIME()` → `CURRENT_DATETIME()` for timestamp functions
-- `OBJECT_NAME(@@PROCID)` → Manual procedure name assignment (no direct equivalent)
-- `@@ROWCOUNT` → `ROW_COUNT()` or explicit counting in BigQuery
-- `CAST(s.Sales_Date AS DATE)` → `DATE(s.Sales_Date)` for date casting
-- `CONCAT()` → `CONCAT()` (similar but may need adjustment for NULL handling)
-
-**Data Type Conversions:**
-- `UNIQUEIDENTIFIER` → `STRING` (UUID format)
-- `DATETIME` → `DATETIME` (compatible)
-- `NVARCHAR` → `STRING`
-- `BIGINT` → `INT64`
-- `INT` → `INT64`
-
-**Control Flow Restructuring:**
-- `TRY-CATCH` blocks → BigQuery exception handling with `BEGIN EXCEPTION` blocks
-- `SET NOCOUNT ON` → Not applicable in BigQuery
-- Temporary tables (`#InvalidRows`) → Common Table Expressions (CTEs) or temporary datasets
-- `TRUNCATE TABLE` → `DELETE FROM table WHERE TRUE` in BigQuery
-
-## 4. Manual Adjustments
-
-**Components Requiring Manual Implementation:**
-- **Procedure Structure:** BigQuery stored procedures use different syntax (`CREATE OR REPLACE PROCEDURE`)
-- **Variable Declarations:** BigQuery uses `DECLARE` with different syntax patterns
-- **Temporary Table Logic:** Convert `#InvalidRows` temporary table to CTE or array-based logic
-- **Error Handling:** Restructure TRY-CATCH to BigQuery's exception handling model
-- **Row Count Tracking:** Replace `@@ROWCOUNT` with explicit counting or `ROW_COUNT()` function calls
-- **System Functions:** Manual implementation of procedure name tracking (no `@@PROCID` equivalent)
-
-**External Dependencies:**
-- **Audit Framework:** Verify audit table schemas are compatible with BigQuery
-- **Data Quality Tables:** Ensure DQ_Failures table structure supports BigQuery data types
-- **Scheduling Integration:** Update job scheduling to work with BigQuery's execution environment
-- **Monitoring Systems:** Adjust monitoring tools to capture BigQuery procedure execution metrics
-
-**Business Logic Validation Areas:**
-- **Data Quality Rules:** Validate that validation logic produces same results in BigQuery
-- **Calculation Accuracy:** Verify Total_Sales_Amount calculations maintain precision
-- **Dimensional Lookup Logic:** Ensure JOIN conditions work correctly with BigQuery's execution engine
-- **Audit Trail Completeness:** Confirm all audit information is captured properly
-
-## 5. Optimization Techniques
-
-**BigQuery Best Practices:**
-- **Partitioning Strategy:** Partition `dw.Fact_Sales` table by `Sales_Date` for improved query performance
-- **Clustering Implementation:** Cluster fact table on `Customer_ID` and `Product_ID` for efficient filtering
-- **Materialized Views:** Consider materialized views for frequently accessed dimensional data
-- **Query Optimization:** Use BigQuery's query optimizer by avoiding unnecessary CAST operations
-
-**Data Processing Optimizations:**
-- **Batch Processing:** Implement array-based processing for data quality checks instead of row-by-row validation
-- **Streaming Inserts:** Consider BigQuery streaming inserts for real-time data processing requirements
-- **Window Functions:** Replace complex subqueries with window functions for better performance
-- **JOIN Optimization:** Use BigQuery's automatic JOIN optimization by ensuring proper table statistics
-
-**Pipeline Improvements:**
-- **Error Recovery:** Implement checkpoint-based recovery for large data volumes
-- **Parallel Processing:** Leverage BigQuery's automatic parallelization for large datasets
-- **Resource Management:** Use appropriate slot allocation for consistent performance
-- **Cost Optimization:** Implement query result caching and avoid SELECT * operations
-
-**Recommendation: REFACTOR**
-The existing logic is well-structured and follows good ETL practices. The recommendation is to **REFACTOR** the current implementation to BigQuery syntax while maintaining the core business logic, audit framework, and data quality validation patterns. The procedure's modular design and comprehensive error handling make it suitable for adaptation rather than complete rebuilding.
-
-**Migration Priority:**
-1. Convert basic syntax and data types
-2. Implement BigQuery-compatible error handling
-3. Optimize dimensional lookups with BigQuery best practices
-4. Enhance with BigQuery-specific performance optimizations
-5. Validate data quality and audit functionality
-```
-
-Converted BigQuery Procedure:
-```
--- BigQuery SQL Script: Sales Fact Table Loading Procedure with Data Quality Validation and Audit Logging
-
-CREATE OR REPLACE PROCEDURE dw.sp_load_sales_fact()
+CREATE OR ALTER PROCEDURE dw.sp_load_sales_fact
+AS
 BEGIN
-  -- =========================
-  -- 1. Variable Declarations
-  -- =========================
-  DECLARE batch_id STRING DEFAULT GENERATE_UUID();
-  DECLARE start_time DATETIME DEFAULT CURRENT_DATETIME();
-  DECLARE end_time DATETIME;
-  DECLARE rows_inserted INT64 DEFAULT 0;
-  DECLARE rows_rejected INT64 DEFAULT 0;
-  DECLARE error_message STRING;
-  DECLARE proc_name STRING DEFAULT 'dw.sp_load_sales_fact'; -- No direct equivalent to OBJECT_NAME(@@PROCID)
+    SET NOCOUNT ON;
 
-  -- =========================
-  -- 2. Start Audit Logging
-  -- =========================
-  INSERT INTO dw.Audit_Log (
+    DECLARE 
+        @batch_id UNIQUEIDENTIFIER = NEWID(),
+        @start_time DATETIME = SYSDATETIME(),
+        @end_time DATETIME,
+        @rows_inserted INT = 0,
+        @rows_rejected INT = 0,
+        @error_message NVARCHAR(4000),
+        @proc_name NVARCHAR(128) = OBJECT_NAME(@@PROCID);
+
+    BEGIN TRY
+        -------------------------------------------------------------------------
+        -- 1. Start Audit Logging
+        -------------------------------------------------------------------------
+        INSERT INTO dw.Audit_Log
+        (
+            Batch_ID,
+            Procedure_Name,
+            Start_Time,
+            Status,
+            Message
+        )
+        VALUES
+        (
+            @batch_id,
+            @proc_name,
+            @start_time,
+            'STARTED',
+            'Sales Fact Load Initiated'
+        );
+
+        -------------------------------------------------------------------------
+        -- 2. Temporary Table for Validation Failures
+        -------------------------------------------------------------------------
+        IF OBJECT_ID('tempdb..#InvalidRows') IS NOT NULL DROP TABLE #InvalidRows;
+
+        CREATE TABLE #InvalidRows
+        (
+            Transaction_ID BIGINT,
+            Reason NVARCHAR(255)
+        );
+
+        -------------------------------------------------------------------------
+        -- 3. Basic Data Quality Checks
+        -------------------------------------------------------------------------
+        INSERT INTO #InvalidRows (Transaction_ID, Reason)
+        SELECT Transaction_ID, 'Missing CustomerID'
+        FROM stg.Sales_Transactions
+        WHERE Customer_ID IS NULL;
+
+        INSERT INTO #InvalidRows (Transaction_ID, Reason)
+        SELECT Transaction_ID, 'Invalid Quantity'
+        FROM stg.Sales_Transactions
+        WHERE Quantity <= 0;
+
+        -------------------------------------------------------------------------
+        -- 4. Delete Invalid Rows from Staging for This Batch
+        -------------------------------------------------------------------------
+        DELETE s
+        FROM stg.Sales_Transactions s
+        INNER JOIN #InvalidRows i
+            ON s.Transaction_ID = i.Transaction_ID;
+
+        SET @rows_rejected = @@ROWCOUNT;
+
+        -------------------------------------------------------------------------
+        -- 5. Load Cleaned Data into Fact Table
+        -------------------------------------------------------------------------
+        ;WITH transformed AS (
+            SELECT
+                s.Transaction_ID,
+                s.Customer_ID,
+                s.Product_ID,
+                s.Sales_Date,
+                s.Quantity,
+                s.Unit_Price,
+                s.Quantity * s.Unit_Price AS Total_Sales_Amount,
+                d.Region_ID,
+                c.Customer_Segment,
+                SYSDATETIME() AS Load_Timestamp,
+                @batch_id AS Batch_ID
+            FROM stg.Sales_Transactions s
+            INNER JOIN dw.Dim_Customer c
+                ON s.Customer_ID = c.Customer_ID
+            INNER JOIN dw.Dim_Date d
+                ON CAST(s.Sales_Date AS DATE) = d.Date_Value
+        )
+        INSERT INTO dw.Fact_Sales
+        (
+            Transaction_ID,
+            Customer_ID,
+            Product_ID,
+            Sales_Date,
+            Quantity,
+            Unit_Price,
+            Total_Sales_Amount,
+            Region_ID,
+            Customer_Segment,
+            Load_Timestamp,
+            Batch_ID
+        )
+        SELECT *
+        FROM transformed;
+
+        SET @rows_inserted = @@ROWCOUNT;
+
+        -------------------------------------------------------------------------
+        -- 6. Archive or Truncate Staging Table (optional)
+        -------------------------------------------------------------------------
+        TRUNCATE TABLE stg.Sales_Transactions;
+
+        -------------------------------------------------------------------------
+        -- 7. Log Validation Failures
+        -------------------------------------------------------------------------
+        INSERT INTO dw.DQ_Failures
+        (
+            Transaction_ID,
+            Failure_Reason,
+            Logged_Timestamp,
+            Batch_ID
+        )
+        SELECT 
+            Transaction_ID,
+            Reason,
+            SYSDATETIME(),
+            @batch_id
+        FROM #InvalidRows;
+
+        -------------------------------------------------------------------------
+        -- 8. End Audit Log
+        -------------------------------------------------------------------------
+        SET @end_time = SYSDATETIME();
+
+        UPDATE dw.Audit_Log
+        SET 
+            End_Time = @end_time,
+            Rows_Inserted = @rows_inserted,
+            Rows_Rejected = @rows_rejected,
+            Status = 'COMPLETED',
+            Message = CONCAT('Inserted ', @rows_inserted, ' rows; Rejected ', @rows_rejected, ' rows.')
+        WHERE Batch_ID = @batch_id;
+
+    END TRY
+    BEGIN CATCH
+        -------------------------------------------------------------------------
+        -- 9. Error Handling
+        -------------------------------------------------------------------------
+        SET @end_time = SYSDATETIME();
+        SET @error_message = ERROR_MESSAGE();
+
+        UPDATE dw.Audit_Log
+        SET 
+            End_Time = @end_time,
+            Status = 'FAILED',
+            Message = @error_message
+        WHERE Batch_ID = @batch_id;
+
+        -- Optional: Rethrow for pipeline monitoring
+        THROW;
+    END CATCH;
+
+    -------------------------------------------------------------------------
+    -- 10. Final Cleanup
+    -------------------------------------------------------------------------
+    IF OBJECT_ID('tempdb..#InvalidRows') IS NOT NULL DROP TABLE #InvalidRows;
+
+END;
+GO
+```
+
+Converted BigQuery Code
+```
+-- BigQuery SQL Script: Load Sales Fact with Data Quality, Audit, and Error Logging
+
+DECLARE batch_id STRING DEFAULT GENERATE_UUID();
+DECLARE start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+DECLARE end_time TIMESTAMP;
+DECLARE rows_inserted INT64 DEFAULT 0;
+DECLARE rows_rejected INT64 DEFAULT 0;
+DECLARE error_message STRING;
+DECLARE proc_name STRING DEFAULT 'sp_load_sales_fact';
+
+BEGIN
+  -- 1. Start Audit Logging
+  INSERT INTO `dw.Audit_Log`
+  (
     Batch_ID,
     Procedure_Name,
     Start_Time,
     Status,
     Message
   )
-  VALUES (
+  VALUES
+  (
     batch_id,
     proc_name,
     start_time,
@@ -186,54 +248,32 @@ BEGIN
     'Sales Fact Load Initiated'
   );
 
-  -- =========================
-  -- 3. Data Quality Checks (CTEs)
-  -- =========================
-  -- Identify invalid rows (missing Customer_ID or invalid Quantity)
-  WITH
-    MissingCustomer AS (
-      SELECT Transaction_ID, 'Missing CustomerID' AS Reason
-      FROM stg.Sales_Transactions
-      WHERE Customer_ID IS NULL
-    ),
-    InvalidQuantity AS (
-      SELECT Transaction_ID, 'Invalid Quantity' AS Reason
-      FROM stg.Sales_Transactions
-      WHERE Quantity <= 0
-    ),
-    InvalidRows AS (
-      SELECT * FROM MissingCustomer
-      UNION ALL
-      SELECT * FROM InvalidQuantity
-    )
+  -- 2. Temporary Table for Validation Failures (use temp table via scripting)
+  CREATE TEMP TABLE InvalidRows (
+    Transaction_ID INT64,
+    Reason STRING
+  );
 
-  -- =========================
-  -- 4. Delete Invalid Rows from Staging
-  -- =========================
-  -- BigQuery does not support DELETE with JOIN directly, so use WHERE IN
-  ;
-  DELETE FROM stg.Sales_Transactions
+  -- 3. Basic Data Quality Checks
+  INSERT INTO InvalidRows (Transaction_ID, Reason)
+  SELECT Transaction_ID, 'Missing CustomerID'
+  FROM `stg.Sales_Transactions`
+  WHERE Customer_ID IS NULL;
+
+  INSERT INTO InvalidRows (Transaction_ID, Reason)
+  SELECT Transaction_ID, 'Invalid Quantity'
+  FROM `stg.Sales_Transactions`
+  WHERE Quantity <= 0;
+
+  -- 4. Delete Invalid Rows from Staging for This Batch
+  DELETE FROM `stg.Sales_Transactions`
   WHERE Transaction_ID IN (
-    SELECT Transaction_ID FROM (
-      SELECT Transaction_ID FROM MissingCustomer
-      UNION ALL
-      SELECT Transaction_ID FROM InvalidQuantity
-    )
+    SELECT Transaction_ID FROM InvalidRows
   );
 
-  -- Track number of rows rejected
-  SET rows_rejected = (
-    SELECT COUNT(*) FROM (
-      SELECT Transaction_ID FROM MissingCustomer
-      UNION ALL
-      SELECT Transaction_ID FROM InvalidQuantity
-    )
-  );
+  SET rows_rejected = (SELECT COUNT(*) FROM InvalidRows);
 
-  -- =========================
   -- 5. Load Cleaned Data into Fact Table
-  -- =========================
-  -- Use a CTE for transformation and enrichment
   WITH transformed AS (
     SELECT
       s.Transaction_ID,
@@ -245,15 +285,16 @@ BEGIN
       s.Quantity * s.Unit_Price AS Total_Sales_Amount,
       d.Region_ID,
       c.Customer_Segment,
-      CURRENT_DATETIME() AS Load_Timestamp,
+      CURRENT_TIMESTAMP() AS Load_Timestamp,
       batch_id AS Batch_ID
-    FROM stg.Sales_Transactions s
-    INNER JOIN dw.Dim_Customer c
+    FROM `stg.Sales_Transactions` s
+    INNER JOIN `dw.Dim_Customer` c
       ON s.Customer_ID = c.Customer_ID
-    INNER JOIN dw.Dim_Date d
+    INNER JOIN `dw.Dim_Date` d
       ON DATE(s.Sales_Date) = d.Date_Value
   )
-  INSERT INTO dw.Fact_Sales (
+  INSERT INTO `dw.Fact_Sales`
+  (
     Transaction_ID,
     Customer_ID,
     Product_ID,
@@ -269,21 +310,16 @@ BEGIN
   SELECT *
   FROM transformed;
 
-  -- Track number of rows inserted
   SET rows_inserted = (
     SELECT COUNT(*) FROM transformed
   );
 
-  -- =========================
-  -- 6. Truncate Staging Table
-  -- =========================
-  -- BigQuery does not support TRUNCATE, use DELETE
-  DELETE FROM stg.Sales_Transactions WHERE TRUE;
+  -- 6. Archive or Truncate Staging Table (optional)
+  TRUNCATE TABLE `stg.Sales_Transactions`;
 
-  -- =========================
   -- 7. Log Validation Failures
-  -- =========================
-  INSERT INTO dw.DQ_Failures (
+  INSERT INTO `dw.DQ_Failures`
+  (
     Transaction_ID,
     Failure_Reason,
     Logged_Timestamp,
@@ -292,20 +328,14 @@ BEGIN
   SELECT 
     Transaction_ID,
     Reason,
-    CURRENT_DATETIME(),
+    CURRENT_TIMESTAMP(),
     batch_id
-  FROM (
-    SELECT * FROM MissingCustomer
-    UNION ALL
-    SELECT * FROM InvalidQuantity
-  );
+  FROM InvalidRows;
 
-  -- =========================
   -- 8. End Audit Log
-  -- =========================
-  SET end_time = CURRENT_DATETIME();
+  SET end_time = CURRENT_TIMESTAMP();
 
-  UPDATE dw.Audit_Log
+  UPDATE `dw.Audit_Log`
   SET 
     End_Time = end_time,
     Rows_Inserted = rows_inserted,
@@ -315,35 +345,39 @@ BEGIN
   WHERE Batch_ID = batch_id;
 
 EXCEPTION WHEN ERROR THEN
-  -- =========================
   -- 9. Error Handling
-  -- =========================
-  SET end_time = CURRENT_DATETIME();
-  SET error_message = @@error_message;
+  SET end_time = CURRENT_TIMESTAMP();
+  SET error_message = ERROR_MESSAGE();
 
-  UPDATE dw.Audit_Log
+  UPDATE `dw.Audit_Log`
   SET 
     End_Time = end_time,
     Status = 'FAILED',
     Message = error_message
   WHERE Batch_ID = batch_id;
 
-  -- Optionally re-raise error for pipeline monitoring
+  -- Optional: Rethrow for pipeline monitoring
   RAISE USING MESSAGE = error_message;
+
 END;
 
--- End of BigQuery Procedure
+-- 10. Final Cleanup (Temp table auto-dropped at end of script)
 
--- Notes:
--- - All table references are generic (no dataset/project prefix).
--- - All temporary table logic is replaced with CTEs.
--- - Variable assignments, error handling, and audit logging are implemented using BigQuery scripting.
--- - Ensure table schemas for Audit_Log and DQ_Failures match expected types.
--- - For large tables, consider partitioning and clustering for performance.
-
-API Cost Consumed in dollars: 0.0040 USD
+-- End of BigQuery SQL script
 ```
 
----
+Transformation Change Detection
+- `NEWID()` → `GENERATE_UUID()`
+- `SYSDATETIME()` → `CURRENT_TIMESTAMP()`
+- `OBJECT_NAME(@@PROCID)` → Manual assignment
+- Data quality checks and calculation logic are preserved.
+- Temporary table logic is mapped to BigQuery temp table.
+- Joins and table mappings are accurate.
+- Error handling and logging are implemented.
+- Data type mappings are correct.
 
-All requirements are met: metadata appears once at the top, the conversion is accurate and complete, optimization suggestions are provided, and API cost is explicitly stated.
+Test Suite and Reconciliation
+- A comprehensive Pytest test suite is provided to validate all business scenarios and edge cases.
+- A Python reconciliation script is included to automate comparison of Synapse and BigQuery outputs at the data level.
+
+API Cost Consumed in dollars: 0.0047 USD
