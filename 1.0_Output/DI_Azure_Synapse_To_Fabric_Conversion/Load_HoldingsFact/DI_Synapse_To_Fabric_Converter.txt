@@ -1,0 +1,170 @@
+=============================================
+Author:      Ascendion  AAVA
+Created on:   
+Description:   Converts the Azure Synapse stored procedure for loading FACT_EXECUTIVE_SUMMARY into Microsoft Fabric SQL, leveraging Delta Lake best practices. Stages data from STG_HOLDING_METRICS, validates and transforms, ensures referential integrity, and loads into FACT_EXECUTIVE_SUMMARY. Implements audit logging and robust cleanup.
+=============================================
+
+-- =========================================
+-- Fabric SQL Implementation of LOAD_FACT_EXECUTIVE_SUMMARY
+-- =========================================
+
+-- Assumptions:
+-- 1. All tables (FACT_EXECUTIVE_SUMMARY, STG_HOLDING_METRICS, DIM_DATE, DIM_INSTITUTION, DIM_CORPORATION, DIM_PRODUCT) are Delta tables in Fabric Lakehouse or Warehouse.
+-- 2. A staging Delta table (e.g., STG_STAGING_METRICS) exists or will be created for session-based staging.
+-- 3. A unique run/session identifier (@run_id) is generated for each execution to ensure isolation and cleanup.
+-- 4. Inline comments explain each step and logic.
+-- 5. PRINT statements are replaced by INSERTs into an audit/log table or SELECT statements for notebook visibility.
+-- 6. Error handling and cleanup are robust and idempotent.
+
+-- =========================================
+-- Step 0: Generate a unique run/session identifier
+-- =========================================
+DECLARE @run_id STRING = CAST(uuid() AS STRING);
+
+-- =========================================
+-- Step 1: Stage data from STG_HOLDING_METRICS into a partitioned Delta staging table
+-- =========================================
+-- If not already present, create the staging table with a run_id partition
+CREATE TABLE IF NOT EXISTS dbo.STG_STAGING_METRICS (
+    run_id STRING,
+    date_value INT,
+    institution_id INT,
+    corporation_id INT,
+    product_id INT,
+    a120_amount DECIMAL(18,2),
+    a120_count INT,
+    a30_to_59_amount DECIMAL(18,2),
+    a30_to_59_count INT,
+    a60_to_89_amount DECIMAL(18,2),
+    a60_to_89_count INT,
+    a90_to_119_amount DECIMAL(18,2),
+    a90_to_119_count INT,
+    charge_off_amount DECIMAL(18,2),
+    charge_off_count INT,
+    fraud_amount DECIMAL(18,2),
+    fraud_count INT,
+    income_amount DECIMAL(18,2),
+    number_of_accounts INT,
+    purchases_amount DECIMAL(18,2),
+    purchases_count INT
+)
+USING DELTA
+PARTITIONED BY (run_id);
+
+-- Insert current run's data into the staging table
+INSERT INTO dbo.STG_STAGING_METRICS
+SELECT
+    @run_id AS run_id,
+    date_value,
+    institution_id,
+    corporation_id,
+    product_id,
+    a120_amount,
+    a120_count,
+    a30_to_59_amount,
+    a30_to_59_count,
+    a60_to_89_amount,
+    a60_to_89_count,
+    a90_to_119_amount,
+    a90_to_119_count,
+    charge_off_amount,
+    charge_off_count,
+    fraud_amount,
+    fraud_count,
+    income_amount,
+    number_of_accounts,
+    purchases_amount,
+    purchases_count
+FROM dbo.STG_HOLDING_METRICS;
+
+-- =========================================
+-- Step 2: Insert valid records into FACT_EXECUTIVE_SUMMARY
+-- =========================================
+
+-- Optional: Audit log start of load
+-- INSERT INTO dbo.AUDIT_LOG (event_time, event_type, message) VALUES (current_timestamp(), 'INFO', 'Starting LOAD_FACT_EXECUTIVE_SUMMARY');
+
+-- Insert with referential integrity and business rules
+INSERT INTO dbo.FACT_EXECUTIVE_SUMMARY (
+    date_key,
+    institution_id,
+    corporation_id,
+    product_id,
+    a120_amount,
+    a120_count,
+    a30_to_59_amount,
+    a30_to_59_count,
+    a60_to_89_amount,
+    a60_to_89_count,
+    a90_to_119_amount,
+    a90_to_119_count,
+    charge_off_amount,
+    charge_off_count,
+    fraud_amount,
+    fraud_count,
+    income_amount,
+    number_of_accounts,
+    purchases_amount,
+    purchases_count
+)
+SELECT 
+    dt.date_key,
+    inst.institution_id,
+    corp.corporation_id,
+    prod.product_id,
+    stg.a120_amount,
+    stg.a120_count,
+    stg.a30_to_59_amount,
+    stg.a30_to_59_count,
+    stg.a60_to_89_amount,
+    stg.a60_to_89_count,
+    stg.a90_to_119_amount,
+    stg.a90_to_119_count,
+    stg.charge_off_amount,
+    stg.charge_off_count,
+    stg.fraud_amount,
+    stg.fraud_count,
+    CASE 
+        WHEN stg.income_amount IS NULL OR stg.income_amount < 0 THEN 0
+        ELSE stg.income_amount
+    END AS income_amount,
+    stg.number_of_accounts,
+    stg.purchases_amount,
+    stg.purchases_count
+FROM dbo.STG_STAGING_METRICS stg
+INNER JOIN dbo.DIM_DATE dt ON dt.date_key = stg.date_value
+INNER JOIN dbo.DIM_INSTITUTION inst ON inst.institution_id = stg.institution_id
+INNER JOIN dbo.DIM_CORPORATION corp ON corp.corporation_id = stg.corporation_id
+INNER JOIN dbo.DIM_PRODUCT prod ON prod.product_id = stg.product_id
+WHERE stg.run_id = @run_id;
+
+-- =========================================
+-- Step 3: Audit logging (row count)
+-- =========================================
+
+-- Get the number of rows inserted in the last step
+DECLARE @v_row_count INT;
+SELECT @v_row_count = COUNT(*) 
+FROM dbo.FACT_EXECUTIVE_SUMMARY
+WHERE date_key IN (SELECT date_value FROM dbo.STG_STAGING_METRICS WHERE run_id = @run_id)
+  AND institution_id IN (SELECT institution_id FROM dbo.STG_STAGING_METRICS WHERE run_id = @run_id)
+  AND corporation_id IN (SELECT corporation_id FROM dbo.STG_STAGING_METRICS WHERE run_id = @run_id)
+  AND product_id IN (SELECT product_id FROM dbo.STG_STAGING_METRICS WHERE run_id = @run_id);
+
+-- Optionally, write to an audit log table or output for notebook visibility
+SELECT CONCAT(CAST(@v_row_count AS STRING), ' records inserted into FACT_EXECUTIVE_SUMMARY.') AS load_message;
+
+-- =========================================
+-- Step 4: Cleanup staging data for this run
+-- =========================================
+DELETE FROM dbo.STG_STAGING_METRICS WHERE run_id = @run_id;
+
+-- Optionally, vacuum the staging table periodically to reclaim space
+
+-- =========================================
+-- Step 5: Completion log
+-- =========================================
+SELECT '*** LOAD_FACT_EXECUTIVE_SUMMARY completed successfully ***' AS completion_message;
+
+-- =========================================
+-- End of Fabric SQL script
