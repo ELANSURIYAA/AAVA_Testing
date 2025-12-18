@@ -1,101 +1,120 @@
 =============================================
 Author:        Ascendion AVA
 Created on:   
-Description:   Loads, validates, and enriches sales transaction data from staging to the sales fact table with audit and data quality logging.
+Description:   Documentation and migration analysis for the Azure Synapse stored procedure 'dw.sp_load_sales_fact', which performs data quality checks, loads fact sales data, and manages audit logging for ETL workflows.
 =============================================
 
-## 1. Procedure Overview
+# 1. Procedure Overview
 
-This document analyzes the Azure Synapse stored procedure `dw.sp_load_sales_fact`, which implements an ETL workflow to load sales transaction data from a staging table (`stg.Sales_Transactions`) into the data warehouse fact table (`dw.Fact_Sales`). The workflow performs data validation, enrichment via joins with dimension tables, audit logging, and records data quality failures. The key business objective is to ensure only clean, validated, and enriched sales data is loaded into the analytics-ready fact table, supporting enterprise reporting, analytics, and regulatory compliance.
+**Workflow/Session Mapping:**  
+- This stored procedure represents a single ETL mapping/workflow session for loading sales fact data.
+- **Business Objective:**  
+  The procedure supports the data integration and quality assurance process for the sales fact table in a data warehouse. It performs data cleansing, enrichment (joining with dimension tables), error logging, and audit tracking to ensure reliable and traceable data loading from staging to the fact table.
 
-**Number of mappings per workflow/session:** 1 (single stored procedure encapsulating the entire ETL workflow)
-
----
-
-## 2. Complexity Metrics
-
-| Metric                       | Value / Description                                                                                  |
-|------------------------------|-----------------------------------------------------------------------------------------------------|
-| Number of Source Qualifiers  | 1 (stg.Sales_Transactions; SQL Server)                                                              |
-| Number of Transformations    | 4 (Validation, Join with Customer [SQL Server], Join with Date [SQL Server], Derived Column)        |
-| Lookup Usage                 | 2 (dw.Dim_Customer, dw.Dim_Date; both as inner joins, equivalent to connected lookups)              |
-| Expression Logic             | 2 (Total_Sales_Amount = Quantity * Unit_Price; Load_Timestamp = SYSDATETIME())                      |
-| Join Conditions              | 2 (Inner Join: Customer_ID, Inner Join: Sales_Date = Date_Value)                                    |
-| Conditional Logic            | 2 (Validation: Customer_ID IS NULL, Quantity <= 0; Error handling via TRY/CATCH)                    |
-| Reusable Components          | 0 (no explicit reusable transformations, mapplets, or sessions)                                     |
-| Data Sources                 | 1 (stg.Sales_Transactions; SQL Server table)                                                        |
-| Data Targets                 | 3 (dw.Fact_Sales, dw.Audit_Log, dw.DQ_Failures; all SQL Server tables)                             |
-| Pre/Post SQL Logic           | 2 (Audit Log insert/update, DQ Failure logging)                                                     |
-| Session/Workflow Controls    | 1 (TRY/CATCH error handling, status updates in Audit Log)                                           |
-| DML Logic                    | 4 (INSERT into Audit_Log, INSERT into Fact_Sales, DELETE from staging, TRUNCATE staging, INSERT into DQ_Failures, UPDATE Audit_Log) |
-| Complexity Score (0–100)     | 55 (moderate complexity; multiple joins, validation, audit, and error handling)                     |
-
-**High-complexity areas:**
-- Nested control flow (TRY/CATCH with audit/error logging)
-- Multiple lookups (joins with two dimension tables)
-- Branching logic (validation and error handling)
-- DML operations affecting multiple tables in a transactional context
+**Key Steps:**
+- Audit log initiation and completion.
+- Data quality validation (missing CustomerID, invalid Quantity).
+- Cleansing of staging data by removing invalid records.
+- Enrichment via joins with customer and date dimensions.
+- Loading cleaned/enriched data into the fact table.
+- Logging of validation failures.
+- Error handling and audit log updates.
 
 ---
 
-## 3. Syntax Differences
+# 2. Complexity Metrics
 
-- **Functions:**
-    - `SYSDATETIME()` (Azure Synapse) → `current_timestamp()` (PySpark)
-    - `NEWID()` (Azure Synapse) → `uuid.uuid4()` (PySpark, via Python)
-    - `OBJECT_NAME(@@PROCID)` (Azure Synapse) → No direct equivalent; can be set as a string in PySpark
-    - `@@ROWCOUNT` (Azure Synapse) → Use DataFrame `.count()` in PySpark after actions
-    - `TRY/CATCH` (T-SQL) → `try/except` blocks in Python
+| Metric                      | Value/Type                                                                                 |
+|-----------------------------|-------------------------------------------------------------------------------------------|
+| Number of Source Qualifiers | 1 (stg.Sales_Transactions)                                                                |
+| Number of Transformations   | 5 (Data Quality Check, Join with Dim_Customer, Join with Dim_Date, Expression, Aggregation)|
+| Lookup Usage                | 0 (No explicit lookup transformation; joins used instead)                                 |
+| Expression Logic            | 1 (Total_Sales_Amount = Quantity * Unit_Price; simple, not deeply nested)                |
+| Join Conditions             | 2 (Inner Join: Customer_ID, Inner Join: Sales_Date to Date_Value)                        |
+| Conditional Logic           | 2 (WHERE for validation, DELETE with JOIN for cleansing)                                 |
+| Reusable Components         | 0 (No reusable transformations or mapplets)                                               |
+| Data Sources                | 1 (SQL Server: stg.Sales_Transactions)                                                    |
+| Data Targets                | 3 (SQL Server: dw.Fact_Sales, dw.Audit_Log, dw.DQ_Failures)                              |
+| Pre/Post SQL Logic          | 1 (Truncate staging table after load)                                                     |
+| Session/Workflow Controls   | 1 (TRY/CATCH for error handling and audit updates)                                        |
+| DML Logic                   | 4 (INSERT, DELETE, TRUNCATE, UPDATE)                                                      |
+| Complexity Score (0–100)    | 45 (Moderate: standard ETL, some control flow, basic validation, no deep nesting)         |
 
-- **Data Types:**
-    - `UNIQUEIDENTIFIER` → `StringType()` in PySpark (UUID as string)
-    - `DATETIME` → `TimestampType()` in PySpark
-    - `NVARCHAR` → `StringType()` in PySpark
-
-- **Temporary Tables:**
-    - `#InvalidRows` (T-SQL temp table) → PySpark DataFrame, possibly persisted as a temp view
-
-- **DML/Workflow:**
-    - `INSERT INTO ... SELECT ...` → DataFrame `.write.insertInto()` or `.write.saveAsTable()` in PySpark
-    - `DELETE ... FROM ... JOIN ...` → DataFrame anti-join or filter
-    - `TRUNCATE TABLE` → Overwrite mode in DataFrame write, or explicit `.delete()` if supported
-
-- **Audit and DQ Logging:**
-    - Direct table inserts/updates in SQL → DataFrame writes in PySpark
+**High-Complexity Areas:**
+- Audit and error handling logic (TRY/CATCH, audit log updates).
+- Data quality validation and cleansing (multiple validation rules).
+- Control flow for error propagation and logging.
 
 ---
 
-## 4. Manual Adjustments
+# 3. Syntax Differences
 
-- **Manual Implementation Required:**
-    - Audit logging logic (start/end, status, row counts) must be re-implemented using DataFrame operations and explicit writes to the audit table.
-    - Error handling and transaction management: PySpark does not support SQL-style transactions; must use try/except and ensure idempotency.
-    - Temporary tables (`#InvalidRows`) must be replaced with DataFrames and/or temp views.
-    - Row count tracking (`@@ROWCOUNT`) must be explicitly calculated after DataFrame actions.
-    - Procedure metadata (procedure name, batch ID) must be handled via variables in Python.
-    - Any pipeline triggers or scheduling must be re-implemented using Databricks Jobs or Workflows.
+- **Functions without direct PySpark equivalents:**
+  - `SYSDATETIME()` → Use `current_timestamp()` in PySpark.
+  - `OBJECT_NAME(@@PROCID)` → No direct equivalent; procedure name may be passed as a parameter or hardcoded.
+  - `NEWID()` → Use `uuid.uuid4()` or `expr("uuid()")` in PySpark.
+  - `@@ROWCOUNT` → Use DataFrame `.count()` after actions in PySpark.
+
+- **Data Type Conversions:**
+  - `DATETIME` → PySpark `TimestampType`.
+  - `UNIQUEIDENTIFIER` → PySpark `StringType` (UUIDs).
+  - `NVARCHAR` → PySpark `StringType`.
+  - `BIGINT` → PySpark `LongType`.
+
+- **Workflow/Control Logic:**
+  - Temporary tables (`#InvalidRows`) → Use temporary DataFrames or persisted tables in Spark.
+  - TRY/CATCH blocks → Use Python `try/except` for error handling.
+  - Audit logging and status updates → Implement as DataFrame writes or via Spark SQL.
+
+- **DML Operations:**
+  - `DELETE ... FROM ... INNER JOIN ...` → Use anti-joins or DataFrame filtering.
+  - `TRUNCATE TABLE` → Use `overwrite` mode in DataFrame writes or explicit `spark.sql("TRUNCATE TABLE ...")`.
+
+---
+
+# 4. Manual Adjustments
+
+- **Components Requiring Manual Implementation:**
+  - Audit logging pattern (status, timestamps, messages) must be manually coded in PySpark.
+  - Error handling and propagation (Python exceptions, logging).
+  - Data quality validation logic (row-level checks, error collection) to be implemented using DataFrame filters and unions.
+  - Temporary table (#InvalidRows) logic to be mapped to temporary DataFrames or persisted tables.
+  - Batch ID and procedure name handling (UUID generation, logging context).
+  - Post-load truncation of staging table (may require Spark SQL or JDBC execution).
+  - All SQL DML operations (INSERT, DELETE, UPDATE) must be translated to DataFrame operations or Spark SQL.
 
 - **External Dependencies:**
-    - No explicit external scripts, but relies on existence of referenced tables and audit/DQ infrastructure.
+  - Any references to external stored procedures, shell scripts, or pre/post SQL blocks must be manually reviewed and implemented in the Databricks orchestration layer if needed.
 
 - **Business Logic Review:**
-    - Validation rules (Customer_ID, Quantity) should be reviewed for completeness.
-    - Ensure data type compatibility and referential integrity in joins.
-    - Confirm audit and DQ logging meets compliance and traceability requirements post-migration.
+  - Validation rules and error messages should be reviewed for business accuracy after migration.
+  - Audit and DQ logging schema must be validated for compatibility.
 
 ---
 
-## 5. Optimization Techniques
+# 5. Optimization Techniques
 
-- **Partitioning:** Use partitioning on large tables (e.g., by Sales_Date or Batch_ID) to optimize read/write performance.
-- **Caching:** Cache dimension tables (`Dim_Customer`, `Dim_Date`) if reused in multiple joins.
-- **Broadcast Joins:** Use broadcast joins for small dimension tables to avoid shuffles.
-- **Pipeline Chaining:** Chain filters and joins in a single DataFrame pipeline to minimize intermediate writes.
-- **Window Functions:** Use Spark SQL window functions to simplify aggregations if needed.
-- **Error Handling:** Use Python `try/except` for robust error handling and ensure audit logs are updated in all cases.
-- **Refactor vs. Rebuild:** Recommend **Refactor**—retain most of the original logic, but leverage Spark best practices for performance and scalability. Consider **Rebuild** only if business logic is to be significantly enhanced or simplified.
+- **Partitioning:**  
+  Partition large tables (e.g., Fact_Sales, Audit_Log) by date or batch ID to optimize read/write performance.
+
+- **Caching:**  
+  Cache dimension tables (Dim_Customer, Dim_Date) if reused across multiple transformations to avoid recomputation.
+
+- **Broadcast Joins:**  
+  Use broadcast joins for small dimension tables (e.g., Dim_Customer, Dim_Date) to speed up join operations.
+
+- **Pipeline Transformation:**  
+  Chain filters and joins in a single DataFrame pipeline to minimize intermediate shuffles and improve execution efficiency.
+
+- **Window Functions:**  
+  Use window functions for aggregations or deduplication if needed in future enhancements.
+
+- **Error Handling:**  
+  Implement robust error handling and logging using Python’s exception handling and Spark’s logging utilities.
+
+- **Refactor vs. Rebuild:**  
+  **Recommendation:** Refactor. The logic is well-structured and can be mapped directly to PySpark DataFrame operations. However, if audit and DQ logging requirements become more complex, consider modularizing these components for reuse.
 
 ---
 
-**API Cost:**  
-apiCost: 0.018 USD
+**apiCost: 0.014 USD**
