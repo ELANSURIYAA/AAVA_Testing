@@ -1,92 +1,75 @@
 =============================================
 Author:        Ascendion AVA
 Created on:    
-Description:   Loads, cleanses, transforms, and audits sales transaction data from staging into the sales fact table, with data quality validation, enrichment, and error handling.
+Description:   Loads, audits, and validates sales transactions from staging to the Fact_Sales table, including data quality checks, audit logging, and error handling.
 =============================================
 
 Procedure Overview:
-The stored procedure [dw.sp_load_sales_fact] orchestrates the ETL process for sales transactions. It performs data quality checks, removes invalid records, enriches valid data with customer and date dimension information, loads the cleansed data into the sales fact table, logs all actions for auditing, and records any data quality failures. This ensures that only high-quality, enriched sales data is integrated into the data warehouse, supporting accurate reporting and analytics.
+This stored procedure (`dw.sp_load_sales_fact`) orchestrates the ETL process for loading sales transactions from a staging table (`stg.Sales_Transactions`) into the data warehouse fact table (`dw.Fact_Sales`). It performs data quality checks, logs audit information, manages rejected records, and handles errors robustly. The business objective is to ensure only clean, validated sales data is loaded into analytics-ready tables, supporting accurate reporting and downstream analytics.
 
 Logic Details:
-- Declares variables for audit and tracking (batch ID, timestamps, row counts, error message, procedure name).
-- Starts audit logging by inserting a "STARTED" status into the audit log.
-- Creates a temporary table (#InvalidRows) to capture validation failures.
-- Performs data quality checks: flags records with missing Customer_ID or invalid Quantity.
-- Deletes invalid records from staging and counts rejected rows.
-- Transforms and loads valid records into dw.Fact_Sales, joining with customer and date dimensions, and calculating Total_Sales_Amount.
-- Truncates the staging table after successful load.
-- Logs validation failures into dw.DQ_Failures.
-- Updates the audit log with completion status, row counts, and messages.
-- Handles errors with TRY/CATCH, updating the audit log with failure status and error details.
-- Cleans up temporary tables at the end.
+- The procedure begins by initializing audit logging for the ETL batch.
+- It creates a temporary table for invalid rows and performs data quality checks (missing CustomerID, invalid Quantity).
+- Invalid records are deleted from the staging table and logged for audit purposes.
+- Cleaned data is joined with dimension tables (`dw.Dim_Customer`, `dw.Dim_Date`), transformed (calculates Total_Sales_Amount), and loaded into the fact table (`dw.Fact_Sales`).
+- The staging table is truncated after the load.
+- All rejected records are logged to the data quality failures table (`dw.DQ_Failures`).
+- Audit log is updated with row counts and status.
+- Robust error handling updates the audit log on failure and rethrows the error for pipeline monitoring.
+- Temporary tables are cleaned up at the end.
 
 Data Flow Details:
-1. Audit log entry marks the start of the process.
-2. Temporary table #InvalidRows is created for validation failures.
-3. Data quality checks identify invalid transactions (missing Customer_ID, Quantity <= 0) and insert them into #InvalidRows.
-4. Invalid records are deleted from stg.Sales_Transactions.
-5. Valid records are selected, joined with dw.Dim_Customer and dw.Dim_Date, transformed, and inserted into dw.Fact_Sales.
-6. Staging table is truncated to prepare for next batch.
-7. Validation failures are logged into dw.DQ_Failures.
-8. Audit log is updated with completion details.
-9. Errors are caught and logged; process is terminated if an error occurs.
-10. Temporary table is dropped for cleanup.
+1. Extract data from `stg.Sales_Transactions`.
+2. Validate data for missing/invalid values and log failures.
+3. Remove invalid records from staging.
+4. Transform and enrich valid records by joining with dimension tables.
+5. Load transformed records into `dw.Fact_Sales`.
+6. Truncate staging table.
+7. Log rejected records to `dw.DQ_Failures`.
+8. Update audit logs with process status and row counts.
+9. Handle errors and clean up temporary tables.
 
 Data Transformations:
-- Data quality validation: removes records with missing Customer_ID or non-positive Quantity.
-- Enrichment: joins with customer and date dimensions to add Customer_Segment and Region_ID.
-- Calculation: computes Total_Sales_Amount as Quantity * Unit_Price.
-- Adds system-generated Load_Timestamp and Batch_ID for traceability.
-- Only valid, enriched records are loaded into the fact table.
-- Invalid records are tracked for data quality reporting.
+- Calculation of `Total_Sales_Amount` as `Quantity * Unit_Price`.
+- Enrichment of sales records with `Region_ID` (from `dw.Dim_Date`) and `Customer_Segment` (from `dw.Dim_Customer`).
+- Data quality validation for missing CustomerID and invalid Quantity.
+- Audit and error messages dynamically generated for each batch.
 
 Data Mapping:
 
-| Target Table Name | Target Column Name    | Source Table Name         | Source Column Name    | Remarks                                 |
-|-------------------|----------------------|--------------------------|----------------------|-----------------------------------------|
-| Fact_Sales        | Transaction_ID       | Sales_Transactions       | Transaction_ID       | After cleansing and transformation      |
-| Fact_Sales        | Customer_ID          | Sales_Transactions       | Customer_ID          | Only valid (non-null)                   |
-| Fact_Sales        | Product_ID           | Sales_Transactions       | Product_ID           |                                         |
-| Fact_Sales        | Sales_Date           | Sales_Transactions       | Sales_Date           | Joined with Dim_Date                    |
-| Fact_Sales        | Quantity             | Sales_Transactions       | Quantity             | Must be > 0                             |
-| Fact_Sales        | Unit_Price           | Sales_Transactions       | Unit_Price           |                                         |
-| Fact_Sales        | Total_Sales_Amount   | Calculated               | Quantity * Unit_Price| Transformation                          |
-| Fact_Sales        | Region_ID            | Dim_Date                 | Region_ID            | Enrichment via join                     |
-| Fact_Sales        | Customer_Segment     | Dim_Customer             | Customer_Segment     | Enrichment via join                     |
-| Fact_Sales        | Load_Timestamp       | System                   | SYSDATETIME()        | Transformation                          |
-| Fact_Sales        | Batch_ID             | Generated                | @batch_id            | Transformation                          |
-| Audit_Log         | Batch_ID             | Generated                | @batch_id            | Audit tracking                          |
-| Audit_Log         | Procedure_Name       | System                   | OBJECT_NAME(@@PROCID)| Audit tracking                          |
-| Audit_Log         | Start_Time           | System                   | SYSDATETIME()        | Audit tracking                          |
-| Audit_Log         | End_Time             | System                   | SYSDATETIME()        | Audit tracking                          |
-| Audit_Log         | Rows_Inserted        | System                   | @@ROWCOUNT           | Audit tracking                          |
-| Audit_Log         | Rows_Rejected        | System                   | @@ROWCOUNT           | Audit tracking                          |
-| Audit_Log         | Status               | System                   | 'STARTED'/'COMPLETED'| Audit tracking                          |
-| Audit_Log         | Message              | System                   | Custom message       | Audit tracking                          |
-| DQ_Failures       | Transaction_ID       | #InvalidRows             | Transaction_ID       | Validation failure                      |
-| DQ_Failures       | Failure_Reason       | #InvalidRows             | Reason               | Validation failure                      |
-| DQ_Failures       | Logged_Timestamp     | System                   | SYSDATETIME()        | Audit tracking                          |
-| DQ_Failures       | Batch_ID             | Generated                | @batch_id            | Audit tracking                          |
+| Target Table Name | Target Column Name    | Source Table Name      | Source Column Name    | Remarks (1 to 1 mapping, Transformation, Validation)                 |
+|-------------------|----------------------|-----------------------|----------------------|-----------------------------------------------------------------------|
+| dw.Fact_Sales     | Transaction_ID       | stg.Sales_Transactions| Transaction_ID       | 1 to 1 mapping                                                        |
+| dw.Fact_Sales     | Customer_ID          | stg.Sales_Transactions| Customer_ID          | 1 to 1 mapping, validated (not null)                                  |
+| dw.Fact_Sales     | Product_ID           | stg.Sales_Transactions| Product_ID           | 1 to 1 mapping                                                        |
+| dw.Fact_Sales     | Sales_Date           | stg.Sales_Transactions| Sales_Date           | 1 to 1 mapping                                                        |
+| dw.Fact_Sales     | Quantity             | stg.Sales_Transactions| Quantity             | 1 to 1 mapping, validated (>0)                                        |
+| dw.Fact_Sales     | Unit_Price           | stg.Sales_Transactions| Unit_Price           | 1 to 1 mapping                                                        |
+| dw.Fact_Sales     | Total_Sales_Amount   | stg.Sales_Transactions| Quantity, Unit_Price | Transformation: Quantity * Unit_Price                                 |
+| dw.Fact_Sales     | Region_ID            | dw.Dim_Date           | Region_ID            | Transformation: join on Sales_Date                                    |
+| dw.Fact_Sales     | Customer_Segment     | dw.Dim_Customer       | Customer_Segment     | Transformation: join on Customer_ID                                   |
+| dw.Fact_Sales     | Load_Timestamp       | System                | SYSDATETIME()        | Transformation: current timestamp                                     |
+| dw.Fact_Sales     | Batch_ID             | System                | @batch_id            | Transformation: batch identifier                                      |
 
 Technical Complexity:
 
-| Parameter        | Value                                                                                  |
-|------------------|----------------------------------------------------------------------------------------|
-| Procedure Name   | dw.sp_load_sales_fact                                                                  |
-| Source Tables    | 3 (stg.Sales_Transactions, dw.Dim_Customer, dw.Dim_Date)                               |
-| Target Tables    | 3 (dw.Fact_Sales, dw.Audit_Log, dw.DQ_Failures)                                        |
-| Data Flows       | 4 (validation, deletion, transformation/load, audit/DQ logging)                        |
-| Transformations  | 5 (validation, joins, calculation, enrichment, audit/error handling)                   |
-| Joins and Filters| 2 joins (Dim_Customer, Dim_Date), 2 filters (Customer_ID NULL, Quantity <= 0)          |
-| Variables        | 7 (batch_id, start_time, end_time, rows_inserted, rows_rejected, error_message, proc_name)|
-| Parameters       | 0 (no input/output parameters)                                                         |
-| Dependencies     | 3 (dw.Audit_Log, dw.DQ_Failures, dimension tables)                                     |
-| Complexity Score | 65                                                                                     |
+| Parameter         | Value   |
+|-------------------|---------|
+| Procedure Name    | dw.sp_load_sales_fact |
+| Source Tables     | 3       |
+| Target Tables     | 3       |
+| Data Flows        | 3       |
+| Transformations   | 5       |
+| Joins and Filters | 4       |
+| Variables         | 7       |
+| Parameters        | 0       |
+| Dependencies      | 2       |
+| Complexity Score  | 65      |
 
 Key Outputs:
-- Cleaned, validated, and enriched sales transactions loaded into dw.Fact_Sales for analytics and reporting.
-- Data quality failures tracked in dw.DQ_Failures for monitoring and remediation.
-- Full audit trail in dw.Audit_Log for compliance and operational transparency.
-- Supports business goals of accurate sales reporting, data quality management, and traceability.
+- Cleaned and validated sales transactions loaded into `dw.Fact_Sales`.
+- Audit logs in `dw.Audit_Log` for batch tracking, row counts, and error messages.
+- Data quality failures logged in `dw.DQ_Failures` for rejected transactions and reasons.
+- Outputs support business reporting, analytics, and data governance.
 
 apiCost: 0.0125 USD
