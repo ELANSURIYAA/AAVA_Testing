@@ -1,23 +1,28 @@
 ================================
 Author: AAVA
 Created on: 
-Description: Pytest-based unit tests for validating BigQuery SQL logic converting Synapse stored procedure for customer sales summary, customer status updates, and sales master merge operations.
+Description: Unit tests and Pytest script for validating BigQuery logic converted from Synapse stored procedure for processing customer orders, VIP logic, and logging.
 ================================
 
 Test Case List:
 
-| Test Case ID | Description                                                                 | Expected Outcome                                                                                 |
-|--------------|-----------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
-| TC01         | Insert summary for customers with sales above threshold (happy path)        | CustomerSalesSummary contains correct records, tiers assigned as per TotalSales                  |
-| TC02         | Insert summary when no sales above threshold (empty dataset)                | CustomerSalesSummary remains empty or no new records inserted                                    |
-| TC03         | Insert summary with NULL SaleAmount values                                  | NULL SaleAmount values ignored in aggregation, correct TotalSales and tiers assigned             |
-| TC04         | Update customer status to VIP/Regular based on total sales (happy path)     | Customers' Status updated correctly based on aggregated sales                                    |
-| TC05         | Update customer status with customers having no sales                       | Customers with no sales remain unchanged or set to 'Regular' as per logic                       |
-| TC06         | Merge sales records: update existing, insert new (happy path)               | SalesMaster updated for existing SaleIDs, new records inserted for new SaleIDs                   |
-| TC07         | Merge sales records with NULL SaleAmount or SaleDate                        | NULLs handled gracefully, no errors, records inserted/updated as per logic                      |
-| TC08         | Error: Missing required column in input data                                | Appropriate exception raised, operation fails gracefully                                         |
-| TC09         | Edge: SaleAmount exactly at threshold (boundary condition)                  | SaleAmount == threshold is excluded from summary as per WHERE clause                             |
-| TC10         | Edge: All input tables are empty                                            | No changes in target tables, script completes without error                                      |
+| Test Case ID | Description                                                                                  | Expected Outcome                                                                                                 |
+|--------------|----------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: Active customers with completed orders, some exceeding VIP threshold              | VIP customers table contains only qualifying customers with correct TotalSpent; log reflects correct count        |
+| TC02         | Edge: No active customers                                                                    | No rows inserted into VIP or log tables; all remain empty                                                        |
+| TC03         | Edge: Active customers with no completed orders                                               | No VIP customers inserted; log reflects correct count of active customers                                        |
+| TC04         | Edge: Customer with exactly 1000 total spent (boundary)                                       | Customer NOT inserted into VIP table (threshold is > 1000)                                                       |
+| TC05         | Edge: Customer with NULL order amounts                                                        | NULLs treated as zero; only customers with SUM > 1000 inserted into VIP                                          |
+| TC06         | Edge: Orders table missing OrderStatus column                                                 | Error raised during execution                                                                                    |
+| TC07         | Error: Orders table missing entirely                                                          | Error raised during execution                                                                                    |
+| TC08         | Error: VIP table missing required columns                                                     | Error raised during DML execution                                                                                |
+| TC09         | Edge: Duplicate CustomerId in customers table                                                 | Each CustomerId processed only once; aggregation correct                                                         |
+| TC10         | Edge: Orders with mixed statuses (Completed, Pending, Cancelled)                              | Only 'Completed' orders included in aggregation                                                                  |
+| TC11         | Error: Orders with invalid (non-numeric) OrderAmount                                          | Error or those rows ignored in aggregation (depending on BigQuery behavior)                                      |
+| TC12         | Happy path: MERGE upsert updates existing VIP and inserts new                                 | Existing VIP customers updated, new ones inserted, no duplicates                                                 |
+| TC13         | Edge: Empty orders table, non-empty customers table                                           | No VIP customers inserted; log reflects correct count of active customers                                        |
+| TC14         | Edge: Empty customers table                                                                   | No inserts into VIP or log tables                                                                                |
+| TC15         | Edge: All orders have OrderStatus other than 'Completed'                                      | No VIP customers inserted; log reflects correct count of active customers                                        |
 
 Pytest Script:
 
@@ -25,345 +30,197 @@ Pytest Script:
 # ================================================
 # Author: AAVA
 # Created on: 
-# Description: Pytest-based unit tests for validating BigQuery SQL logic converting Synapse stored procedure for customer sales summary, customer status updates, and sales master merge operations.
+# Description: Pytest script for validating BigQuery logic for customer order processing, VIP logic, and logging.
 # ================================================
 
 import pytest
 import pandas as pd
 from sqlalchemy import create_engine, text
-from pandas.testing import assert_frame_equal
+from datetime import datetime
 
-# Helper function to simulate BigQuery SQL in-memory using SQLite (for illustration)
-def run_sql(sql, conn):
-    with conn.begin():
-        for statement in sql.strip().split(';'):
-            if statement.strip():
-                conn.execute(text(statement))
+# Helper function to simulate BigQuery SQL logic in Pandas for unit testing
+def process_customer_orders(customers_df, orders_df, vip_customers_df=None, use_merge=False):
+    # Filter active customers
+    active_customers = customers_df[customers_df['IsActive'] == True].copy()
+    # Aggregate total spent per customer (only 'Completed' orders)
+    completed_orders = orders_df[orders_df['OrderStatus'] == 'Completed'].copy()
+    agg = completed_orders.groupby('CustomerId', as_index=False)['OrderAmount'].sum()
+    agg.rename(columns={'OrderAmount': 'TotalSpent'}, inplace=True)
+    # Merge with active customers
+    merged = pd.merge(active_customers[['CustomerId']], agg, on='CustomerId', how='left')
+    merged['TotalSpent'] = merged['TotalSpent'].fillna(0)
+    # VIP selection
+    vip = merged[merged['TotalSpent'] > 1000][['CustomerId', 'TotalSpent']].copy()
+    # Logging
+    log = pd.DataFrame([{
+        'ProcessDate': pd.Timestamp.now(),
+        'CustomersProcessed': len(active_customers)
+    }])
+    # MERGE logic: upsert
+    if use_merge and vip_customers_df is not None:
+        # Update existing, insert new
+        vip_customers_df = vip_customers_df.copy()
+        for idx, row in vip.iterrows():
+            if row['CustomerId'] in vip_customers_df['CustomerId'].values:
+                vip_customers_df.loc[vip_customers_df['CustomerId'] == row['CustomerId'], 'TotalSpent'] = row['TotalSpent']
+            else:
+                vip_customers_df = pd.concat([vip_customers_df, pd.DataFrame([row])], ignore_index=True)
+        vip = vip_customers_df
+    return vip.reset_index(drop=True), log.reset_index(drop=True)
 
-@pytest.fixture(scope="function")
-def setup_db(tmp_path):
-    # Using SQLite for test simulation (replace with BigQuery mocks in real scenario)
-    engine = create_engine('sqlite:///:memory:')
-    conn = engine.connect()
-    # Create tables
-    conn.execute(text("""
-        CREATE TABLE Customers (
-            CustomerID INTEGER PRIMARY KEY,
-            Status TEXT
-        );
-    """))
-    conn.execute(text("""
-        CREATE TABLE Sales (
-            SaleID INTEGER PRIMARY KEY,
-            CustomerID INTEGER,
-            SaleAmount NUMERIC,
-            SaleDate TEXT
-        );
-    """))
-    conn.execute(text("""
-        CREATE TABLE CustomerSalesSummary (
-            CustomerID INTEGER,
-            TotalSales NUMERIC,
-            RecordDate TEXT,
-            Tier TEXT
-        );
-    """))
-    conn.execute(text("""
-        CREATE TABLE SalesMaster (
-            SaleID INTEGER PRIMARY KEY,
-            CustomerID INTEGER,
-            SaleAmount NUMERIC,
-            SaleDate TEXT
-        );
-    """))
-    yield conn
-    conn.close()
-
-# Test Cases
-
-def test_TC01_insert_summary_happy_path(setup_db):
-    conn = setup_db
-    # Insert test data
-    conn.execute(text("INSERT INTO Customers (CustomerID, Status) VALUES (1, 'Regular'), (2, 'Regular');"))
-    conn.execute(text("""
-        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
-        (101, 1, 12000, '2024-06-01'),
-        (102, 2, 7000, '2024-06-01'),
-        (103, 2, 3000, '2024-06-02');
-    """))
-    # Simulate BigQuery logic (threshold = 5000)
-    run_sql("""
-        INSERT INTO CustomerSalesSummary (CustomerID, TotalSales, RecordDate, Tier)
-        SELECT
-            c.CustomerID,
-            SUM(s.SaleAmount) AS TotalSales,
-            '2024-06-10' AS RecordDate,
-            CASE
-                WHEN SUM(s.SaleAmount) > 10000 THEN 'Platinum'
-                WHEN SUM(s.SaleAmount) > 5000 THEN 'Gold'
-                ELSE 'Silver'
-            END AS Tier
-        FROM Customers c
-        INNER JOIN Sales s ON c.CustomerID = s.CustomerID
-        WHERE s.SaleAmount > 5000
-        GROUP BY c.CustomerID;
-    """, conn)
-    # Validate results
-    df = pd.read_sql("SELECT * FROM CustomerSalesSummary ORDER BY CustomerID", conn)
-    expected = pd.DataFrame({
-        "CustomerID": [1, 2],
-        "TotalSales": [12000, 7000],
-        "RecordDate": ['2024-06-10', '2024-06-10'],
-        "Tier": ['Platinum', 'Gold']
+# Fixtures for setup/teardown
+@pytest.fixture
+def sample_data():
+    # Default happy path data
+    customers = pd.DataFrame({
+        'CustomerId': [1, 2, 3],
+        'IsActive': [True, True, False]
     })
-    assert_frame_equal(df.reset_index(drop=True), expected)
-
-def test_TC02_insert_summary_no_sales_above_threshold(setup_db):
-    conn = setup_db
-    conn.execute(text("INSERT INTO Customers (CustomerID, Status) VALUES (1, 'Regular');"))
-    conn.execute(text("""
-        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
-        (101, 1, 3000, '2024-06-01');
-    """))
-    run_sql("""
-        INSERT INTO CustomerSalesSummary (CustomerID, TotalSales, RecordDate, Tier)
-        SELECT
-            c.CustomerID,
-            SUM(s.SaleAmount) AS TotalSales,
-            '2024-06-10' AS RecordDate,
-            CASE
-                WHEN SUM(s.SaleAmount) > 10000 THEN 'Platinum'
-                WHEN SUM(s.SaleAmount) > 5000 THEN 'Gold'
-                ELSE 'Silver'
-            END AS Tier
-        FROM Customers c
-        INNER JOIN Sales s ON c.CustomerID = s.CustomerID
-        WHERE s.SaleAmount > 5000
-        GROUP BY c.CustomerID;
-    """, conn)
-    df = pd.read_sql("SELECT * FROM CustomerSalesSummary", conn)
-    assert df.empty
-
-def test_TC03_insert_summary_null_saleamount(setup_db):
-    conn = setup_db
-    conn.execute(text("INSERT INTO Customers (CustomerID, Status) VALUES (1, 'Regular');"))
-    conn.execute(text("""
-        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
-        (101, 1, NULL, '2024-06-01'),
-        (102, 1, 8000, '2024-06-02');
-    """))
-    run_sql("""
-        INSERT INTO CustomerSalesSummary (CustomerID, TotalSales, RecordDate, Tier)
-        SELECT
-            c.CustomerID,
-            SUM(s.SaleAmount) AS TotalSales,
-            '2024-06-10' AS RecordDate,
-            CASE
-                WHEN SUM(s.SaleAmount) > 10000 THEN 'Platinum'
-                WHEN SUM(s.SaleAmount) > 5000 THEN 'Gold'
-                ELSE 'Silver'
-            END AS Tier
-        FROM Customers c
-        INNER JOIN Sales s ON c.CustomerID = s.CustomerID
-        WHERE s.SaleAmount > 5000
-        GROUP BY c.CustomerID;
-    """, conn)
-    df = pd.read_sql("SELECT * FROM CustomerSalesSummary", conn)
-    expected = pd.DataFrame({
-        "CustomerID": [1],
-        "TotalSales": [8000],
-        "RecordDate": ['2024-06-10'],
-        "Tier": ['Gold']
+    orders = pd.DataFrame({
+        'OrderId': [101, 102, 103, 104, 105],
+        'CustomerId': [1, 1, 2, 2, 3],
+        'OrderAmount': [800, 300, 1200, 200, 500],
+        'OrderStatus': ['Completed', 'Completed', 'Completed', 'Pending', 'Completed']
     })
-    assert_frame_equal(df.reset_index(drop=True), expected)
+    return customers, orders
 
-def test_TC04_update_customer_status_happy_path(setup_db):
-    conn = setup_db
-    conn.execute(text("INSERT INTO Customers (CustomerID, Status) VALUES (1, 'Regular'), (2, 'Regular');"))
-    conn.execute(text("""
-        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
-        (101, 1, 12000, '2024-06-01'),
-        (102, 2, 4000, '2024-06-01');
-    """))
-    run_sql("""
-        UPDATE Customers
-        SET Status = (
-            SELECT CASE
-                WHEN SUM(SaleAmount) > 10000 THEN 'VIP'
-                ELSE 'Regular'
-            END
-            FROM Sales
-            WHERE Customers.CustomerID = Sales.CustomerID
-        )
-        WHERE EXISTS (
-            SELECT 1 FROM Sales WHERE Customers.CustomerID = Sales.CustomerID
-        );
-    """, conn)
-    df = pd.read_sql("SELECT CustomerID, Status FROM Customers ORDER BY CustomerID", conn)
-    expected = pd.DataFrame({
-        "CustomerID": [1, 2],
-        "Status": ['VIP', 'Regular']
+# TC01: Happy path
+def test_happy_path(sample_data):
+    customers, orders = sample_data
+    vip, log = process_customer_orders(customers, orders)
+    assert len(vip) == 1
+    assert vip.iloc[0]['CustomerId'] == 2
+    assert vip.iloc[0]['TotalSpent'] == 1200
+    assert log.iloc[0]['CustomersProcessed'] == 2
+
+# TC02: No active customers
+def test_no_active_customers():
+    customers = pd.DataFrame({'CustomerId': [1, 2], 'IsActive': [False, False]})
+    orders = pd.DataFrame({'OrderId': [], 'CustomerId': [], 'OrderAmount': [], 'OrderStatus': []})
+    vip, log = process_customer_orders(customers, orders)
+    assert vip.empty
+    assert log.iloc[0]['CustomersProcessed'] == 0
+
+# TC03: Active customers with no completed orders
+def test_no_completed_orders():
+    customers = pd.DataFrame({'CustomerId': [1], 'IsActive': [True]})
+    orders = pd.DataFrame({'OrderId': [1], 'CustomerId': [1], 'OrderAmount': [500], 'OrderStatus': ['Pending']})
+    vip, log = process_customer_orders(customers, orders)
+    assert vip.empty
+    assert log.iloc[0]['CustomersProcessed'] == 1
+
+# TC04: Customer with exactly 1000 spent (boundary)
+def test_boundary_vip_threshold():
+    customers = pd.DataFrame({'CustomerId': [1], 'IsActive': [True]})
+    orders = pd.DataFrame({'OrderId': [1], 'CustomerId': [1], 'OrderAmount': [1000], 'OrderStatus': ['Completed']})
+    vip, log = process_customer_orders(customers, orders)
+    assert vip.empty
+
+# TC05: Customer with NULL order amounts
+def test_null_order_amounts():
+    customers = pd.DataFrame({'CustomerId': [1], 'IsActive': [True]})
+    orders = pd.DataFrame({'OrderId': [1, 2], 'CustomerId': [1, 1], 'OrderAmount': [None, 1200], 'OrderStatus': ['Completed', 'Completed']})
+    vip, log = process_customer_orders(customers, orders)
+    assert len(vip) == 1
+    assert vip.iloc[0]['TotalSpent'] == 1200
+
+# TC06: Orders table missing OrderStatus column
+def test_missing_orderstatus_column():
+    customers = pd.DataFrame({'CustomerId': [1], 'IsActive': [True]})
+    orders = pd.DataFrame({'OrderId': [1], 'CustomerId': [1], 'OrderAmount': [1500]})
+    with pytest.raises(KeyError):
+        process_customer_orders(customers, orders)
+
+# TC07: Orders table missing entirely
+def test_missing_orders_table():
+    customers = pd.DataFrame({'CustomerId': [1], 'IsActive': [True]})
+    with pytest.raises(TypeError):
+        process_customer_orders(customers, None)
+
+# TC08: VIP table missing required columns (simulate by passing wrong columns to merge)
+def test_vip_table_missing_columns():
+    customers = pd.DataFrame({'CustomerId': [1], 'IsActive': [True]})
+    orders = pd.DataFrame({'OrderId': [1], 'CustomerId': [1], 'OrderAmount': [1500], 'OrderStatus': ['Completed']})
+    vip_customers_df = pd.DataFrame({'CustId': [1], 'TotalSpent': [1000]})  # Wrong column name
+    with pytest.raises(KeyError):
+        process_customer_orders(customers, orders, vip_customers_df, use_merge=True)
+
+# TC09: Duplicate CustomerId in customers table
+def test_duplicate_customerid():
+    customers = pd.DataFrame({'CustomerId': [1, 1], 'IsActive': [True, True]})
+    orders = pd.DataFrame({'OrderId': [1], 'CustomerId': [1], 'OrderAmount': [2000], 'OrderStatus': ['Completed']})
+    vip, log = process_customer_orders(customers, orders)
+    assert len(vip) == 1
+    assert vip.iloc[0]['CustomerId'] == 1
+    assert vip.iloc[0]['TotalSpent'] == 2000
+    assert log.iloc[0]['CustomersProcessed'] == 2
+
+# TC10: Orders with mixed statuses
+def test_mixed_order_statuses():
+    customers = pd.DataFrame({'CustomerId': [1], 'IsActive': [True]})
+    orders = pd.DataFrame({
+        'OrderId': [1, 2, 3],
+        'CustomerId': [1, 1, 1],
+        'OrderAmount': [500, 700, 300],
+        'OrderStatus': ['Completed', 'Pending', 'Completed']
     })
-    assert_frame_equal(df.reset_index(drop=True), expected)
+    vip, log = process_customer_orders(customers, orders)
+    assert len(vip) == 1
+    assert vip.iloc[0]['TotalSpent'] == 800
 
-def test_TC05_update_customer_status_no_sales(setup_db):
-    conn = setup_db
-    conn.execute(text("INSERT INTO Customers (CustomerID, Status) VALUES (1, 'Regular'), (2, 'Regular');"))
-    # No sales for customer 2
-    conn.execute(text("""
-        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
-        (101, 1, 12000, '2024-06-01');
-    """))
-    run_sql("""
-        UPDATE Customers
-        SET Status = (
-            SELECT CASE
-                WHEN SUM(SaleAmount) > 10000 THEN 'VIP'
-                ELSE 'Regular'
-            END
-            FROM Sales
-            WHERE Customers.CustomerID = Sales.CustomerID
-        )
-        WHERE EXISTS (
-            SELECT 1 FROM Sales WHERE Customers.CustomerID = Sales.CustomerID
-        );
-    """, conn)
-    df = pd.read_sql("SELECT CustomerID, Status FROM Customers ORDER BY CustomerID", conn)
-    # Customer 2 should remain 'Regular'
-    expected = pd.DataFrame({
-        "CustomerID": [1, 2],
-        "Status": ['VIP', 'Regular']
+# TC11: Orders with invalid (non-numeric) OrderAmount
+def test_invalid_order_amount():
+    customers = pd.DataFrame({'CustomerId': [1], 'IsActive': [True]})
+    orders = pd.DataFrame({
+        'OrderId': [1, 2],
+        'CustomerId': [1, 1],
+        'OrderAmount': ['abc', 1200],
+        'OrderStatus': ['Completed', 'Completed']
     })
-    assert_frame_equal(df.reset_index(drop=True), expected)
-
-def test_TC06_merge_sales_master_happy_path(setup_db):
-    conn = setup_db
-    # Existing record in SalesMaster
-    conn.execute(text("""
-        INSERT INTO SalesMaster (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
-        (101, 1, 1000, '2024-06-01');
-    """))
-    # New and existing sales in Sales
-    conn.execute(text("""
-        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
-        (101, 1, 1200, '2024-06-01'),  -- Should update
-        (102, 2, 3000, '2024-06-02');  -- Should insert
-    """))
-    # Simulate MERGE
-    run_sql("""
-        UPDATE SalesMaster
-        SET SaleAmount = (SELECT SaleAmount FROM Sales WHERE SalesMaster.SaleID = Sales.SaleID)
-        WHERE SaleID IN (SELECT SaleID FROM Sales);
-        INSERT INTO SalesMaster (SaleID, CustomerID, SaleAmount, SaleDate)
-        SELECT SaleID, CustomerID, SaleAmount, SaleDate
-        FROM Sales
-        WHERE SaleID NOT IN (SELECT SaleID FROM SalesMaster);
-    """, conn)
-    df = pd.read_sql("SELECT * FROM SalesMaster ORDER BY SaleID", conn)
-    expected = pd.DataFrame({
-        "SaleID": [101, 102],
-        "CustomerID": [1, 2],
-        "SaleAmount": [1200, 3000],
-        "SaleDate": ['2024-06-01', '2024-06-02']
-    })
-    assert_frame_equal(df.reset_index(drop=True), expected)
-
-def test_TC07_merge_sales_master_nulls(setup_db):
-    conn = setup_db
-    conn.execute(text("""
-        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
-        (101, 1, NULL, NULL);
-    """))
-    run_sql("""
-        INSERT INTO SalesMaster (SaleID, CustomerID, SaleAmount, SaleDate)
-        SELECT SaleID, CustomerID, SaleAmount, SaleDate FROM Sales;
-    """, conn)
-    df = pd.read_sql("SELECT * FROM SalesMaster", conn)
-    expected = pd.DataFrame({
-        "SaleID": [101],
-        "CustomerID": [1],
-        "SaleAmount": [None],
-        "SaleDate": [None]
-    })
-    assert_frame_equal(df.reset_index(drop=True), expected)
-
-def test_TC08_error_missing_column(setup_db):
-    conn = setup_db
-    # Omit SaleAmount column
-    conn.execute(text("""
-        CREATE TABLE Sales2 (
-            SaleID INTEGER PRIMARY KEY,
-            CustomerID INTEGER,
-            SaleDate TEXT
-        );
-    """))
-    # Try to run logic expecting SaleAmount
+    # Should raise or ignore invalid, depending on implementation
     with pytest.raises(Exception):
-        run_sql("""
-            INSERT INTO CustomerSalesSummary (CustomerID, TotalSales, RecordDate, Tier)
-            SELECT
-                c.CustomerID,
-                SUM(s.SaleAmount) AS TotalSales,
-                '2024-06-10' AS RecordDate,
-                CASE
-                    WHEN SUM(s.SaleAmount) > 10000 THEN 'Platinum'
-                    WHEN SUM(s.SaleAmount) > 5000 THEN 'Gold'
-                    ELSE 'Silver'
-                END AS Tier
-            FROM Customers c
-            INNER JOIN Sales2 s ON c.CustomerID = s.CustomerID
-            WHERE s.SaleAmount > 5000
-            GROUP BY c.CustomerID;
-        """, conn)
+        process_customer_orders(customers, orders)
 
-def test_TC09_edge_saleamount_at_threshold(setup_db):
-    conn = setup_db
-    conn.execute(text("INSERT INTO Customers (CustomerID, Status) VALUES (1, 'Regular');"))
-    conn.execute(text("""
-        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
-        (101, 1, 5000, '2024-06-01');
-    """))
-    run_sql("""
-        INSERT INTO CustomerSalesSummary (CustomerID, TotalSales, RecordDate, Tier)
-        SELECT
-            c.CustomerID,
-            SUM(s.SaleAmount) AS TotalSales,
-            '2024-06-10' AS RecordDate,
-            CASE
-                WHEN SUM(s.SaleAmount) > 10000 THEN 'Platinum'
-                WHEN SUM(s.SaleAmount) > 5000 THEN 'Gold'
-                ELSE 'Silver'
-            END AS Tier
-        FROM Customers c
-        INNER JOIN Sales s ON c.CustomerID = s.CustomerID
-        WHERE s.SaleAmount > 5000
-        GROUP BY c.CustomerID;
-    """, conn)
-    df = pd.read_sql("SELECT * FROM CustomerSalesSummary", conn)
-    # SaleAmount == threshold should be excluded
-    assert df.empty
+# TC12: MERGE upsert updates existing VIP and inserts new
+def test_merge_upsert():
+    customers = pd.DataFrame({'CustomerId': [1, 2], 'IsActive': [True, True]})
+    orders = pd.DataFrame({
+        'OrderId': [1, 2],
+        'CustomerId': [1, 2],
+        'OrderAmount': [1500, 2000],
+        'OrderStatus': ['Completed', 'Completed']
+    })
+    vip_customers_df = pd.DataFrame({'CustomerId': [1], 'TotalSpent': [1000]})
+    vip, log = process_customer_orders(customers, orders, vip_customers_df, use_merge=True)
+    assert len(vip) == 2
+    assert set(vip['CustomerId']) == {1, 2}
+    assert vip[vip['CustomerId'] == 1]['TotalSpent'].iloc[0] == 1500
+    assert vip[vip['CustomerId'] == 2]['TotalSpent'].iloc[0] == 2000
 
-def test_TC10_all_tables_empty(setup_db):
-    conn = setup_db
-    # No data inserted
-    run_sql("""
-        INSERT INTO CustomerSalesSummary (CustomerID, TotalSales, RecordDate, Tier)
-        SELECT
-            c.CustomerID,
-            SUM(s.SaleAmount) AS TotalSales,
-            '2024-06-10' AS RecordDate,
-            CASE
-                WHEN SUM(s.SaleAmount) > 10000 THEN 'Platinum'
-                WHEN SUM(s.SaleAmount) > 5000 THEN 'Gold'
-                ELSE 'Silver'
-            END AS Tier
-        FROM Customers c
-        INNER JOIN Sales s ON c.CustomerID = s.CustomerID
-        WHERE s.SaleAmount > 5000
-        GROUP BY c.CustomerID;
-    """, conn)
-    df = pd.read_sql("SELECT * FROM CustomerSalesSummary", conn)
-    assert df.empty
+# TC13: Empty orders table, non-empty customers table
+def test_empty_orders_table():
+    customers = pd.DataFrame({'CustomerId': [1, 2], 'IsActive': [True, True]})
+    orders = pd.DataFrame({'OrderId': [], 'CustomerId': [], 'OrderAmount': [], 'OrderStatus': []})
+    vip, log = process_customer_orders(customers, orders)
+    assert vip.empty
+    assert log.iloc[0]['CustomersProcessed'] == 2
+
+# TC14: Empty customers table
+def test_empty_customers_table():
+    customers = pd.DataFrame({'CustomerId': [], 'IsActive': []})
+    orders = pd.DataFrame({'OrderId': [1], 'CustomerId': [1], 'OrderAmount': [2000], 'OrderStatus': ['Completed']})
+    vip, log = process_customer_orders(customers, orders)
+    assert vip.empty
+    assert log.iloc[0]['CustomersProcessed'] == 0
+
+# TC15: All orders have OrderStatus other than 'Completed'
+def test_no_completed_status_orders():
+    customers = pd.DataFrame({'CustomerId': [1], 'IsActive': [True]})
+    orders = pd.DataFrame({'OrderId': [1], 'CustomerId': [1], 'OrderAmount': [2000], 'OrderStatus': ['Pending']})
+    vip, log = process_customer_orders(customers, orders)
+    assert vip.empty
+    assert log.iloc[0]['CustomersProcessed'] == 1
 
 
-API Cost Consumed in dollars: 0.0061 USD
+API Cost Consumption:
+apiCost: 0.0032 USD
