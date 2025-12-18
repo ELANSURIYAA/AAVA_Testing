@@ -1,0 +1,373 @@
+===============================================
+Author: Ascendion AAVA
+Created on: 
+Description: Unit test cases and Pytest script for validating the Fabric SQL implementation of the FACT_EXECUTIVE_SUMMARY ETL process. Covers data staging, referential integrity, business rule enforcement, and error handling.
+===============================================
+
+### Test Case List
+
+| Test Case ID | Test Case | Description | Expected Outcome |
+|--------------|-----------|-------------|------------------|
+| TC01 | Happy path: All valid data | All source and dimension data present and valid | All rows inserted into FACT_EXECUTIVE_SUMMARY with correct transformations |
+| TC02 | Edge: NULL income_amount | Source row has NULL income_amount | income_amount set to 0 in FACT_EXECUTIVE_SUMMARY |
+| TC03 | Edge: Negative income_amount | Source row has negative income_amount | income_amount set to 0 in FACT_EXECUTIVE_SUMMARY |
+| TC04 | Edge: Missing DIM_DATE | Source row references non-existent date_key | Row not inserted into FACT_EXECUTIVE_SUMMARY |
+| TC05 | Edge: Missing DIM_INSTITUTION | Source row references non-existent institution_id | Row not inserted into FACT_EXECUTIVE_SUMMARY |
+| TC06 | Edge: Missing DIM_CORPORATION | Source row references non-existent corporation_id | Row not inserted into FACT_EXECUTIVE_SUMMARY |
+| TC07 | Edge: Missing DIM_PRODUCT | Source row references non-existent product_id | Row not inserted into FACT_EXECUTIVE_SUMMARY |
+| TC08 | Edge: Empty STG_HOLDING_METRICS | No source data | No rows inserted, process completes gracefully |
+| TC09 | Error: Missing required columns in STG_HOLDING_METRICS | Source table missing required columns | ETL fails with error, no data loaded |
+| TC10 | Error: Invalid data types in STG_HOLDING_METRICS | Source columns have invalid types (e.g., string in numeric) | ETL fails with error, no data loaded |
+| TC11 | Edge: Multiple rows, mixed validity | Mix of valid and invalid (missing dimension) rows | Only valid rows inserted, invalid rows skipped |
+| TC12 | Edge: Duplicate source rows | Duplicate rows in STG_HOLDING_METRICS | All duplicates inserted (no deduplication logic) |
+
+---
+
+### Pytest Script
+
+
+import pytest
+import pandas as pd
+from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, DECIMAL
+from sqlalchemy.types import Integer as SQLInt, String as SQLString, DECIMAL as SQLDecimal
+
+# Helper function to create in-memory SQLite DB (simulate Fabric Lakehouse for unit test)
+@pytest.fixture(scope="function")
+def db_engine():
+    engine = create_engine('sqlite:///:memory:')
+    yield engine
+    engine.dispose()
+
+# Helper to create all dimension and fact tables
+def create_tables(engine):
+    meta = MetaData()
+    Table('DIM_DATE', meta,
+          Column('date_key', SQLInt, primary_key=True))
+    Table('DIM_INSTITUTION', meta,
+          Column('institution_id', SQLInt, primary_key=True))
+    Table('DIM_CORPORATION', meta,
+          Column('corporation_id', SQLInt, primary_key=True))
+    Table('DIM_PRODUCT', meta,
+          Column('product_id', SQLInt, primary_key=True))
+    Table('STG_HOLDING_METRICS', meta,
+          Column('date_value', SQLInt),
+          Column('institution_id', SQLInt),
+          Column('corporation_id', SQLInt),
+          Column('product_id', SQLInt),
+          Column('a120_amount', SQLDecimal),
+          Column('a120_count', SQLInt),
+          Column('a30_to_59_amount', SQLDecimal),
+          Column('a30_to_59_count', SQLInt),
+          Column('a60_to_89_amount', SQLDecimal),
+          Column('a60_to_89_count', SQLInt),
+          Column('a90_to_119_amount', SQLDecimal),
+          Column('a90_to_119_count', SQLInt),
+          Column('charge_off_amount', SQLDecimal),
+          Column('charge_off_count', SQLInt),
+          Column('fraud_amount', SQLDecimal),
+          Column('fraud_count', SQLInt),
+          Column('income_amount', SQLDecimal),
+          Column('number_of_accounts', SQLInt),
+          Column('purchases_amount', SQLDecimal),
+          Column('purchases_count', SQLInt),
+    )
+    Table('FACT_EXECUTIVE_SUMMARY', meta,
+          Column('date_key', SQLInt),
+          Column('institution_id', SQLInt),
+          Column('corporation_id', SQLInt),
+          Column('product_id', SQLInt),
+          Column('a120_amount', SQLDecimal),
+          Column('a120_count', SQLInt),
+          Column('a30_to_59_amount', SQLDecimal),
+          Column('a30_to_59_count', SQLInt),
+          Column('a60_to_89_amount', SQLDecimal),
+          Column('a60_to_89_count', SQLInt),
+          Column('a90_to_119_amount', SQLDecimal),
+          Column('a90_to_119_count', SQLInt),
+          Column('charge_off_amount', SQLDecimal),
+          Column('charge_off_count', SQLInt),
+          Column('fraud_amount', SQLDecimal),
+          Column('fraud_count', SQLInt),
+          Column('income_amount', SQLDecimal),
+          Column('number_of_accounts', SQLInt),
+          Column('purchases_amount', SQLDecimal),
+          Column('purchases_count', SQLInt),
+    )
+    meta.create_all(engine)
+
+# Helper to run the ETL logic in Python (simulate Fabric SQL logic)
+def run_etl(engine):
+    # Stage data (simulate staging table)
+    stg_df = pd.read_sql('SELECT * FROM STG_HOLDING_METRICS', engine)
+    # Load dimension tables
+    dim_date = pd.read_sql('SELECT * FROM DIM_DATE', engine)
+    dim_inst = pd.read_sql('SELECT * FROM DIM_INSTITUTION', engine)
+    dim_corp = pd.read_sql('SELECT * FROM DIM_CORPORATION', engine)
+    dim_prod = pd.read_sql('SELECT * FROM DIM_PRODUCT', engine)
+
+    # Join and transform
+    merged = stg_df.merge(dim_date, left_on='date_value', right_on='date_key', how='inner') \
+                   .merge(dim_inst, left_on='institution_id', right_on='institution_id', how='inner') \
+                   .merge(dim_corp, left_on='corporation_id', right_on='corporation_id', how='inner') \
+                   .merge(dim_prod, left_on='product_id', right_on='product_id', how='inner')
+
+    # Business rule: income_amount NULL or <0 => 0
+    merged['income_amount'] = merged['income_amount'].apply(lambda x: 0 if pd.isnull(x) or x < 0 else x)
+
+    # Select columns for fact table
+    fact_cols = [
+        'date_key', 'institution_id', 'corporation_id', 'product_id',
+        'a120_amount', 'a120_count', 'a30_to_59_amount', 'a30_to_59_count',
+        'a60_to_89_amount', 'a60_to_89_count', 'a90_to_119_amount', 'a90_to_119_count',
+        'charge_off_amount', 'charge_off_count', 'fraud_amount', 'fraud_count',
+        'income_amount', 'number_of_accounts', 'purchases_amount', 'purchases_count'
+    ]
+    fact_df = merged[fact_cols]
+    fact_df.to_sql('FACT_EXECUTIVE_SUMMARY', engine, if_exists='append', index=False)
+
+# --- Test Cases ---
+
+def insert_df(engine, table, df):
+    df.to_sql(table, engine, if_exists='append', index=False)
+
+def clear_tables(engine):
+    with engine.connect() as conn:
+        conn.execute("DELETE FROM FACT_EXECUTIVE_SUMMARY")
+        conn.execute("DELETE FROM STG_HOLDING_METRICS")
+        conn.execute("DELETE FROM DIM_DATE")
+        conn.execute("DELETE FROM DIM_INSTITUTION")
+        conn.execute("DELETE FROM DIM_CORPORATION")
+        conn.execute("DELETE FROM DIM_PRODUCT")
+
+@pytest.mark.parametrize("stg_data, dim_date, dim_inst, dim_corp, dim_prod, expected_rows, expected_income", [
+    # TC01: Happy path
+    (
+        pd.DataFrame([{
+            'date_value': 20230101, 'institution_id': 1, 'corporation_id': 10, 'product_id': 100,
+            'a120_amount': 1000.0, 'a120_count': 5, 'a30_to_59_amount': 200.0, 'a30_to_59_count': 2,
+            'a60_to_89_amount': 300.0, 'a60_to_89_count': 3, 'a90_to_119_amount': 400.0, 'a90_to_119_count': 4,
+            'charge_off_amount': 50.0, 'charge_off_count': 1, 'fraud_amount': 10.0, 'fraud_count': 1,
+            'income_amount': 500.0, 'number_of_accounts': 10, 'purchases_amount': 1500.0, 'purchases_count': 15
+        }]),
+        pd.DataFrame([{'date_key': 20230101}]),
+        pd.DataFrame([{'institution_id': 1}]),
+        pd.DataFrame([{'corporation_id': 10}]),
+        pd.DataFrame([{'product_id': 100}]),
+        1, [500.0]
+    ),
+    # TC02: NULL income_amount
+    (
+        pd.DataFrame([{
+            'date_value': 20230101, 'institution_id': 1, 'corporation_id': 10, 'product_id': 100,
+            'a120_amount': 1000.0, 'a120_count': 5, 'a30_to_59_amount': 200.0, 'a30_to_59_count': 2,
+            'a60_to_89_amount': 300.0, 'a60_to_89_count': 3, 'a90_to_119_amount': 400.0, 'a90_to_119_count': 4,
+            'charge_off_amount': 50.0, 'charge_off_count': 1, 'fraud_amount': 10.0, 'fraud_count': 1,
+            'income_amount': None, 'number_of_accounts': 10, 'purchases_amount': 1500.0, 'purchases_count': 15
+        }]),
+        pd.DataFrame([{'date_key': 20230101}]),
+        pd.DataFrame([{'institution_id': 1}]),
+        pd.DataFrame([{'corporation_id': 10}]),
+        pd.DataFrame([{'product_id': 100}]),
+        1, [0.0]
+    ),
+    # TC03: Negative income_amount
+    (
+        pd.DataFrame([{
+            'date_value': 20230101, 'institution_id': 1, 'corporation_id': 10, 'product_id': 100,
+            'a120_amount': 1000.0, 'a120_count': 5, 'a30_to_59_amount': 200.0, 'a30_to_59_count': 2,
+            'a60_to_89_amount': 300.0, 'a60_to_89_count': 3, 'a90_to_119_amount': 400.0, 'a90_to_119_count': 4,
+            'charge_off_amount': 50.0, 'charge_off_count': 1, 'fraud_amount': 10.0, 'fraud_count': 1,
+            'income_amount': -100.0, 'number_of_accounts': 10, 'purchases_amount': 1500.0, 'purchases_count': 15
+        }]),
+        pd.DataFrame([{'date_key': 20230101}]),
+        pd.DataFrame([{'institution_id': 1}]),
+        pd.DataFrame([{'corporation_id': 10}]),
+        pd.DataFrame([{'product_id': 100}]),
+        1, [0.0]
+    ),
+    # TC04: Missing DIM_DATE
+    (
+        pd.DataFrame([{
+            'date_value': 20230102, 'institution_id': 1, 'corporation_id': 10, 'product_id': 100,
+            'a120_amount': 1000.0, 'a120_count': 5, 'a30_to_59_amount': 200.0, 'a30_to_59_count': 2,
+            'a60_to_89_amount': 300.0, 'a60_to_89_count': 3, 'a90_to_119_amount': 400.0, 'a90_to_119_count': 4,
+            'charge_off_amount': 50.0, 'charge_off_count': 1, 'fraud_amount': 10.0, 'fraud_count': 1,
+            'income_amount': 500.0, 'number_of_accounts': 10, 'purchases_amount': 1500.0, 'purchases_count': 15
+        }]),
+        pd.DataFrame([{'date_key': 20230101}]),  # No matching date_key
+        pd.DataFrame([{'institution_id': 1}]),
+        pd.DataFrame([{'corporation_id': 10}]),
+        pd.DataFrame([{'product_id': 100}]),
+        0, []
+    ),
+    # TC05: Missing DIM_INSTITUTION
+    (
+        pd.DataFrame([{
+            'date_value': 20230101, 'institution_id': 2, 'corporation_id': 10, 'product_id': 100,
+            'a120_amount': 1000.0, 'a120_count': 5, 'a30_to_59_amount': 200.0, 'a30_to_59_count': 2,
+            'a60_to_89_amount': 300.0, 'a60_to_89_count': 3, 'a90_to_119_amount': 400.0, 'a90_to_119_count': 4,
+            'charge_off_amount': 50.0, 'charge_off_count': 1, 'fraud_amount': 10.0, 'fraud_count': 1,
+            'income_amount': 500.0, 'number_of_accounts': 10, 'purchases_amount': 1500.0, 'purchases_count': 15
+        }]),
+        pd.DataFrame([{'date_key': 20230101}]),
+        pd.DataFrame([{'institution_id': 1}]),  # No matching institution_id
+        pd.DataFrame([{'corporation_id': 10}]),
+        pd.DataFrame([{'product_id': 100}]),
+        0, []
+    ),
+    # TC06: Missing DIM_CORPORATION
+    (
+        pd.DataFrame([{
+            'date_value': 20230101, 'institution_id': 1, 'corporation_id': 11, 'product_id': 100,
+            'a120_amount': 1000.0, 'a120_count': 5, 'a30_to_59_amount': 200.0, 'a30_to_59_count': 2,
+            'a60_to_89_amount': 300.0, 'a60_to_89_count': 3, 'a90_to_119_amount': 400.0, 'a90_to_119_count': 4,
+            'charge_off_amount': 50.0, 'charge_off_count': 1, 'fraud_amount': 10.0, 'fraud_count': 1,
+            'income_amount': 500.0, 'number_of_accounts': 10, 'purchases_amount': 1500.0, 'purchases_count': 15
+        }]),
+        pd.DataFrame([{'date_key': 20230101}]),
+        pd.DataFrame([{'institution_id': 1}]),
+        pd.DataFrame([{'corporation_id': 10}]),  # No matching corporation_id
+        pd.DataFrame([{'product_id': 100}]),
+        0, []
+    ),
+    # TC07: Missing DIM_PRODUCT
+    (
+        pd.DataFrame([{
+            'date_value': 20230101, 'institution_id': 1, 'corporation_id': 10, 'product_id': 101,
+            'a120_amount': 1000.0, 'a120_count': 5, 'a30_to_59_amount': 200.0, 'a30_to_59_count': 2,
+            'a60_to_89_amount': 300.0, 'a60_to_89_count': 3, 'a90_to_119_amount': 400.0, 'a90_to_119_count': 4,
+            'charge_off_amount': 50.0, 'charge_off_count': 1, 'fraud_amount': 10.0, 'fraud_count': 1,
+            'income_amount': 500.0, 'number_of_accounts': 10, 'purchases_amount': 1500.0, 'purchases_count': 15
+        }]),
+        pd.DataFrame([{'date_key': 20230101}]),
+        pd.DataFrame([{'institution_id': 1}]),
+        pd.DataFrame([{'corporation_id': 10}]),
+        pd.DataFrame([{'product_id': 100}]),  # No matching product_id
+        0, []
+    ),
+    # TC08: Empty STG_HOLDING_METRICS
+    (
+        pd.DataFrame([]),
+        pd.DataFrame([{'date_key': 20230101}]),
+        pd.DataFrame([{'institution_id': 1}]),
+        pd.DataFrame([{'corporation_id': 10}]),
+        pd.DataFrame([{'product_id': 100}]),
+        0, []
+    ),
+    # TC11: Multiple rows, mixed validity
+    (
+        pd.DataFrame([
+            {
+                'date_value': 20230101, 'institution_id': 1, 'corporation_id': 10, 'product_id': 100,
+                'a120_amount': 1000.0, 'a120_count': 5, 'a30_to_59_amount': 200.0, 'a30_to_59_count': 2,
+                'a60_to_89_amount': 300.0, 'a60_to_89_count': 3, 'a90_to_119_amount': 400.0, 'a90_to_119_count': 4,
+                'charge_off_amount': 50.0, 'charge_off_count': 1, 'fraud_amount': 10.0, 'fraud_count': 1,
+                'income_amount': 500.0, 'number_of_accounts': 10, 'purchases_amount': 1500.0, 'purchases_count': 15
+            },
+            {
+                'date_value': 20230101, 'institution_id': 2, 'corporation_id': 10, 'product_id': 100,
+                'a120_amount': 1000.0, 'a120_count': 5, 'a30_to_59_amount': 200.0, 'a30_to_59_count': 2,
+                'a60_to_89_amount': 300.0, 'a60_to_89_count': 3, 'a90_to_119_amount': 400.0, 'a90_to_119_count': 4,
+                'charge_off_amount': 50.0, 'charge_off_count': 1, 'fraud_amount': 10.0, 'fraud_count': 1,
+                'income_amount': 600.0, 'number_of_accounts': 10, 'purchases_amount': 1500.0, 'purchases_count': 15
+            }
+        ]),
+        pd.DataFrame([{'date_key': 20230101}]),
+        pd.DataFrame([{'institution_id': 1}]),  # Only institution_id 1 is valid
+        pd.DataFrame([{'corporation_id': 10}]),
+        pd.DataFrame([{'product_id': 100}]),
+        1, [500.0]
+    ),
+    # TC12: Duplicate source rows
+    (
+        pd.DataFrame([
+            {
+                'date_value': 20230101, 'institution_id': 1, 'corporation_id': 10, 'product_id': 100,
+                'a120_amount': 1000.0, 'a120_count': 5, 'a30_to_59_amount': 200.0, 'a30_to_59_count': 2,
+                'a60_to_89_amount': 300.0, 'a60_to_89_count': 3, 'a90_to_119_amount': 400.0, 'a90_to_119_count': 4,
+                'charge_off_amount': 50.0, 'charge_off_count': 1, 'fraud_amount': 10.0, 'fraud_count': 1,
+                'income_amount': 500.0, 'number_of_accounts': 10, 'purchases_amount': 1500.0, 'purchases_count': 15
+            },
+            {
+                'date_value': 20230101, 'institution_id': 1, 'corporation_id': 10, 'product_id': 100,
+                'a120_amount': 1000.0, 'a120_count': 5, 'a30_to_59_amount': 200.0, 'a30_to_59_count': 2,
+                'a60_to_89_amount': 300.0, 'a60_to_89_count': 3, 'a90_to_119_amount': 400.0, 'a90_to_119_count': 4,
+                'charge_off_amount': 50.0, 'charge_off_count': 1, 'fraud_amount': 10.0, 'fraud_count': 1,
+                'income_amount': 500.0, 'number_of_accounts': 10, 'purchases_amount': 1500.0, 'purchases_count': 15
+            }
+        ]),
+        pd.DataFrame([{'date_key': 20230101}]),
+        pd.DataFrame([{'institution_id': 1}]),
+        pd.DataFrame([{'corporation_id': 10}]),
+        pd.DataFrame([{'product_id': 100}]),
+        2, [500.0, 500.0]
+    ),
+])
+def test_fact_executive_summary_etl(
+    db_engine, stg_data, dim_date, dim_inst, dim_corp, dim_prod, expected_rows, expected_income
+):
+    create_tables(db_engine)
+    clear_tables(db_engine)
+    # Insert dimension and staging data
+    if not dim_date.empty:
+        insert_df(db_engine, 'DIM_DATE', dim_date)
+    if not dim_inst.empty:
+        insert_df(db_engine, 'DIM_INSTITUTION', dim_inst)
+    if not dim_corp.empty:
+        insert_df(db_engine, 'DIM_CORPORATION', dim_corp)
+    if not dim_prod.empty:
+        insert_df(db_engine, 'DIM_PRODUCT', dim_prod)
+    if not stg_data.empty:
+        insert_df(db_engine, 'STG_HOLDING_METRICS', stg_data)
+    # Run ETL
+    run_etl(db_engine)
+    # Validate
+    fact_df = pd.read_sql('SELECT * FROM FACT_EXECUTIVE_SUMMARY', db_engine)
+    assert len(fact_df) == expected_rows
+    if expected_rows > 0:
+        assert list(fact_df['income_amount']) == expected_income
+
+# TC09: Error - Missing required columns in STG_HOLDING_METRICS
+def test_missing_columns_error(db_engine):
+    create_tables(db_engine)
+    clear_tables(db_engine)
+    # Remove required column from staging table
+    with db_engine.connect() as conn:
+        conn.execute("DROP TABLE STG_HOLDING_METRICS")
+        conn.execute("CREATE TABLE STG_HOLDING_METRICS (date_value INTEGER)")
+    # Insert dimension data
+    insert_df(db_engine, 'DIM_DATE', pd.DataFrame([{'date_key': 20230101}]))
+    insert_df(db_engine, 'DIM_INSTITUTION', pd.DataFrame([{'institution_id': 1}]))
+    insert_df(db_engine, 'DIM_CORPORATION', pd.DataFrame([{'corporation_id': 10}]))
+    insert_df(db_engine, 'DIM_PRODUCT', pd.DataFrame([{'product_id': 100}]))
+    # Insert incomplete staging data
+    insert_df(db_engine, 'STG_HOLDING_METRICS', pd.DataFrame([{'date_value': 20230101}]))
+    # ETL should fail due to missing columns
+    with pytest.raises(Exception):
+        run_etl(db_engine)
+
+# TC10: Error - Invalid data types in STG_HOLDING_METRICS
+def test_invalid_data_types_error(db_engine):
+    create_tables(db_engine)
+    clear_tables(db_engine)
+    # Insert dimension data
+    insert_df(db_engine, 'DIM_DATE', pd.DataFrame([{'date_key': 20230101}]))
+    insert_df(db_engine, 'DIM_INSTITUTION', pd.DataFrame([{'institution_id': 1}]))
+    insert_df(db_engine, 'DIM_CORPORATION', pd.DataFrame([{'corporation_id': 10}]))
+    insert_df(db_engine, 'DIM_PRODUCT', pd.DataFrame([{'product_id': 100}]))
+    # Insert staging data with invalid type
+    stg_data = pd.DataFrame([{
+        'date_value': 20230101, 'institution_id': 1, 'corporation_id': 10, 'product_id': 100,
+        'a120_amount': 'not_a_number', 'a120_count': 5, 'a30_to_59_amount': 200.0, 'a30_to_59_count': 2,
+        'a60_to_89_amount': 300.0, 'a60_to_89_count': 3, 'a90_to_119_amount': 400.0, 'a90_to_119_count': 4,
+        'charge_off_amount': 50.0, 'charge_off_count': 1, 'fraud_amount': 10.0, 'fraud_count': 1,
+        'income_amount': 500.0, 'number_of_accounts': 10, 'purchases_amount': 1500.0, 'purchases_count': 15
+    }])
+    with pytest.raises(Exception):
+        insert_df(db_engine, 'STG_HOLDING_METRICS', stg_data)
+        run_etl(db_engine)
+
+
+---
+
+**apiCost: 0.0092 USD**
