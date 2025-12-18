@@ -1,0 +1,369 @@
+=============================================
+Author:    AAVA
+Created on:    
+Description:   Example conversion of an Azure Synapse stored procedure to BigQuery SQL demonstrating variable declarations, conditionals, joins, aggregations, and DML operations
+=============================================
+
+Test Case List:
+
+| Test Case ID | Description                                                                 | Expected Outcome                                                                                 |
+|--------------|-----------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
+| TC01         | Insert summary for customers with sales above threshold (happy path)        | CustomerSalesSummary contains correct records, tiers assigned as per TotalSales                  |
+| TC02         | Insert summary when no sales above threshold (empty dataset)                | CustomerSalesSummary remains empty or no new records inserted                                    |
+| TC03         | Insert summary with NULL SaleAmount values                                  | NULL SaleAmount values ignored in aggregation, correct TotalSales and tiers assigned             |
+| TC04         | Update customer status to VIP/Regular based on total sales (happy path)     | Customers' Status updated correctly based on aggregated sales                                    |
+| TC05         | Update customer status with customers having no sales                       | Customers with no sales remain unchanged or set to 'Regular' as per logic                       |
+| TC06         | Merge sales records: update existing, insert new (happy path)               | SalesMaster updated for existing SaleIDs, new records inserted for new SaleIDs                   |
+| TC07         | Merge sales records with NULL SaleAmount or SaleDate                        | NULLs handled gracefully, no errors, records inserted/updated as per logic                      |
+| TC08         | Error: Missing required column in input data                                | Appropriate exception raised, operation fails gracefully                                         |
+| TC09         | Edge: SaleAmount exactly at threshold (boundary condition)                  | SaleAmount == threshold is excluded from summary as per WHERE clause                             |
+| TC10         | Edge: All input tables are empty                                            | No changes in target tables, script completes without error                                      |
+
+Pytest Script:
+
+
+# ================================================
+# Author: AAVA
+# Created on: 
+# Description: Pytest-based unit tests for validating BigQuery SQL logic converting Synapse stored procedure for customer sales summary, customer status updates, and sales master merge operations.
+# ================================================
+
+import pytest
+import pandas as pd
+from sqlalchemy import create_engine, text
+from pandas.testing import assert_frame_equal
+
+# Helper function to simulate BigQuery SQL in-memory using SQLite (for illustration)
+def run_sql(sql, conn):
+    with conn.begin():
+        for statement in sql.strip().split(';'):
+            if statement.strip():
+                conn.execute(text(statement))
+
+@pytest.fixture(scope="function")
+def setup_db(tmp_path):
+    # Using SQLite for test simulation (replace with BigQuery mocks in real scenario)
+    engine = create_engine('sqlite:///:memory:')
+    conn = engine.connect()
+    # Create tables
+    conn.execute(text("""
+        CREATE TABLE Customers (
+            CustomerID INTEGER PRIMARY KEY,
+            Status TEXT
+        );
+    """))
+    conn.execute(text("""
+        CREATE TABLE Sales (
+            SaleID INTEGER PRIMARY KEY,
+            CustomerID INTEGER,
+            SaleAmount NUMERIC,
+            SaleDate TEXT
+        );
+    """))
+    conn.execute(text("""
+        CREATE TABLE CustomerSalesSummary (
+            CustomerID INTEGER,
+            TotalSales NUMERIC,
+            RecordDate TEXT,
+            Tier TEXT
+        );
+    """))
+    conn.execute(text("""
+        CREATE TABLE SalesMaster (
+            SaleID INTEGER PRIMARY KEY,
+            CustomerID INTEGER,
+            SaleAmount NUMERIC,
+            SaleDate TEXT
+        );
+    """))
+    yield conn
+    conn.close()
+
+# Test Cases
+
+def test_TC01_insert_summary_happy_path(setup_db):
+    conn = setup_db
+    # Insert test data
+    conn.execute(text("INSERT INTO Customers (CustomerID, Status) VALUES (1, 'Regular'), (2, 'Regular');"))
+    conn.execute(text("""
+        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
+        (101, 1, 12000, '2024-06-01'),
+        (102, 2, 7000, '2024-06-01'),
+        (103, 2, 3000, '2024-06-02');
+    """))
+    # Simulate BigQuery logic (threshold = 5000)
+    run_sql("""
+        INSERT INTO CustomerSalesSummary (CustomerID, TotalSales, RecordDate, Tier)
+        SELECT
+            c.CustomerID,
+            SUM(s.SaleAmount) AS TotalSales,
+            '2024-06-10' AS RecordDate,
+            CASE
+                WHEN SUM(s.SaleAmount) > 10000 THEN 'Platinum'
+                WHEN SUM(s.SaleAmount) > 5000 THEN 'Gold'
+                ELSE 'Silver'
+            END AS Tier
+        FROM Customers c
+        INNER JOIN Sales s ON c.CustomerID = s.CustomerID
+        WHERE s.SaleAmount > 5000
+        GROUP BY c.CustomerID;
+    """, conn)
+    # Validate results
+    df = pd.read_sql("SELECT * FROM CustomerSalesSummary ORDER BY CustomerID", conn)
+    expected = pd.DataFrame({
+        "CustomerID": [1, 2],
+        "TotalSales": [12000, 7000],
+        "RecordDate": ['2024-06-10', '2024-06-10'],
+        "Tier": ['Platinum', 'Gold']
+    })
+    assert_frame_equal(df.reset_index(drop=True), expected)
+
+def test_TC02_insert_summary_no_sales_above_threshold(setup_db):
+    conn = setup_db
+    conn.execute(text("INSERT INTO Customers (CustomerID, Status) VALUES (1, 'Regular');"))
+    conn.execute(text("""
+        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
+        (101, 1, 3000, '2024-06-01');
+    """))
+    run_sql("""
+        INSERT INTO CustomerSalesSummary (CustomerID, TotalSales, RecordDate, Tier)
+        SELECT
+            c.CustomerID,
+            SUM(s.SaleAmount) AS TotalSales,
+            '2024-06-10' AS RecordDate,
+            CASE
+                WHEN SUM(s.SaleAmount) > 10000 THEN 'Platinum'
+                WHEN SUM(s.SaleAmount) > 5000 THEN 'Gold'
+                ELSE 'Silver'
+            END AS Tier
+        FROM Customers c
+        INNER JOIN Sales s ON c.CustomerID = s.CustomerID
+        WHERE s.SaleAmount > 5000
+        GROUP BY c.CustomerID;
+    """, conn)
+    df = pd.read_sql("SELECT * FROM CustomerSalesSummary", conn)
+    assert df.empty
+
+def test_TC03_insert_summary_null_saleamount(setup_db):
+    conn = setup_db
+    conn.execute(text("INSERT INTO Customers (CustomerID, Status) VALUES (1, 'Regular');"))
+    conn.execute(text("""
+        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
+        (101, 1, NULL, '2024-06-01'),
+        (102, 1, 8000, '2024-06-02');
+    """))
+    run_sql("""
+        INSERT INTO CustomerSalesSummary (CustomerID, TotalSales, RecordDate, Tier)
+        SELECT
+            c.CustomerID,
+            SUM(s.SaleAmount) AS TotalSales,
+            '2024-06-10' AS RecordDate,
+            CASE
+                WHEN SUM(s.SaleAmount) > 10000 THEN 'Platinum'
+                WHEN SUM(s.SaleAmount) > 5000 THEN 'Gold'
+                ELSE 'Silver'
+            END AS Tier
+        FROM Customers c
+        INNER JOIN Sales s ON c.CustomerID = s.CustomerID
+        WHERE s.SaleAmount > 5000
+        GROUP BY c.CustomerID;
+    """, conn)
+    df = pd.read_sql("SELECT * FROM CustomerSalesSummary", conn)
+    expected = pd.DataFrame({
+        "CustomerID": [1],
+        "TotalSales": [8000],
+        "RecordDate": ['2024-06-10'],
+        "Tier": ['Gold']
+    })
+    assert_frame_equal(df.reset_index(drop=True), expected)
+
+def test_TC04_update_customer_status_happy_path(setup_db):
+    conn = setup_db
+    conn.execute(text("INSERT INTO Customers (CustomerID, Status) VALUES (1, 'Regular'), (2, 'Regular');"))
+    conn.execute(text("""
+        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
+        (101, 1, 12000, '2024-06-01'),
+        (102, 2, 4000, '2024-06-01');
+    """))
+    run_sql("""
+        UPDATE Customers
+        SET Status = (
+            SELECT CASE
+                WHEN SUM(SaleAmount) > 10000 THEN 'VIP'
+                ELSE 'Regular'
+            END
+            FROM Sales
+            WHERE Customers.CustomerID = Sales.CustomerID
+        )
+        WHERE EXISTS (
+            SELECT 1 FROM Sales WHERE Customers.CustomerID = Sales.CustomerID
+        );
+    """, conn)
+    df = pd.read_sql("SELECT CustomerID, Status FROM Customers ORDER BY CustomerID", conn)
+    expected = pd.DataFrame({
+        "CustomerID": [1, 2],
+        "Status": ['VIP', 'Regular']
+    })
+    assert_frame_equal(df.reset_index(drop=True), expected)
+
+def test_TC05_update_customer_status_no_sales(setup_db):
+    conn = setup_db
+    conn.execute(text("INSERT INTO Customers (CustomerID, Status) VALUES (1, 'Regular'), (2, 'Regular');"))
+    # No sales for customer 2
+    conn.execute(text("""
+        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
+        (101, 1, 12000, '2024-06-01');
+    """))
+    run_sql("""
+        UPDATE Customers
+        SET Status = (
+            SELECT CASE
+                WHEN SUM(SaleAmount) > 10000 THEN 'VIP'
+                ELSE 'Regular'
+            END
+            FROM Sales
+            WHERE Customers.CustomerID = Sales.CustomerID
+        )
+        WHERE EXISTS (
+            SELECT 1 FROM Sales WHERE Customers.CustomerID = Sales.CustomerID
+        );
+    """, conn)
+    df = pd.read_sql("SELECT CustomerID, Status FROM Customers ORDER BY CustomerID", conn)
+    # Customer 2 should remain 'Regular'
+    expected = pd.DataFrame({
+        "CustomerID": [1, 2],
+        "Status": ['VIP', 'Regular']
+    })
+    assert_frame_equal(df.reset_index(drop=True), expected)
+
+def test_TC06_merge_sales_master_happy_path(setup_db):
+    conn = setup_db
+    # Existing record in SalesMaster
+    conn.execute(text("""
+        INSERT INTO SalesMaster (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
+        (101, 1, 1000, '2024-06-01');
+    """))
+    # New and existing sales in Sales
+    conn.execute(text("""
+        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
+        (101, 1, 1200, '2024-06-01'),  -- Should update
+        (102, 2, 3000, '2024-06-02');  -- Should insert
+    """))
+    # Simulate MERGE
+    run_sql("""
+        UPDATE SalesMaster
+        SET SaleAmount = (SELECT SaleAmount FROM Sales WHERE SalesMaster.SaleID = Sales.SaleID)
+        WHERE SaleID IN (SELECT SaleID FROM Sales);
+        INSERT INTO SalesMaster (SaleID, CustomerID, SaleAmount, SaleDate)
+        SELECT SaleID, CustomerID, SaleAmount, SaleDate
+        FROM Sales
+        WHERE SaleID NOT IN (SELECT SaleID FROM SalesMaster);
+    """, conn)
+    df = pd.read_sql("SELECT * FROM SalesMaster ORDER BY SaleID", conn)
+    expected = pd.DataFrame({
+        "SaleID": [101, 102],
+        "CustomerID": [1, 2],
+        "SaleAmount": [1200, 3000],
+        "SaleDate": ['2024-06-01', '2024-06-02']
+    })
+    assert_frame_equal(df.reset_index(drop=True), expected)
+
+def test_TC07_merge_sales_master_nulls(setup_db):
+    conn = setup_db
+    conn.execute(text("""
+        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
+        (101, 1, NULL, NULL);
+    """))
+    run_sql("""
+        INSERT INTO SalesMaster (SaleID, CustomerID, SaleAmount, SaleDate)
+        SELECT SaleID, CustomerID, SaleAmount, SaleDate FROM Sales;
+    """, conn)
+    df = pd.read_sql("SELECT * FROM SalesMaster", conn)
+    expected = pd.DataFrame({
+        "SaleID": [101],
+        "CustomerID": [1],
+        "SaleAmount": [None],
+        "SaleDate": [None]
+    })
+    assert_frame_equal(df.reset_index(drop=True), expected)
+
+def test_TC08_error_missing_column(setup_db):
+    conn = setup_db
+    # Omit SaleAmount column
+    conn.execute(text("""
+        CREATE TABLE Sales2 (
+            SaleID INTEGER PRIMARY KEY,
+            CustomerID INTEGER,
+            SaleDate TEXT
+        );
+    """))
+    # Try to run logic expecting SaleAmount
+    with pytest.raises(Exception):
+        run_sql("""
+            INSERT INTO CustomerSalesSummary (CustomerID, TotalSales, RecordDate, Tier)
+            SELECT
+                c.CustomerID,
+                SUM(s.SaleAmount) AS TotalSales,
+                '2024-06-10' AS RecordDate,
+                CASE
+                    WHEN SUM(s.SaleAmount) > 10000 THEN 'Platinum'
+                    WHEN SUM(s.SaleAmount) > 5000 THEN 'Gold'
+                    ELSE 'Silver'
+                END AS Tier
+            FROM Customers c
+            INNER JOIN Sales2 s ON c.CustomerID = s.CustomerID
+            WHERE s.SaleAmount > 5000
+            GROUP BY c.CustomerID;
+        """, conn)
+
+def test_TC09_edge_saleamount_at_threshold(setup_db):
+    conn = setup_db
+    conn.execute(text("INSERT INTO Customers (CustomerID, Status) VALUES (1, 'Regular');"))
+    conn.execute(text("""
+        INSERT INTO Sales (SaleID, CustomerID, SaleAmount, SaleDate) VALUES
+        (101, 1, 5000, '2024-06-01');
+    """))
+    run_sql("""
+        INSERT INTO CustomerSalesSummary (CustomerID, TotalSales, RecordDate, Tier)
+        SELECT
+            c.CustomerID,
+            SUM(s.SaleAmount) AS TotalSales,
+            '2024-06-10' AS RecordDate,
+            CASE
+                WHEN SUM(s.SaleAmount) > 10000 THEN 'Platinum'
+                WHEN SUM(s.SaleAmount) > 5000 THEN 'Gold'
+                ELSE 'Silver'
+            END AS Tier
+        FROM Customers c
+        INNER JOIN Sales s ON c.CustomerID = s.CustomerID
+        WHERE s.SaleAmount > 5000
+        GROUP BY c.CustomerID;
+    """, conn)
+    df = pd.read_sql("SELECT * FROM CustomerSalesSummary", conn)
+    # SaleAmount == threshold should be excluded
+    assert df.empty
+
+def test_TC10_all_tables_empty(setup_db):
+    conn = setup_db
+    # No data inserted
+    run_sql("""
+        INSERT INTO CustomerSalesSummary (CustomerID, TotalSales, RecordDate, Tier)
+        SELECT
+            c.CustomerID,
+            SUM(s.SaleAmount) AS TotalSales,
+            '2024-06-10' AS RecordDate,
+            CASE
+                WHEN SUM(s.SaleAmount) > 10000 THEN 'Platinum'
+                WHEN SUM(s.SaleAmount) > 5000 THEN 'Gold'
+                ELSE 'Silver'
+            END AS Tier
+        FROM Customers c
+        INNER JOIN Sales s ON c.CustomerID = s.CustomerID
+        WHERE s.SaleAmount > 5000
+        GROUP BY c.CustomerID;
+    """, conn)
+    df = pd.read_sql("SELECT * FROM CustomerSalesSummary", conn)
+    assert df.empty
+
+
+API Cost Consumed in dollars: 0.0061 USD
