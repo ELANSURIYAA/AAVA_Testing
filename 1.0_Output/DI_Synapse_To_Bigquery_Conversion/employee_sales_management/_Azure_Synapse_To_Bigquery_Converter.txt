@@ -1,72 +1,55 @@
 =============================================
 Author:        AAVA
 Created on:   
-Description:   BigQuery SQL conversion of Azure Synapse stored procedure for sales fact loading with audit logging and data quality checks
+Description:   Load Sales Fact - Converted from Azure Synapse stored procedure to BigQuery
 =============================================
 
--- ==========================================================================================
--- Script:        bq_load_sales_fact.sql
--- Description:   BigQuery SQL conversion of Azure Synapse stored procedure [dw].[sp_load_sales_fact]
---                Implements audit logging, data quality checks, transformation, and error handling.
--- Author:        [Your Name]
--- Date:          [YYYY-MM-DD]
--- Notes:         - Uses BigQuery scripting (DECLARE, BEGIN ... EXCEPTION ... END)
---                - Temporary tables are emulated with temporary named tables (prefixed with _)
---                - Audit and DQ logging follow BigQuery best practices
---                - All timestamps in UTC (CURRENT_TIMESTAMP())
---                - API cost: Each DML/DDL statement incurs BigQuery processing cost based on data scanned/modified.
--- ==========================================================================================
+-- This script implements the logic of the original Synapse stored procedure 'dw.sp_load_sales_fact'
+-- using BigQuery Standard SQL, including variable management, audit logging, data quality checks,
+-- transformation, fact loading, error handling, and audit updates.
 
--- Begin BigQuery Script
+-- ===========================
+-- BEGIN: BigQuery SQL Script
+-- ===========================
+
 DECLARE batch_id STRING DEFAULT GENERATE_UUID();
 DECLARE start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
 DECLARE end_time TIMESTAMP;
 DECLARE rows_inserted INT64 DEFAULT 0;
 DECLARE rows_rejected INT64 DEFAULT 0;
 DECLARE error_message STRING;
-DECLARE proc_name STRING DEFAULT 'bq_load_sales_fact';
+DECLARE proc_name STRING DEFAULT 'sp_load_sales_fact';
 
 BEGIN
-
-  -- Insert Audit Log: STARTED
+  -- Start Audit Log
   INSERT INTO `dw.Audit_Log`
     (Batch_ID, Procedure_Name, Start_Time, Status, Message)
   VALUES
     (batch_id, proc_name, start_time, 'STARTED', 'Sales Fact Load Initiated');
 
-  -- Clean up temp table if exists (BigQuery does not support temp tables in the same way as SQL Server)
-  -- We'll use a session-scoped table with a unique name
-  EXECUTE IMMEDIATE FORMAT("""
-    CREATE OR REPLACE TABLE `dw._InvalidRows_%s` (
-      Transaction_ID INT64,
-      Reason STRING
-    )
-  """, batch_id);
+  -- Create temporary table for invalid rows
+  CREATE TEMP TABLE InvalidRows AS
+  SELECT Transaction_ID, 'Missing CustomerID' AS Reason
+  FROM `stg.Sales_Transactions`
+  WHERE Customer_ID IS NULL
 
-  -- Data Quality Check: Missing Customer_ID
-  INSERT INTO `dw._InvalidRows_` || batch_id (Transaction_ID, Reason)
-  SELECT Transaction_ID, 'Missing CustomerID'
-    FROM `stg.Sales_Transactions`
-   WHERE Customer_ID IS NULL;
+  UNION ALL
 
-  -- Data Quality Check: Invalid Quantity
-  INSERT INTO `dw._InvalidRows_` || batch_id (Transaction_ID, Reason)
-  SELECT Transaction_ID, 'Invalid Quantity'
-    FROM `stg.Sales_Transactions`
-   WHERE Quantity <= 0;
+  SELECT Transaction_ID, 'Invalid Quantity' AS Reason
+  FROM `stg.Sales_Transactions`
+  WHERE Quantity <= 0;
 
-  -- Remove Invalid Rows from Staging
+  -- Delete invalid rows from staging table
+  -- BigQuery does not support DELETE with JOIN directly, so use WHERE IN
   DELETE FROM `stg.Sales_Transactions`
-   WHERE Transaction_ID IN (
-     SELECT Transaction_ID FROM `dw._InvalidRows_` || batch_id
-   );
+  WHERE Transaction_ID IN (SELECT Transaction_ID FROM InvalidRows);
 
-  -- Count rows rejected
+  -- Count rejected rows
   SET rows_rejected = (
-    SELECT COUNT(*) FROM `dw._InvalidRows_` || batch_id
+    SELECT COUNT(*) FROM InvalidRows
   );
 
-  -- Data Transformation and Load
+  -- Data Transformation using CTE
   WITH transformed AS (
     SELECT
       s.Transaction_ID,
@@ -80,17 +63,21 @@ BEGIN
       c.Customer_Segment,
       CURRENT_TIMESTAMP() AS Load_Timestamp,
       batch_id AS Batch_ID
-    FROM `stg.Sales_Transactions` s
-    INNER JOIN `dw.Dim_Customer` c
-      ON s.Customer_ID = c.Customer_ID
-    INNER JOIN `dw.Dim_Date` d
-      ON DATE(s.Sales_Date) = d.Date_Value
+    FROM
+      `stg.Sales_Transactions` s
+      INNER JOIN `dw.Dim_Customer` c ON s.Customer_ID = c.Customer_ID
+      INNER JOIN `dw.Dim_Date` d ON DATE(s.Sales_Date) = d.Date_Value
   )
+
+  -- Insert into Fact Table
   INSERT INTO `dw.Fact_Sales`
     (Transaction_ID, Customer_ID, Product_ID, Sales_Date, Quantity, Unit_Price, Total_Sales_Amount, Region_ID, Customer_Segment, Load_Timestamp, Batch_ID)
-  SELECT * FROM transformed;
+  SELECT
+    Transaction_ID, Customer_ID, Product_ID, Sales_Date, Quantity, Unit_Price, Total_Sales_Amount, Region_ID, Customer_Segment, Load_Timestamp, Batch_ID
+  FROM
+    transformed;
 
-  -- Count rows inserted
+  -- Count inserted rows
   SET rows_inserted = (
     SELECT COUNT(*) FROM transformed
   );
@@ -98,47 +85,53 @@ BEGIN
   -- Truncate staging table
   TRUNCATE TABLE `stg.Sales_Transactions`;
 
-  -- Log Data Quality Failures
+  -- Insert DQ failures
   INSERT INTO `dw.DQ_Failures`
     (Transaction_ID, Failure_Reason, Logged_Timestamp, Batch_ID)
   SELECT
-    Transaction_ID,
-    Reason,
-    CURRENT_TIMESTAMP(),
-    batch_id
-  FROM `dw._InvalidRows_` || batch_id;
+    Transaction_ID, Reason, CURRENT_TIMESTAMP(), batch_id
+  FROM
+    InvalidRows;
 
-  -- Update Audit Log: COMPLETED
+  -- End time
   SET end_time = CURRENT_TIMESTAMP();
+
+  -- Update Audit Log as COMPLETED
   UPDATE `dw.Audit_Log`
-     SET End_Time = end_time,
-         Rows_Inserted = rows_inserted,
-         Rows_Rejected = rows_rejected,
-         Status = 'COMPLETED',
-         Message = CONCAT('Inserted ', CAST(rows_inserted AS STRING), ' rows; Rejected ', CAST(rows_rejected AS STRING), ' rows.')
-   WHERE Batch_ID = batch_id;
+  SET
+    End_Time = end_time,
+    Rows_Inserted = rows_inserted,
+    Rows_Rejected = rows_rejected,
+    Status = 'COMPLETED',
+    Message = CONCAT('Inserted ', CAST(rows_inserted AS STRING), ' rows; Rejected ', CAST(rows_rejected AS STRING), ' rows.')
+  WHERE
+    Batch_ID = batch_id;
 
 EXCEPTION WHEN ERROR THEN
+  -- On error, update audit log as FAILED
   SET end_time = CURRENT_TIMESTAMP();
-  SET error_message = ERROR_MESSAGE();
+  SET error_message = @@error.message;
   UPDATE `dw.Audit_Log`
-     SET End_Time = end_time,
-         Status = 'FAILED',
-         Message = error_message
-   WHERE Batch_ID = batch_id;
-  -- Optionally, re-raise error
-  RAISE USING MESSAGE = error_message;
+  SET
+    End_Time = end_time,
+    Status = 'FAILED',
+    Message = error_message
+  WHERE
+    Batch_ID = batch_id;
+  -- Optionally, re-raise error (BigQuery scripting will propagate error by default)
 END;
 
--- Clean up temp table
-EXECUTE IMMEDIATE FORMAT("DROP TABLE IF EXISTS `dw._InvalidRows_%s`", batch_id);
+-- ===========================
+-- END: BigQuery SQL Script
+-- ===========================
 
--- ==========================================================================================
--- API COST CONSUMPTION NOTES:
--- - Each INSERT, DELETE, UPDATE, and SELECT statement will incur BigQuery processing costs, based on the amount of data scanned or modified.
--- - TRUNCATE TABLE is free, but underlying storage costs may apply.
--- - Use partitioned/tabled clustering for large tables to optimize cost.
--- - For best cost efficiency, ensure all tables involved are partitioned and clustered appropriately.
--- ==========================================================================================
+-- Notes:
+-- - All table names are fully qualified with backticks.
+-- - Temporary table InvalidRows is scoped to this script execution.
+-- - Error handling uses EXCEPTION block (BigQuery scripting).
+-- - Variables are declared and used in BigQuery scripting style.
+-- - TRUNCATE TABLE is supported in BigQuery.
+-- - Audit logging and DQ failure logging are preserved.
+-- - The script is designed for execution in BigQuery scripting (e.g., via bq query --use_legacy_sql=false).
 
-API Cost Consumed in dollars: 0.0032 USD
+API Cost Consumed in dollars: 0.0023 USD
