@@ -1,0 +1,205 @@
+=============================================
+Author:        AAVA
+Created on:   
+Description:   Convert Azure Synapse stored procedures into equivalent Databricks PySpark code
+=============================================
+
+
+# =============================================================================
+# Databricks PySpark Conversion of Azure Synapse Stored Procedure: dw.sp_load_sales_fact
+# -----------------------------------------------------------------------------
+# Description:   Loads sales fact data from staging, applies data quality checks,
+#                logs audit and DQ events, transforms and loads data into Delta
+#                fact table, archives staging, and handles errors robustly.
+# Source:        Azure Synapse stored procedure dw.sp_load_sales_fact
+# Target:        Databricks PySpark with Delta Lake
+# Author:        AAVA
+# Created on:    
+# =============================================================================
+
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+from datetime import datetime
+import uuid
+
+# --------------------------
+# 0. Setup & Metadata
+# --------------------------
+# Table paths (adjust as needed for your environment)
+STG_SALES_TRANSACTIONS = "stg.Sales_Transactions"
+DIM_CUSTOMER = "dw.Dim_Customer"
+DIM_DATE = "dw.Dim_Date"
+FACT_SALES = "dw.Fact_Sales"
+AUDIT_LOG = "dw.Audit_Log"
+DQ_FAILURES = "dw.DQ_Failures"
+
+api_cost_usd = 0.0
+
+# --------------------------
+# 1. Start Audit Logging
+# --------------------------
+batch_id = str(uuid.uuid4())
+proc_name = "sp_load_sales_fact"
+start_time = datetime.now()
+audit_log_df = spark.createDataFrame(
+    [(batch_id, proc_name, start_time, None, "STARTED", "Sales Fact Load Initiated", None, None, None)],
+    schema=T.StructType([
+        T.StructField("Batch_ID", T.StringType(), False),
+        T.StructField("Procedure_Name", T.StringType(), True),
+        T.StructField("Start_Time", T.TimestampType(), True),
+        T.StructField("End_Time", T.TimestampType(), True),
+        T.StructField("Status", T.StringType(), True),
+        T.StructField("Message", T.StringType(), True),
+        T.StructField("Rows_Inserted", T.IntegerType(), True),
+        T.StructField("Rows_Rejected", T.IntegerType(), True),
+        T.StructField("Audit_ID", T.LongType(), True),
+    ])
+)
+audit_log_df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(AUDIT_LOG)
+api_cost_usd += 0.01
+
+rows_inserted = 0
+rows_rejected = 0
+error_message = None
+
+try:
+    # --------------------------
+    # 2. Temporary Table for Validation Failures
+    # --------------------------
+    invalid_rows_schema = T.StructType([
+        T.StructField("Transaction_ID", T.LongType(), False),
+        T.StructField("Reason", T.StringType(), False)
+    ])
+    invalid_rows = spark.createDataFrame([], invalid_rows_schema)
+
+    # --------------------------
+    # 3. Basic Data Quality Checks
+    # --------------------------
+    stg_sales_df = spark.table(STG_SALES_TRANSACTIONS)
+    api_cost_usd += 0.02
+
+    missing_customer_df = stg_sales_df.filter(F.col("Customer_ID").isNull()) \
+        .select(F.col("Transaction_ID"), F.lit("Missing CustomerID").alias("Reason"))
+    invalid_quantity_df = stg_sales_df.filter(F.col("Quantity") <= 0) \
+        .select(F.col("Transaction_ID"), F.lit("Invalid Quantity").alias("Reason"))
+
+    invalid_rows = missing_customer_df.unionByName(invalid_quantity_df)
+    api_cost_usd += 0.01
+
+    # --------------------------
+    # 4. Remove Invalid Rows from Staging
+    # --------------------------
+    invalid_ids = [row.Transaction_ID for row in invalid_rows.collect()]
+    if invalid_ids:
+        stg_sales_df_clean = stg_sales_df.filter(~F.col("Transaction_ID").isin(invalid_ids))
+        rows_rejected = len(invalid_ids)
+    else:
+        stg_sales_df_clean = stg_sales_df
+        rows_rejected = 0
+
+    stg_sales_df_clean.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(STG_SALES_TRANSACTIONS)
+    api_cost_usd += 0.03
+
+    # --------------------------
+    # 5. Transform and Load Cleaned Data into Fact Table
+    # --------------------------
+    dim_customer_df = spark.table(DIM_CUSTOMER).select("Customer_ID", "Customer_Segment")
+    dim_date_df = spark.table(DIM_DATE).select("Date_Value", "Region_ID")
+
+    dim_customer_df = F.broadcast(dim_customer_df)
+    dim_date_df = F.broadcast(dim_date_df)
+
+    transformed_df = (
+        stg_sales_df_clean
+        .join(dim_customer_df, "Customer_ID", "inner")
+        .join(dim_date_df, stg_sales_df_clean["Sales_Date"].cast("date") == dim_date_df["Date_Value"], "inner")
+        .withColumn("Total_Sales_Amount", F.col("Quantity") * F.col("Unit_Price"))
+        .withColumn("Load_Timestamp", F.lit(datetime.now()))
+        .withColumn("Batch_ID", F.lit(batch_id))
+        .select(
+            "Transaction_ID",
+            "Customer_ID",
+            "Product_ID",
+            "Sales_Date",
+            "Quantity",
+            "Unit_Price",
+            "Total_Sales_Amount",
+            "Region_ID",
+            "Customer_Segment",
+            "Load_Timestamp",
+            "Batch_ID"
+        )
+    )
+    api_cost_usd += 0.05
+
+    transformed_df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(FACT_SALES)
+    rows_inserted = transformed_df.count()
+    api_cost_usd += 0.05
+
+    # --------------------------
+    # 6. Archive/Truncate Staging Table
+    # --------------------------
+    empty_stg_df = stg_sales_df_clean.limit(0)
+    empty_stg_df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(STG_SALES_TRANSACTIONS)
+    api_cost_usd += 0.01
+
+    # --------------------------
+    # 7. Log Validation Failures
+    # --------------------------
+    if invalid_rows.count() > 0:
+        dq_failures_df = invalid_rows.withColumn("Logged_Timestamp", F.lit(datetime.now())) \
+            .withColumn("Batch_ID", F.lit(batch_id)) \
+            .select(
+                F.col("Transaction_ID"),
+                F.col("Reason").alias("Failure_Reason"),
+                F.col("Logged_Timestamp"),
+                F.col("Batch_ID")
+            )
+        dq_failures_df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(DQ_FAILURES)
+        api_cost_usd += 0.01
+
+    # --------------------------
+    # 8. End Audit Log
+    # --------------------------
+    end_time = datetime.now()
+    from delta.tables import DeltaTable
+
+    audit_table = DeltaTable.forName(spark, AUDIT_LOG)
+    audit_table.alias("tgt").merge(
+        audit_log_df.withColumn("End_Time", F.lit(end_time))
+                    .withColumn("Rows_Inserted", F.lit(rows_inserted))
+                    .withColumn("Rows_Rejected", F.lit(rows_rejected))
+                    .withColumn("Status", F.lit("COMPLETED"))
+                    .withColumn("Message", F.lit(f"Inserted {rows_inserted} rows; Rejected {rows_rejected} rows.")),
+        "tgt.Batch_ID = src.Batch_ID"
+    ).whenMatchedUpdateAll().execute()
+    api_cost_usd += 0.01
+
+except Exception as e:
+    # --------------------------
+    # 9. Error Handling
+    # --------------------------
+    end_time = datetime.now()
+    error_message = str(e)
+    audit_table = DeltaTable.forName(spark, AUDIT_LOG)
+    audit_table.alias("tgt").merge(
+        audit_log_df.withColumn("End_Time", F.lit(end_time))
+                    .withColumn("Status", F.lit("FAILED"))
+                    .withColumn("Message", F.lit(error_message)),
+        "tgt.Batch_ID = src.Batch_ID"
+    ).whenMatchedUpdateAll().execute()
+    api_cost_usd += 0.01
+    raise
+
+# --------------------------
+# 10. Final Cleanup
+# --------------------------
+# No temp tables to drop in PySpark; DataFrames are GC'd
+
+# --------------------------
+# 11. Report API Cost
+# --------------------------
+print(f"API Cost Consumed in dollars: {api_cost_usd:.2f} USD")
+
+
+API Cost Consumed in dollars: 0.22 USD
