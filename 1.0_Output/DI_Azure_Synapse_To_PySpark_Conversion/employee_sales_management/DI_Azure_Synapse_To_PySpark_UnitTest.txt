@@ -1,114 +1,141 @@
 ================================
 Author: AAVA
 Created on: 
-Description: Pytest-based unit test suite for Databricks PySpark script loading sales fact data, including data quality checks, audit logging, and error handling.
+Description: Pytest-based unit test suite for validating the Databricks PySpark implementation of the dw.sp_load_sales_fact ETL process, including data quality checks, fact table loading, auditing, and error handling.
 ================================
 
-### Test Case List
+## Test Case List
 
-| Test Case ID | Test Case Description                                                                 | Expected Outcome                                                                                                  |
-|--------------|--------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
-| TC01         | Happy path: All sales records are valid                                              | All records inserted into `dw.Fact_Sales`, audit log shows correct counts, no DQ failures logged.                 |
-| TC02         | Edge: Some records have NULL Customer_ID                                             | Only valid records inserted, invalid records logged in `dw.DQ_Failures`, correct counts in audit log.             |
-| TC03         | Edge: Some records have Quantity <= 0                                                | Only valid records inserted, invalid records logged in `dw.DQ_Failures`, correct counts in audit log.             |
-| TC04         | Edge: All records invalid (all fail DQ checks)                                       | No records inserted, all records logged in `dw.DQ_Failures`, audit log shows 0 inserted, all rejected.            |
-| TC05         | Edge: Empty staging table                                                            | No records inserted, audit log shows 0 inserted and 0 rejected, no DQ failures logged.                            |
-| TC06         | Edge: Sales_Date does not match any in `dw.Dim_Date`                                 | Only matching records inserted, unmatched records excluded, audit log reflects correct counts.                     |
-| TC07         | Edge: Customer_ID not found in `dw.Dim_Customer`                                     | Only matching records inserted, unmatched records excluded, audit log reflects correct counts.                     |
-| TC08         | Error: Missing required column in staging (e.g., Quantity column missing)             | Audit log status is FAILED, error message logged, no records inserted.                                            |
-| TC09         | Error: Invalid data type in Quantity (e.g., string instead of int)                    | Audit log status is FAILED, error message logged, no records inserted.                                            |
-| TC10         | Edge: Multiple DQ failures in a single record (e.g., NULL Customer_ID and Quantity=0)| All applicable reasons logged, record appears once in DQ failures, correct counts in audit log.                   |
-| TC11         | Happy path: Audit log and DQ failures tables are empty before run                     | After run, audit log and DQ failures have the correct new entries only.                                           |
-| TC12         | Edge: Large batch (performance, e.g., 10,000+ records)                               | All valid records processed, performance within reasonable time, correct counts in audit log and DQ failures.     |
+| Test Case ID | Test Case Description                                                                 | Expected Outcome                                                                                           |
+|--------------|--------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: All staging data is valid and matches dimension tables                    | All rows loaded to dw.Fact_Sales; Audit_Log and DQ_Failures updated correctly; staging truncated           |
+| TC02         | Edge: Staging contains rows with NULL Customer_ID                                    | Those rows rejected, logged in DQ_Failures, not loaded to Fact_Sales; Audit_Log reflects rejections        |
+| TC03         | Edge: Staging contains rows with Quantity <= 0                                       | Those rows rejected, logged in DQ_Failures, not loaded to Fact_Sales; Audit_Log reflects rejections        |
+| TC04         | Edge: Staging contains rows with both NULL Customer_ID and invalid Quantity          | Both rejection reasons logged; rows not loaded; DQ_Failures contains both reasons                          |
+| TC05         | Edge: Empty staging table                                                            | No rows loaded or rejected; Audit_Log and DQ_Failures reflect zero activity                                |
+| TC06         | Edge: Staging rows with missing dimension references (Customer_ID or Date not found) | Those rows not loaded; only valid dimension matches loaded; Audit_Log reflects correct counts              |
+| TC07         | Error: Staging table missing required columns                                        | Process fails; Audit_Log status is FAILED; error message logged                                            |
+| TC08         | Error: Unexpected data types in staging columns                                      | Process fails; Audit_Log status is FAILED; error message logged                                            |
+| TC09         | Edge: Duplicate Transaction_ID in staging                                            | Both rows processed (no deduplication in logic); both loaded if valid; Audit_Log reflects correct count    |
+| TC10         | Edge: Large batch (performance/volume test)                                          | All valid rows loaded; process completes successfully; Audit_Log reflects correct counts                   |
 
 ---
 
-### Pytest Script
+## Pytest Script
 
 
 import pytest
-from pyspark.sql import SparkSession, Row, functions as F
-from datetime import datetime
-import uuid
 import pandas as pd
+import uuid
+from datetime import datetime
+from pyspark.sql import SparkSession, Row, functions as F
+from pyspark.sql.types import StructType, StructField, IntegerType, StringType, DoubleType, TimestampType, LongType
 
-@pytest.fixture(scope="module")
-def spark():
-    spark = SparkSession.builder.master("local[2]").appName("TestSalesFactLoad").getOrCreate()
-    yield spark
-    spark.stop()
+# ------------------ Helper Functions ------------------
 
-def setup_tables(spark, sales_data=None, dim_customer_data=None, dim_date_data=None):
-    # Default data for dimensions
-    if dim_customer_data is None:
-        dim_customer_data = [
-            Row(Customer_ID=1, Customer_Segment="Retail"),
-            Row(Customer_ID=2, Customer_Segment="Wholesale"),
-        ]
-    if dim_date_data is None:
-        dim_date_data = [
-            Row(Date_Value=datetime(2023, 1, 1).date(), Region_ID=100),
-            Row(Date_Value=datetime(2023, 1, 2).date(), Region_ID=101),
-        ]
-    # Create or replace tables
-    spark.createDataFrame(dim_customer_data).write.format("delta").mode("overwrite").saveAsTable("dw.Dim_Customer")
-    spark.createDataFrame(dim_date_data).write.format("delta").mode("overwrite").saveAsTable("dw.Dim_Date")
-    # Sales staging
-    if sales_data is not None:
-        spark.createDataFrame(sales_data).write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
-    else:
-        # Empty table
-        schema = "Transaction_ID BIGINT, Customer_ID INT, Product_ID INT, Sales_Date DATE, Quantity INT, Unit_Price DOUBLE"
-        spark.createDataFrame([], schema).write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
-    # Clean up Fact and DQ tables
-    for tbl in ["dw.Fact_Sales", "dw.DQ_Failures", "dw.Audit_Log"]:
-        spark.sql(f"DROP TABLE IF EXISTS {tbl}")
-        # Create empty tables with appropriate schema
-        if tbl == "dw.Fact_Sales":
-            schema = "Transaction_ID BIGINT, Customer_ID INT, Product_ID INT, Sales_Date DATE, Quantity INT, Unit_Price DOUBLE, Total_Sales_Amount DOUBLE, Region_ID INT, Customer_Segment STRING, Load_Timestamp TIMESTAMP, Batch_ID STRING"
-        elif tbl == "dw.DQ_Failures":
-            schema = "Transaction_ID BIGINT, Failure_Reason STRING, Logged_Timestamp TIMESTAMP, Batch_ID STRING"
-        elif tbl == "dw.Audit_Log":
-            schema = "Batch_ID STRING, Procedure_Name STRING, Start_Time TIMESTAMP, Status STRING, Message STRING, End_Time TIMESTAMP, Rows_Inserted INT, Rows_Rejected INT, Error_Message STRING"
-        spark.createDataFrame([], schema).write.format("delta").mode("overwrite").saveAsTable(tbl)
+def create_spark():
+    return SparkSession.builder.master("local[1]").appName("TestSalesFactLoad").getOrCreate()
 
-def run_sales_fact_load(spark):
-    # Import the main logic from the provided PySpark script
-    # For testability, this should be refactored into a function in production code.
-    from pyspark.sql import functions as F
+def reset_tables(spark):
+    # Drop and recreate all relevant tables for isolation
+    spark.sql("DROP TABLE IF EXISTS stg.Sales_Transactions")
+    spark.sql("DROP TABLE IF EXISTS dw.Dim_Customer")
+    spark.sql("DROP TABLE IF EXISTS dw.Dim_Date")
+    spark.sql("DROP TABLE IF EXISTS dw.Fact_Sales")
+    spark.sql("DROP TABLE IF EXISTS dw.Audit_Log")
+    spark.sql("DROP TABLE IF EXISTS dw.DQ_Failures")
+    # Create empty tables with expected schema
+    spark.createDataFrame([], schema=StructType([
+        StructField("Transaction_ID", LongType()),
+        StructField("Customer_ID", IntegerType()),
+        StructField("Product_ID", IntegerType()),
+        StructField("Sales_Date", StringType()),
+        StructField("Quantity", IntegerType()),
+        StructField("Unit_Price", DoubleType())
+    ])).write.format("delta").saveAsTable("stg.Sales_Transactions")
+    spark.createDataFrame([
+        Row(Customer_ID=1, Customer_Segment="Retail"),
+        Row(Customer_ID=2, Customer_Segment="Wholesale"),
+    ]).write.format("delta").mode("overwrite").saveAsTable("dw.Dim_Customer")
+    spark.createDataFrame([
+        Row(Date_Value=datetime(2023, 1, 1).date(), Region_ID=10),
+        Row(Date_Value=datetime(2023, 1, 2).date(), Region_ID=20),
+    ]).write.format("delta").mode("overwrite").saveAsTable("dw.Dim_Date")
+    spark.createDataFrame([], schema=StructType([
+        StructField("Transaction_ID", LongType()),
+        StructField("Customer_ID", IntegerType()),
+        StructField("Product_ID", IntegerType()),
+        StructField("Sales_Date", StringType()),
+        StructField("Quantity", IntegerType()),
+        StructField("Unit_Price", DoubleType()),
+        StructField("Total_Sales_Amount", DoubleType()),
+        StructField("Region_ID", IntegerType()),
+        StructField("Customer_Segment", StringType()),
+        StructField("Load_Timestamp", TimestampType()),
+        StructField("Batch_ID", StringType())
+    ])).write.format("delta").saveAsTable("dw.Fact_Sales")
+    spark.createDataFrame([], schema=StructType([
+        StructField("Batch_ID", StringType()),
+        StructField("Procedure_Name", StringType()),
+        StructField("Start_Time", TimestampType()),
+        StructField("Status", StringType()),
+        StructField("Message", StringType()),
+        StructField("Rows_Inserted", IntegerType()),
+        StructField("Rows_Rejected", IntegerType()),
+        StructField("End_Time", TimestampType())
+    ])).write.format("delta").saveAsTable("dw.Audit_Log")
+    spark.createDataFrame([], schema=StructType([
+        StructField("Transaction_ID", LongType()),
+        StructField("Reason", StringType()),
+        StructField("Logged_Timestamp", TimestampType()),
+        StructField("Batch_ID", StringType())
+    ])).write.format("delta").saveAsTable("dw.DQ_Failures")
+
+def run_etl_script(spark):
+    # The ETL process as per the provided PySpark code
     from datetime import datetime
     import uuid
+    import traceback
 
     batch_id = str(uuid.uuid4())
-    start_time = datetime.now()
+    start_time = datetime.utcnow()
     end_time = None
     rows_inserted = 0
     rows_rejected = 0
     error_message = None
     proc_name = "sp_load_sales_fact"
 
-    audit_log_start = spark.createDataFrame(
-        [(batch_id, proc_name, start_time, "STARTED", "Sales Fact Load Initiated", None, None, None, None)],
-        ["Batch_ID", "Procedure_Name", "Start_Time", "Status", "Message", "End_Time", "Rows_Inserted", "Rows_Rejected", "Error_Message"]
+    audit_log_df = spark.createDataFrame(
+        [(batch_id, proc_name, start_time, "STARTED", "Sales Fact Load Initiated", None, None, None)],
+        ["Batch_ID", "Procedure_Name", "Start_Time", "Status", "Message", "Rows_Inserted", "Rows_Rejected", "End_Time"]
     )
-    audit_log_start.write.format("delta").mode("append").saveAsTable("dw.Audit_Log")
+    audit_log_df.write.format("delta").mode("append").saveAsTable("dw.Audit_Log")
 
     try:
-        invalid_rows = spark.createDataFrame([], "Transaction_ID BIGINT, Reason STRING")
-        sales_df = spark.table("stg.Sales_Transactions")
-        missing_customer = sales_df.filter(F.col("Customer_ID").isNull()) \
+        stg_sales_df = spark.table("stg.Sales_Transactions")
+
+        invalid_customer_df = stg_sales_df.filter(F.col("Customer_ID").isNull()) \
             .select(F.col("Transaction_ID"), F.lit("Missing CustomerID").alias("Reason"))
-        invalid_quantity = sales_df.filter(F.col("Quantity") <= 0) \
+        invalid_quantity_df = stg_sales_df.filter(F.col("Quantity") <= 0) \
             .select(F.col("Transaction_ID"), F.lit("Invalid Quantity").alias("Reason"))
-        invalid_rows = missing_customer.unionByName(invalid_quantity)
-        valid_sales_df = sales_df.join(invalid_rows, on="Transaction_ID", how="left_anti")
-        rows_rejected = sales_df.count() - valid_sales_df.count()
-        dim_customer = spark.table("dw.Dim_Customer")
-        dim_date = spark.table("dw.Dim_Date")
-        transformed_df = (
-            valid_sales_df
-            .join(dim_customer, "Customer_ID", "inner")
-            .join(dim_date, F.to_date(valid_sales_df["Sales_Date"]) == dim_date["Date_Value"], "inner")
+        invalid_rows_df = invalid_customer_df.unionByName(invalid_quantity_df).dropDuplicates()
+
+        valid_sales_df = stg_sales_df.join(
+            invalid_rows_df.select("Transaction_ID"),
+            on="Transaction_ID",
+            how="left_anti"
+        )
+        rows_rejected = invalid_rows_df.count()
+
+        dim_customer_df = spark.table("dw.Dim_Customer")
+        dim_date_df = spark.table("dw.Dim_Date")
+
+        dim_customer_df = F.broadcast(dim_customer_df)
+        dim_date_df = F.broadcast(dim_date_df)
+
+        transformed_df = valid_sales_df \
+            .join(dim_customer_df, "Customer_ID", "inner") \
+            .join(dim_date_df, F.to_date(valid_sales_df["Sales_Date"]) == dim_date_df["Date_Value"], "inner") \
             .select(
                 valid_sales_df["Transaction_ID"],
                 valid_sales_df["Customer_ID"],
@@ -117,224 +144,222 @@ def run_sales_fact_load(spark):
                 valid_sales_df["Quantity"],
                 valid_sales_df["Unit_Price"],
                 (valid_sales_df["Quantity"] * valid_sales_df["Unit_Price"]).alias("Total_Sales_Amount"),
-                dim_date["Region_ID"],
-                dim_customer["Customer_Segment"],
-                F.lit(datetime.now()).alias("Load_Timestamp"),
+                dim_date_df["Region_ID"],
+                dim_customer_df["Customer_Segment"],
+                F.current_timestamp().alias("Load_Timestamp"),
                 F.lit(batch_id).alias("Batch_ID")
             )
-        )
+
         transformed_df.write.format("delta").mode("append").saveAsTable("dw.Fact_Sales")
         rows_inserted = transformed_df.count()
+
         spark.sql("TRUNCATE TABLE stg.Sales_Transactions")
-        if invalid_rows.count() > 0:
-            dq_failures = invalid_rows.withColumn("Logged_Timestamp", F.lit(datetime.now())) \
-                .withColumn("Batch_ID", F.lit(batch_id))
-            dq_failures.withColumnRenamed("Reason", "Failure_Reason") \
-                .write.format("delta").mode("append").saveAsTable("dw.DQ_Failures")
-        end_time = datetime.now()
-        audit_log_update = (
-            spark.table("dw.Audit_Log")
-            .filter(F.col("Batch_ID") == batch_id)
-            .withColumn("End_Time", F.lit(end_time))
-            .withColumn("Rows_Inserted", F.lit(rows_inserted))
-            .withColumn("Rows_Rejected", F.lit(rows_rejected))
-            .withColumn("Status", F.lit("COMPLETED"))
-            .withColumn("Message", F.concat(F.lit("Inserted "), F.lit(rows_inserted), F.lit(" rows; Rejected "), F.lit(rows_rejected), F.lit(" rows.")))
-        )
-        audit_log_update.write.format("delta").mode("overwrite").option("replaceWhere", f"Batch_ID = '{batch_id}'").saveAsTable("dw.Audit_Log")
-        return batch_id
+
+        dq_failures_df = invalid_rows_df \
+            .withColumn("Logged_Timestamp", F.current_timestamp()) \
+            .withColumn("Batch_ID", F.lit(batch_id))
+        dq_failures_df.write.format("delta").mode("append").saveAsTable("dw.DQ_Failures")
+
+        end_time = datetime.utcnow()
+        spark.sql(f"""
+            UPDATE dw.Audit_Log
+            SET End_Time = TIMESTAMP('{end_time}'),
+                Rows_Inserted = {rows_inserted},
+                Rows_Rejected = {rows_rejected},
+                Status = 'COMPLETED',
+                Message = 'Inserted {rows_inserted} rows; Rejected {rows_rejected} rows.'
+            WHERE Batch_ID = '{batch_id}'
+        """)
+
     except Exception as e:
-        end_time = datetime.now()
-        error_message = str(e)
-        audit_log_error = (
-            spark.table("dw.Audit_Log")
-            .filter(F.col("Batch_ID") == batch_id)
-            .withColumn("End_Time", F.lit(end_time))
-            .withColumn("Status", F.lit("FAILED"))
-            .withColumn("Message", F.lit(error_message))
-        )
-        audit_log_error.write.format("delta").mode("overwrite").option("replaceWhere", f"Batch_ID = '{batch_id}'").saveAsTable("dw.Audit_Log")
+        end_time = datetime.utcnow()
+        error_message = traceback.format_exc()
+        spark.sql(f"""
+            UPDATE dw.Audit_Log
+            SET End_Time = TIMESTAMP('{end_time}'),
+                Status = 'FAILED',
+                Message = '{error_message}'
+            WHERE Batch_ID = '{batch_id}'
+        """)
         raise
 
-# --- Helper to fetch table as pandas for assertion ---
-def fetch_table(spark, table):
-    return spark.table(table).toPandas()
+# ------------------ Fixtures ------------------
 
-# --- Test Cases ---
+@pytest.fixture(scope="module")
+def spark():
+    spark = create_spark()
+    yield spark
+    spark.stop()
+
+@pytest.fixture(autouse=True)
+def setup_teardown(spark):
+    reset_tables(spark)
+    yield
+    reset_tables(spark)
+
+# ------------------ Test Cases ------------------
 
 def test_TC01_happy_path(spark):
-    setup_tables(spark, sales_data=[
-        Row(Transaction_ID=1, Customer_ID=1, Product_ID=100, Sales_Date=datetime(2023,1,1).date(), Quantity=2, Unit_Price=10.0),
-        Row(Transaction_ID=2, Customer_ID=2, Product_ID=101, Sales_Date=datetime(2023,1,2).date(), Quantity=3, Unit_Price=20.0),
-    ])
-    batch_id = run_sales_fact_load(spark)
-    fact = fetch_table(spark, "dw.Fact_Sales")
+    # All valid data
+    data = [
+        (1001, 1, 101, "2023-01-01", 5, 10.0),
+        (1002, 2, 102, "2023-01-02", 3, 20.0)
+    ]
+    df = spark.createDataFrame(data, schema=["Transaction_ID", "Customer_ID", "Product_ID", "Sales_Date", "Quantity", "Unit_Price"])
+    df.write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
+    run_etl_script(spark)
+    fact = spark.table("dw.Fact_Sales").toPandas()
     assert len(fact) == 2
-    assert fact.Total_Sales_Amount.tolist() == [20.0, 60.0]
-    dq = fetch_table(spark, "dw.DQ_Failures")
-    assert dq.empty
-    audit = fetch_table(spark, "dw.Audit_Log")
-    row = audit[audit.Batch_ID == batch_id].iloc[0]
-    assert row.Status == "COMPLETED"
-    assert row.Rows_Inserted == 2
-    assert row.Rows_Rejected == 0
+    assert set(fact["Transaction_ID"]) == {1001, 1002}
+    audit = spark.table("dw.Audit_Log").orderBy(F.desc("Start_Time")).limit(1).toPandas().iloc[0]
+    assert audit["Rows_Inserted"] == 2
+    assert audit["Rows_Rejected"] == 0
+    dq = spark.table("dw.DQ_Failures").toPandas()
+    assert len(dq) == 0
 
 def test_TC02_null_customer_id(spark):
-    setup_tables(spark, sales_data=[
-        Row(Transaction_ID=1, Customer_ID=None, Product_ID=100, Sales_Date=datetime(2023,1,1).date(), Quantity=2, Unit_Price=10.0),
-        Row(Transaction_ID=2, Customer_ID=2, Product_ID=101, Sales_Date=datetime(2023,1,2).date(), Quantity=3, Unit_Price=20.0),
-    ])
-    batch_id = run_sales_fact_load(spark)
-    fact = fetch_table(spark, "dw.Fact_Sales")
+    # One row with NULL Customer_ID
+    data = [
+        (1001, None, 101, "2023-01-01", 5, 10.0),
+        (1002, 2, 102, "2023-01-02", 3, 20.0)
+    ]
+    df = spark.createDataFrame(data, schema=["Transaction_ID", "Customer_ID", "Product_ID", "Sales_Date", "Quantity", "Unit_Price"])
+    df.write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
+    run_etl_script(spark)
+    fact = spark.table("dw.Fact_Sales").toPandas()
     assert len(fact) == 1
-    assert fact.Customer_ID.tolist() == [2]
-    dq = fetch_table(spark, "dw.DQ_Failures")
+    assert fact["Transaction_ID"].iloc[0] == 1002
+    dq = spark.table("dw.DQ_Failures").toPandas()
     assert len(dq) == 1
-    assert dq.Failure_Reason.iloc[0] == "Missing CustomerID"
-    audit = fetch_table(spark, "dw.Audit_Log")
-    row = audit[audit.Batch_ID == batch_id].iloc[0]
-    assert row.Rows_Inserted == 1
-    assert row.Rows_Rejected == 1
+    assert dq["Transaction_ID"].iloc[0] == 1001
+    assert dq["Reason"].iloc[0] == "Missing CustomerID"
+    audit = spark.table("dw.Audit_Log").orderBy(F.desc("Start_Time")).limit(1).toPandas().iloc[0]
+    assert audit["Rows_Inserted"] == 1
+    assert audit["Rows_Rejected"] == 1
 
 def test_TC03_invalid_quantity(spark):
-    setup_tables(spark, sales_data=[
-        Row(Transaction_ID=1, Customer_ID=1, Product_ID=100, Sales_Date=datetime(2023,1,1).date(), Quantity=-1, Unit_Price=10.0),
-        Row(Transaction_ID=2, Customer_ID=2, Product_ID=101, Sales_Date=datetime(2023,1,2).date(), Quantity=3, Unit_Price=20.0),
-    ])
-    batch_id = run_sales_fact_load(spark)
-    fact = fetch_table(spark, "dw.Fact_Sales")
+    # One row with invalid quantity
+    data = [
+        (1001, 1, 101, "2023-01-01", -2, 10.0),
+        (1002, 2, 102, "2023-01-02", 3, 20.0)
+    ]
+    df = spark.createDataFrame(data, schema=["Transaction_ID", "Customer_ID", "Product_ID", "Sales_Date", "Quantity", "Unit_Price"])
+    df.write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
+    run_etl_script(spark)
+    fact = spark.table("dw.Fact_Sales").toPandas()
     assert len(fact) == 1
-    assert fact.Customer_ID.tolist() == [2]
-    dq = fetch_table(spark, "dw.DQ_Failures")
+    assert fact["Transaction_ID"].iloc[0] == 1002
+    dq = spark.table("dw.DQ_Failures").toPandas()
     assert len(dq) == 1
-    assert dq.Failure_Reason.iloc[0] == "Invalid Quantity"
-    audit = fetch_table(spark, "dw.Audit_Log")
-    row = audit[audit.Batch_ID == batch_id].iloc[0]
-    assert row.Rows_Inserted == 1
-    assert row.Rows_Rejected == 1
+    assert dq["Transaction_ID"].iloc[0] == 1001
+    assert dq["Reason"].iloc[0] == "Invalid Quantity"
+    audit = spark.table("dw.Audit_Log").orderBy(F.desc("Start_Time")).limit(1).toPandas().iloc[0]
+    assert audit["Rows_Inserted"] == 1
+    assert audit["Rows_Rejected"] == 1
 
-def test_TC04_all_invalid(spark):
-    setup_tables(spark, sales_data=[
-        Row(Transaction_ID=1, Customer_ID=None, Product_ID=100, Sales_Date=datetime(2023,1,1).date(), Quantity=0, Unit_Price=10.0),
-        Row(Transaction_ID=2, Customer_ID=None, Product_ID=101, Sales_Date=datetime(2023,1,2).date(), Quantity=-1, Unit_Price=20.0),
-    ])
-    batch_id = run_sales_fact_load(spark)
-    fact = fetch_table(spark, "dw.Fact_Sales")
-    assert fact.empty
-    dq = fetch_table(spark, "dw.DQ_Failures")
-    assert len(dq) == 2
-    audit = fetch_table(spark, "dw.Audit_Log")
-    row = audit[audit.Batch_ID == batch_id].iloc[0]
-    assert row.Rows_Inserted == 0
-    assert row.Rows_Rejected == 2
+def test_TC04_both_null_and_invalid_quantity(spark):
+    # One row with NULL Customer_ID, one with invalid quantity, one with both
+    data = [
+        (1001, None, 101, "2023-01-01", 0, 10.0),   # Both reasons
+        (1002, None, 102, "2023-01-02", 3, 20.0),   # Missing CustomerID
+        (1003, 1, 103, "2023-01-01", -1, 15.0),     # Invalid Quantity
+        (1004, 2, 104, "2023-01-02", 2, 30.0)       # Valid
+    ]
+    df = spark.createDataFrame(data, schema=["Transaction_ID", "Customer_ID", "Product_ID", "Sales_Date", "Quantity", "Unit_Price"])
+    df.write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
+    run_etl_script(spark)
+    fact = spark.table("dw.Fact_Sales").toPandas()
+    assert len(fact) == 1
+    assert fact["Transaction_ID"].iloc[0] == 1004
+    dq = spark.table("dw.DQ_Failures").toPandas()
+    assert set(dq["Transaction_ID"]) == {1001, 1002, 1003}
+    assert set(dq["Reason"]) >= {"Missing CustomerID", "Invalid Quantity"}
+    audit = spark.table("dw.Audit_Log").orderBy(F.desc("Start_Time")).limit(1).toPandas().iloc[0]
+    assert audit["Rows_Inserted"] == 1
+    assert audit["Rows_Rejected"] == 3
 
 def test_TC05_empty_staging(spark):
-    setup_tables(spark, sales_data=[])
-    batch_id = run_sales_fact_load(spark)
-    fact = fetch_table(spark, "dw.Fact_Sales")
-    assert fact.empty
-    dq = fetch_table(spark, "dw.DQ_Failures")
-    assert dq.empty
-    audit = fetch_table(spark, "dw.Audit_Log")
-    row = audit[audit.Batch_ID == batch_id].iloc[0]
-    assert row.Rows_Inserted == 0
-    assert row.Rows_Rejected == 0
+    # No data in staging
+    run_etl_script(spark)
+    fact = spark.table("dw.Fact_Sales").toPandas()
+    assert len(fact) == 0
+    dq = spark.table("dw.DQ_Failures").toPandas()
+    assert len(dq) == 0
+    audit = spark.table("dw.Audit_Log").orderBy(F.desc("Start_Time")).limit(1).toPandas().iloc[0]
+    assert audit["Rows_Inserted"] == 0
+    assert audit["Rows_Rejected"] == 0
 
-def test_TC06_sales_date_not_in_dim_date(spark):
-    setup_tables(spark, sales_data=[
-        Row(Transaction_ID=1, Customer_ID=1, Product_ID=100, Sales_Date=datetime(2023,2,1).date(), Quantity=2, Unit_Price=10.0),
-        Row(Transaction_ID=2, Customer_ID=2, Product_ID=101, Sales_Date=datetime(2023,1,2).date(), Quantity=3, Unit_Price=20.0),
-    ])
-    batch_id = run_sales_fact_load(spark)
-    fact = fetch_table(spark, "dw.Fact_Sales")
-    # Only the second record matches dim_date
-    assert len(fact) == 1
-    assert fact.Sales_Date.iloc[0] == pd.Timestamp(datetime(2023,1,2).date())
-    audit = fetch_table(spark, "dw.Audit_Log")
-    row = audit[audit.Batch_ID == batch_id].iloc[0]
-    assert row.Rows_Inserted == 1
-
-def test_TC07_customer_id_not_in_dim_customer(spark):
-    setup_tables(spark, sales_data=[
-        Row(Transaction_ID=1, Customer_ID=99, Product_ID=100, Sales_Date=datetime(2023,1,1).date(), Quantity=2, Unit_Price=10.0),
-        Row(Transaction_ID=2, Customer_ID=2, Product_ID=101, Sales_Date=datetime(2023,1,2).date(), Quantity=3, Unit_Price=20.0),
-    ])
-    batch_id = run_sales_fact_load(spark)
-    fact = fetch_table(spark, "dw.Fact_Sales")
-    assert len(fact) == 1
-    assert fact.Customer_ID.iloc[0] == 2
-    audit = fetch_table(spark, "dw.Audit_Log")
-    row = audit[audit.Batch_ID == batch_id].iloc[0]
-    assert row.Rows_Inserted == 1
-
-def test_TC08_missing_column(spark):
-    # Omit 'Quantity' column
-    sales_data = [
-        Row(Transaction_ID=1, Customer_ID=1, Product_ID=100, Sales_Date=datetime(2023,1,1).date(), Unit_Price=10.0),
+def test_TC06_missing_dimension_references(spark):
+    # Row with non-matching Customer_ID and Date
+    data = [
+        (1001, 99, 101, "2023-01-01", 5, 10.0),    # Customer_ID not in dim
+        (1002, 1, 102, "2023-01-31", 3, 20.0),     # Date not in dim
+        (1003, 1, 103, "2023-01-01", 2, 15.0)      # Valid
     ]
-    # Create table with missing column
-    schema = "Transaction_ID BIGINT, Customer_ID INT, Product_ID INT, Sales_Date DATE, Unit_Price DOUBLE"
-    spark.createDataFrame(sales_data, schema=schema).write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
-    setup_tables(spark)  # Setup dims and clear other tables
-    with pytest.raises(Exception):
-        run_sales_fact_load(spark)
-    audit = fetch_table(spark, "dw.Audit_Log")
-    assert (audit.Status == "FAILED").any()
+    df = spark.createDataFrame(data, schema=["Transaction_ID", "Customer_ID", "Product_ID", "Sales_Date", "Quantity", "Unit_Price"])
+    df.write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
+    run_etl_script(spark)
+    fact = spark.table("dw.Fact_Sales").toPandas()
+    assert len(fact) == 1
+    assert fact["Transaction_ID"].iloc[0] == 1003
+    audit = spark.table("dw.Audit_Log").orderBy(F.desc("Start_Time")).limit(1).toPandas().iloc[0]
+    assert audit["Rows_Inserted"] == 1
 
-def test_TC09_invalid_data_type(spark):
+def test_TC07_missing_required_columns(spark):
+    # Staging table missing 'Quantity' column
+    data = [
+        (1001, 1, 101, "2023-01-01", 10.0)
+    ]
+    df = spark.createDataFrame(data, schema=["Transaction_ID", "Customer_ID", "Product_ID", "Sales_Date", "Unit_Price"])
+    df.write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
+    with pytest.raises(Exception):
+        run_etl_script(spark)
+    audit = spark.table("dw.Audit_Log").orderBy(F.desc("Start_Time")).limit(1).toPandas().iloc[0]
+    assert audit["Status"] == "FAILED"
+    assert "Quantity" in audit["Message"]
+
+def test_TC08_unexpected_data_types(spark):
     # Quantity as string
-    sales_data = [
-        Row(Transaction_ID=1, Customer_ID=1, Product_ID=100, Sales_Date=datetime(2023,1,1).date(), Quantity="bad", Unit_Price=10.0),
+    data = [
+        (1001, 1, 101, "2023-01-01", "five", 10.0)
     ]
-    schema = "Transaction_ID BIGINT, Customer_ID INT, Product_ID INT, Sales_Date DATE, Quantity STRING, Unit_Price DOUBLE"
-    spark.createDataFrame(sales_data, schema=schema).write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
-    setup_tables(spark)  # Setup dims and clear other tables
+    df = spark.createDataFrame(data, schema=["Transaction_ID", "Customer_ID", "Product_ID", "Sales_Date", "Quantity", "Unit_Price"])
+    df.write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
     with pytest.raises(Exception):
-        run_sales_fact_load(spark)
-    audit = fetch_table(spark, "dw.Audit_Log")
-    assert (audit.Status == "FAILED").any()
+        run_etl_script(spark)
+    audit = spark.table("dw.Audit_Log").orderBy(F.desc("Start_Time")).limit(1).toPandas().iloc[0]
+    assert audit["Status"] == "FAILED"
+    assert "Quantity" in audit["Message"] or "five" in audit["Message"]
 
-def test_TC10_multiple_dq_failures(spark):
-    setup_tables(spark, sales_data=[
-        Row(Transaction_ID=1, Customer_ID=None, Product_ID=100, Sales_Date=datetime(2023,1,1).date(), Quantity=0, Unit_Price=10.0),
-        Row(Transaction_ID=2, Customer_ID=None, Product_ID=101, Sales_Date=datetime(2023,1,2).date(), Quantity=3, Unit_Price=20.0),
-    ])
-    batch_id = run_sales_fact_load(spark)
-    dq = fetch_table(spark, "dw.DQ_Failures")
-    # First record should appear twice (once for each failure reason)
-    assert set(dq.Transaction_ID) == {1,2}
-    assert "Missing CustomerID" in dq.Failure_Reason.values
-    assert "Invalid Quantity" in dq.Failure_Reason.values
+def test_TC09_duplicate_transaction_id(spark):
+    # Duplicate Transaction_IDs
+    data = [
+        (1001, 1, 101, "2023-01-01", 5, 10.0),
+        (1001, 1, 101, "2023-01-01", 3, 10.0)
+    ]
+    df = spark.createDataFrame(data, schema=["Transaction_ID", "Customer_ID", "Product_ID", "Sales_Date", "Quantity", "Unit_Price"])
+    df.write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
+    run_etl_script(spark)
+    fact = spark.table("dw.Fact_Sales").toPandas()
+    assert len(fact) == 2
+    assert all(fact["Transaction_ID"] == 1001)
+    audit = spark.table("dw.Audit_Log").orderBy(F.desc("Start_Time")).limit(1).toPandas().iloc[0]
+    assert audit["Rows_Inserted"] == 2
 
-def test_TC11_audit_log_and_dq_failures_empty_before_run(spark):
-    # Clean tables
-    for tbl in ["dw.Audit_Log", "dw.DQ_Failures"]:
-        spark.sql(f"DROP TABLE IF EXISTS {tbl}")
-        schema = "Batch_ID STRING, Procedure_Name STRING, Start_Time TIMESTAMP, Status STRING, Message STRING, End_Time TIMESTAMP, Rows_Inserted INT, Rows_Rejected INT, Error_Message STRING" if tbl == "dw.Audit_Log" else "Transaction_ID BIGINT, Failure_Reason STRING, Logged_Timestamp TIMESTAMP, Batch_ID STRING"
-        spark.createDataFrame([], schema).write.format("delta").mode("overwrite").saveAsTable(tbl)
-    setup_tables(spark, sales_data=[
-        Row(Transaction_ID=1, Customer_ID=1, Product_ID=100, Sales_Date=datetime(2023,1,1).date(), Quantity=2, Unit_Price=10.0),
-    ])
-    batch_id = run_sales_fact_load(spark)
-    audit = fetch_table(spark, "dw.Audit_Log")
-    dq = fetch_table(spark, "dw.DQ_Failures")
-    assert not audit.empty
-    assert (audit.Batch_ID == batch_id).any()
-    assert dq.empty
-
-def test_TC12_large_batch(spark):
-    sales_data = [Row(Transaction_ID=i, Customer_ID=1, Product_ID=100, Sales_Date=datetime(2023,1,1).date(), Quantity=1, Unit_Price=10.0) for i in range(1, 10001)]
-    setup_tables(spark, sales_data=sales_data)
-    batch_id = run_sales_fact_load(spark)
-    fact = fetch_table(spark, "dw.Fact_Sales")
+def test_TC10_large_batch(spark):
+    # Large volume test
+    data = [(i, 1, 101, "2023-01-01", 1, 10.0) for i in range(10000)]
+    df = spark.createDataFrame(data, schema=["Transaction_ID", "Customer_ID", "Product_ID", "Sales_Date", "Quantity", "Unit_Price"])
+    df.write.format("delta").mode("overwrite").saveAsTable("stg.Sales_Transactions")
+    run_etl_script(spark)
+    fact = spark.table("dw.Fact_Sales").toPandas()
     assert len(fact) == 10000
-    audit = fetch_table(spark, "dw.Audit_Log")
-    row = audit[audit.Batch_ID == batch_id].iloc[0]
-    assert row.Rows_Inserted == 10000
-    assert row.Rows_Rejected == 0
+    audit = spark.table("dw.Audit_Log").orderBy(F.desc("Start_Time")).limit(1).toPandas().iloc[0]
+    assert audit["Rows_Inserted"] == 10000
+    assert audit["Rows_Rejected"] == 0
 
 
 ---
 
-**API Cost Consumption:**  
+**API Cost Consumed in dollars:**  
 apiCost: 0.0047 USD
