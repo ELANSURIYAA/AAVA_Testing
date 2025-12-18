@@ -1,0 +1,1 @@
+Outputs for workflow: DI Teradata To Snowflake Conversion
