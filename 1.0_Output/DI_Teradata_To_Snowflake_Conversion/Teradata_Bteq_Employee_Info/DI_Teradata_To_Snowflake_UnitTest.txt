@@ -4,328 +4,239 @@ Author:        Ascendion AVA+
 
 Created on:   
 
-Description:   Conversion of Teradata employee backup and insert logic to Snowflake SQL
+Description:   Pytest script for validating Snowflake SQL logic for employee backup table creation, data insertion via join, and sample data selection.
 
 =============================================
 
-**Test Case List:**  
-| Test Case ID | Description                              | Input Data Description                          | Expected Outcome                          |
-|--------------|------------------------------------------|-------------------------------------------------|-------------------------------------------|
-| TC001        | Happy path: correct join and insert      | Employee and Salary with matching EmployeeNo     | employee_bkup populated correctly         |
-| TC002        | Employee with no matching Salary         | Employee row, no Salary row                     | employee_bkup empty                       |
-| TC003        | Salary with no matching Employee         | Salary row, no Employee row                     | employee_bkup empty                       |
-| TC004        | NULL values in Salary.NetPay             | Salary.NetPay is NULL                           | employee_bkup row with NetPay NULL        |
-| TC005        | NULLs in Employee fields                 | Employee fields are NULL                        | employee_bkup row with NULLs              |
-| TC006        | Empty Employee and Salary tables         | Both tables empty                               | employee_bkup empty                       |
-| TC007        | Boundary EmployeeNo values               | EmployeeNo = 0 and max int                      | employee_bkup rows for both               |
-| TC008        | Invalid data types in Salary.NetPay      | NetPay as string                                | Error on insertion                        |
-| TC009        | Unexpected format in Employee table      | Employee table has extra columns                | employee_bkup populated correctly         |
-| TC010        | Time travel restore                      | Drop and undrop employee_bkup                   | employee_bkup restored                    |
-| TC011        | Semi-structured data in Employee         | Employee.Info VARIANT column                    | employee_bkup join works                  |
-| TC012        | Large dataset performance                | 1000 Employee/Salary rows                       | employee_bkup populated, <10s             |
+**Test Case List:**
 
-**Pytest Script:**  
+| Test Case ID | Description                                   | Input Data Description                                                      | Expected Outcome                                   |
+|--------------|-----------------------------------------------|-----------------------------------------------------------------------------|----------------------------------------------------|
+| TC001        | Validate employee_bkup table creation         | No input data; check schema after creation                                  | Table exists with correct schema                   |
+| TC002        | Insert with matching EmployeeNo (happy path)  | Employee and Salary tables with matching EmployeeNo                         | Correct rows inserted into employee_bkup           |
+| TC003        | Insert with no matching EmployeeNo            | Employee and Salary tables with no matching EmployeeNo                      | employee_bkup remains empty                        |
+| TC004        | Insert with NULL values in join columns       | Employee or Salary table contains NULL in EmployeeNo                        | Rows with NULL EmployeeNo are excluded             |
+| TC005        | Insert with NULL in non-key columns           | Employee and Salary tables with NULLs in non-key columns                    | NULLs are inserted as-is in employee_bkup          |
+| TC006        | Select from EmployeeSample with data          | EmployeeSample table with sample records                                    | All records returned as expected                   |
+| TC007        | Select from EmployeeSample with empty table   | EmployeeSample table is empty                                               | No records returned                                |
+| TC008        | Error handling: insert with unexpected types  | Employee or Salary table contains unexpected data types (e.g., string in NetPay) | Error raised or handled gracefully                 |
+
+**Pytest Script:**
 
 import pytest
-import snowflake.connector
+from snowflake.connector import connect
 
-def get_sf_connection():
-    return snowflake.connector.connect(
-        user='YOUR_USER',
-        password='YOUR_PASSWORD',
-        account='YOUR_ACCOUNT',
-        warehouse='YOUR_WAREHOUSE',
-        database='YOUR_DATABASE',
-        schema='PUBLIC'
+# Replace with your Snowflake credentials
+SNOWFLAKE_USER = 'YOUR_USER'
+SNOWFLAKE_PASSWORD = 'YOUR_PASSWORD'
+SNOWFLAKE_ACCOUNT = 'YOUR_ACCOUNT'
+SNOWFLAKE_DATABASE = 'YOUR_DATABASE'
+SNOWFLAKE_SCHEMA = 'PUBLIC'
+
+@pytest.fixture(scope="module")
+def snowflake_connection():
+    conn = connect(
+        user=SNOWFLAKE_USER,
+        password=SNOWFLAKE_PASSWORD,
+        account=SNOWFLAKE_ACCOUNT,
+        database=SNOWFLAKE_DATABASE,
+        schema=SNOWFLAKE_SCHEMA
     )
-
-def execute_sql(conn, sql):
-    cur = conn.cursor()
-    try:
-        cur.execute(sql)
-        return cur
-    finally:
-        cur.close()
-
-def fetch_all(conn, sql):
-    cur = conn.cursor()
-    try:
-        cur.execute(sql)
-        columns = [col[0] for col in cur.description]
-        return [dict(zip(columns, row)) for row in cur.fetchall()]
-    finally:
-        cur.close()
-
-def cleanup_tables(conn, tables):
-    for table in tables:
-        execute_sql(conn, f"DROP TABLE IF EXISTS {table}")
-
-def setup_employee_salary(conn, employee_rows, salary_rows):
-    cleanup_tables(conn, ['Employee', 'Salary', 'employee_bkup'])
-    execute_sql(conn, """
-        CREATE TABLE Employee (
-            EmployeeNo INT,
-            FirstName STRING,
-            LastName STRING,
-            DepartmentNo INT
-        )
-    """)
-    execute_sql(conn, """
-        CREATE TABLE Salary (
-            EmployeeNo INT,
-            NetPay FLOAT
-        )
-    """)
-    for row in employee_rows:
-        execute_sql(conn, f"""
-            INSERT INTO Employee (EmployeeNo, FirstName, LastName, DepartmentNo)
-            VALUES ({row['EmployeeNo']}, '{row['FirstName']}', '{row['LastName']}', {row['DepartmentNo']})
-        """)
-    for row in salary_rows:
-        execute_sql(conn, f"""
-            INSERT INTO Salary (EmployeeNo, NetPay)
-            VALUES ({row['EmployeeNo']}, {row['NetPay'] if row['NetPay'] is not None else 'NULL'})
-        """)
-
-def run_employee_bkup_sql(conn):
-    execute_sql(conn, "DROP TABLE IF EXISTS employee_bkup")
-    execute_sql(conn, """
-        CREATE TABLE employee_bkup (
-            EmployeeNo INT,
-            FirstName STRING,
-            LastName STRING,
-            DepartmentNo INT,
-            NetPay FLOAT
-        )
-    """)
-    execute_sql(conn, """
-        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
-        SELECT e.EmployeeNo, e.FirstName, e.LastName, e.DepartmentNo, s.NetPay
-        FROM Employee e
-        INNER JOIN Salary s ON e.EmployeeNo = s.EmployeeNo
-    """)
-
-def get_employee_bkup(conn):
-    return fetch_all(conn, "SELECT * FROM employee_bkup ORDER BY EmployeeNo")
-
-@pytest.fixture(scope='module')
-def sf_conn():
-    conn = get_sf_connection()
     yield conn
-    cleanup_tables(conn, ['Employee', 'Salary', 'employee_bkup'])
     conn.close()
 
-class TestEmployeeBkupSQL:
-    def test_happy_path(self, sf_conn):
-        employees = [
-            {'EmployeeNo': 1, 'FirstName': 'Alice', 'LastName': 'Smith', 'DepartmentNo': 10},
-            {'EmployeeNo': 2, 'FirstName': 'Bob', 'LastName': 'Jones', 'DepartmentNo': 20}
-        ]
-        salaries = [
-            {'EmployeeNo': 1, 'NetPay': 5000.0},
-            {'EmployeeNo': 2, 'NetPay': 6000.0}
-        ]
-        setup_employee_salary(sf_conn, employees, salaries)
-        run_employee_bkup_sql(sf_conn)
-        results = get_employee_bkup(sf_conn)
-        assert len(results) == 2
-        assert results[0]['EmployeeNo'] == 1
-        assert results[0]['NetPay'] == 5000.0
-        assert results[1]['EmployeeNo'] == 2
-        assert results[1]['NetPay'] == 6000.0
+@pytest.fixture(autouse=True)
+def cleanup_tables(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    # Clean up before each test
+    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
+    cursor.execute("DROP TABLE IF EXISTS Employee;")
+    cursor.execute("DROP TABLE IF EXISTS Salary;")
+    cursor.execute("DROP TABLE IF EXISTS EmployeeSample;")
+    yield
+    # Clean up after each test
+    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
+    cursor.execute("DROP TABLE IF EXISTS Employee;")
+    cursor.execute("DROP TABLE IF EXISTS Salary;")
+    cursor.execute("DROP TABLE IF EXISTS EmployeeSample;")
+    cursor.close()
 
-    def test_employee_no_salary(self, sf_conn):
-        employees = [{'EmployeeNo': 1, 'FirstName': 'Alice', 'LastName': 'Smith', 'DepartmentNo': 10}]
-        salaries = []
-        setup_employee_salary(sf_conn, employees, salaries)
-        run_employee_bkup_sql(sf_conn)
-        results = get_employee_bkup(sf_conn)
-        assert results == []
+def test_table_creation(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    cursor.execute("""
+        CREATE TABLE employee_bkup (
+            EmployeeNo INTEGER,
+            FirstName CHAR(30),
+            LastName CHAR(30),
+            DepartmentNo SMALLINT,
+            NetPay INTEGER
+        );
+    """)
+    cursor.execute("SHOW TABLES LIKE 'employee_bkup';")
+    result = cursor.fetchone()
+    assert result is not None, "employee_bkup table was not created"
+    cursor.close()
 
-    def test_salary_no_employee(self, sf_conn):
-        employees = []
-        salaries = [{'EmployeeNo': 1, 'NetPay': 5000.0}]
-        setup_employee_salary(sf_conn, employees, salaries)
-        run_employee_bkup_sql(sf_conn)
-        results = get_employee_bkup(sf_conn)
-        assert results == []
+def test_insert_happy_path(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    cursor.execute("""
+        CREATE TABLE Employee (EmployeeNo INTEGER, FirstName CHAR(30), LastName CHAR(30), DepartmentNo SMALLINT);
+        CREATE TABLE Salary (EmployeeNo INTEGER, NetPay INTEGER);
+        CREATE TABLE employee_bkup (
+            EmployeeNo INTEGER,
+            FirstName CHAR(30),
+            LastName CHAR(30),
+            DepartmentNo SMALLINT,
+            NetPay INTEGER
+        );
+    """)
+    cursor.execute("""
+        INSERT INTO Employee VALUES (1, 'John', 'Doe', 10), (2, 'Jane', 'Smith', 20);
+        INSERT INTO Salary VALUES (1, 5000), (2, 6000);
+    """)
+    cursor.execute("""
+        INSERT INTO employee_bkup
+        SELECT a.EmployeeNo, a.FirstName, a.LastName, a.DepartmentNo, b.NetPay
+        FROM Employee a INNER JOIN Salary b ON a.EmployeeNo = b.EmployeeNo;
+    """)
+    cursor.execute("SELECT * FROM employee_bkup ORDER BY EmployeeNo;")
+    results = cursor.fetchall()
+    assert results == [
+        (1, 'John', 'Doe', 10, 5000),
+        (2, 'Jane', 'Smith', 20, 6000)
+    ], f"Inserted data mismatch: {results}"
+    cursor.close()
 
-    def test_null_netpay(self, sf_conn):
-        employees = [{'EmployeeNo': 1, 'FirstName': 'Alice', 'LastName': 'Smith', 'DepartmentNo': 10}]
-        salaries = [{'EmployeeNo': 1, 'NetPay': None}]
-        setup_employee_salary(sf_conn, employees, salaries)
-        run_employee_bkup_sql(sf_conn)
-        results = get_employee_bkup(sf_conn)
-        assert len(results) == 1
-        assert results[0]['NetPay'] is None
+def test_insert_no_matching_keys(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    cursor.execute("""
+        CREATE TABLE Employee (EmployeeNo INTEGER, FirstName CHAR(30), LastName CHAR(30), DepartmentNo SMALLINT);
+        CREATE TABLE Salary (EmployeeNo INTEGER, NetPay INTEGER);
+        CREATE TABLE employee_bkup (
+            EmployeeNo INTEGER,
+            FirstName CHAR(30),
+            LastName CHAR(30),
+            DepartmentNo SMALLINT,
+            NetPay INTEGER
+        );
+    """)
+    cursor.execute("""
+        INSERT INTO Employee VALUES (1, 'John', 'Doe', 10);
+        INSERT INTO Salary VALUES (2, 6000);
+    """)
+    cursor.execute("""
+        INSERT INTO employee_bkup
+        SELECT a.EmployeeNo, a.FirstName, a.LastName, a.DepartmentNo, b.NetPay
+        FROM Employee a INNER JOIN Salary b ON a.EmployeeNo = b.EmployeeNo;
+    """)
+    cursor.execute("SELECT * FROM employee_bkup;")
+    results = cursor.fetchall()
+    assert results == [], "employee_bkup should be empty when no matching keys"
+    cursor.close()
 
-    def test_null_employee_fields(self, sf_conn):
-        employees = [{'EmployeeNo': 1, 'FirstName': None, 'LastName': None, 'DepartmentNo': None}]
-        salaries = [{'EmployeeNo': 1, 'NetPay': 5000.0}]
-        setup_employee_salary(sf_conn, employees, salaries)
-        run_employee_bkup_sql(sf_conn)
-        results = get_employee_bkup(sf_conn)
-        assert len(results) == 1
-        assert results[0]['FirstName'] is None
-        assert results[0]['LastName'] is None
-        assert results[0]['DepartmentNo'] is None
+def test_insert_null_in_join_column(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    cursor.execute("""
+        CREATE TABLE Employee (EmployeeNo INTEGER, FirstName CHAR(30), LastName CHAR(30), DepartmentNo SMALLINT);
+        CREATE TABLE Salary (EmployeeNo INTEGER, NetPay INTEGER);
+        CREATE TABLE employee_bkup (
+            EmployeeNo INTEGER,
+            FirstName CHAR(30),
+            LastName CHAR(30),
+            DepartmentNo SMALLINT,
+            NetPay INTEGER
+        );
+    """)
+    cursor.execute("""
+        INSERT INTO Employee VALUES (NULL, 'Null', 'Person', 30), (1, 'John', 'Doe', 10);
+        INSERT INTO Salary VALUES (NULL, 7000), (1, 5000);
+    """)
+    cursor.execute("""
+        INSERT INTO employee_bkup
+        SELECT a.EmployeeNo, a.FirstName, a.LastName, a.DepartmentNo, b.NetPay
+        FROM Employee a INNER JOIN Salary b ON a.EmployeeNo = b.EmployeeNo;
+    """)
+    cursor.execute("SELECT * FROM employee_bkup ORDER BY EmployeeNo;")
+    results = cursor.fetchall()
+    assert results == [(1, 'John', 'Doe', 10, 5000)], f"Rows with NULL join keys should be excluded: {results}"
+    cursor.close()
 
-    def test_empty_tables(self, sf_conn):
-        employees = []
-        salaries = []
-        setup_employee_salary(sf_conn, employees, salaries)
-        run_employee_bkup_sql(sf_conn)
-        results = get_employee_bkup(sf_conn)
-        assert results == []
+def test_insert_null_in_non_key_columns(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    cursor.execute("""
+        CREATE TABLE Employee (EmployeeNo INTEGER, FirstName CHAR(30), LastName CHAR(30), DepartmentNo SMALLINT);
+        CREATE TABLE Salary (EmployeeNo INTEGER, NetPay INTEGER);
+        CREATE TABLE employee_bkup (
+            EmployeeNo INTEGER,
+            FirstName CHAR(30),
+            LastName CHAR(30),
+            DepartmentNo SMALLINT,
+            NetPay INTEGER
+        );
+    """)
+    cursor.execute("""
+        INSERT INTO Employee VALUES (1, NULL, 'Doe', 10);
+        INSERT INTO Salary VALUES (1, NULL);
+    """)
+    cursor.execute("""
+        INSERT INTO employee_bkup
+        SELECT a.EmployeeNo, a.FirstName, a.LastName, a.DepartmentNo, b.NetPay
+        FROM Employee a INNER JOIN Salary b ON a.EmployeeNo = b.EmployeeNo;
+    """)
+    cursor.execute("SELECT * FROM employee_bkup;")
+    results = cursor.fetchall()
+    assert results == [(1, None, 'Doe', 10, None)], f"NULLs in non-key columns should be inserted: {results}"
+    cursor.close()
 
-    def test_boundary_employee_no(self, sf_conn):
-        employees = [
-            {'EmployeeNo': 0, 'FirstName': 'Zero', 'LastName': 'Test', 'DepartmentNo': 1},
-            {'EmployeeNo': 2147483647, 'FirstName': 'Max', 'LastName': 'Int', 'DepartmentNo': 2}
-        ]
-        salaries = [
-            {'EmployeeNo': 0, 'NetPay': 100.0},
-            {'EmployeeNo': 2147483647, 'NetPay': 99999.99}
-        ]
-        setup_employee_salary(sf_conn, employees, salaries)
-        run_employee_bkup_sql(sf_conn)
-        results = get_employee_bkup(sf_conn)
-        assert len(results) == 2
-        assert results[0]['EmployeeNo'] == 0
-        assert results[1]['EmployeeNo'] == 2147483647
+def test_select_from_employee_sample_with_data(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    cursor.execute("""
+        CREATE TABLE EmployeeSample (EmployeeNo INTEGER, FirstName CHAR(30), LastName CHAR(30));
+        INSERT INTO EmployeeSample VALUES (1, 'John', 'Doe'), (2, 'Jane', 'Smith');
+    """)
+    cursor.execute("SELECT * FROM EmployeeSample ORDER BY EmployeeNo;")
+    results = cursor.fetchall()
+    assert results == [(1, 'John', 'Doe'), (2, 'Jane', 'Smith')], f"EmployeeSample select failed: {results}"
+    cursor.close()
 
-    def test_invalid_netpay_type(self, sf_conn):
-        employees = [{'EmployeeNo': 1, 'FirstName': 'Alice', 'LastName': 'Smith', 'DepartmentNo': 10}]
-        cleanup_tables(sf_conn, ['Employee', 'Salary', 'employee_bkup'])
-        execute_sql(sf_conn, """
-            CREATE TABLE Employee (
-                EmployeeNo INT,
-                FirstName STRING,
-                LastName STRING,
-                DepartmentNo INT
-            )
+def test_select_from_employee_sample_empty(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    cursor.execute("CREATE TABLE EmployeeSample (EmployeeNo INTEGER, FirstName CHAR(30), LastName CHAR(30));")
+    cursor.execute("SELECT * FROM EmployeeSample;")
+    results = cursor.fetchall()
+    assert results == [], "EmployeeSample should be empty"
+    cursor.close()
+
+def test_insert_with_unexpected_types(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    cursor.execute("""
+        CREATE TABLE Employee (EmployeeNo INTEGER, FirstName CHAR(30), LastName CHAR(30), DepartmentNo SMALLINT);
+        CREATE TABLE Salary (EmployeeNo INTEGER, NetPay INTEGER);
+        CREATE TABLE employee_bkup (
+            EmployeeNo INTEGER,
+            FirstName CHAR(30),
+            LastName CHAR(30),
+            DepartmentNo SMALLINT,
+            NetPay INTEGER
+        );
+    """)
+    # Insert string into NetPay (should error)
+    cursor.execute("INSERT INTO Employee VALUES (1, 'John', 'Doe', 10);")
+    try:
+        cursor.execute("INSERT INTO Salary VALUES (1, 'FiveThousand');")
+        cursor.execute("""
+            INSERT INTO employee_bkup
+            SELECT a.EmployeeNo, a.FirstName, a.LastName, a.DepartmentNo, b.NetPay
+            FROM Employee a INNER JOIN Salary b ON a.EmployeeNo = b.EmployeeNo;
         """)
-        execute_sql(sf_conn, """
-            CREATE TABLE Salary (
-                EmployeeNo INT,
-                NetPay STRING
-            )
-        """)
-        execute_sql(sf_conn, """
-            INSERT INTO Employee VALUES (1, 'Alice', 'Smith', 10)
-        """)
-        execute_sql(sf_conn, """
-            INSERT INTO Salary VALUES (1, 'NotANumber')
-        """)
-        execute_sql(sf_conn, "DROP TABLE IF EXISTS employee_bkup")
-        execute_sql(sf_conn, """
-            CREATE TABLE employee_bkup (
-                EmployeeNo INT,
-                FirstName STRING,
-                LastName STRING,
-                DepartmentNo INT,
-                NetPay FLOAT
-            )
-        """)
-        with pytest.raises(snowflake.connector.errors.ProgrammingError):
-            execute_sql(sf_conn, """
-                INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
-                SELECT e.EmployeeNo, e.FirstName, e.LastName, e.DepartmentNo, s.NetPay
-                FROM Employee e
-                INNER JOIN Salary s ON e.EmployeeNo = s.EmployeeNo
-            """)
-
-    def test_unexpected_employee_format(self, sf_conn):
-        employees = [{'EmployeeNo': 1, 'FirstName': 'Alice', 'LastName': 'Smith', 'DepartmentNo': 10}]
-        cleanup_tables(sf_conn, ['Employee', 'Salary', 'employee_bkup'])
-        execute_sql(sf_conn, """
-            CREATE TABLE Employee (
-                EmployeeNo INT,
-                FirstName STRING,
-                LastName STRING,
-                DepartmentNo INT,
-                ExtraCol STRING
-            )
-        """)
-        execute_sql(sf_conn, """
-            CREATE TABLE Salary (
-                EmployeeNo INT,
-                NetPay FLOAT
-            )
-        """)
-        execute_sql(sf_conn, """
-            INSERT INTO Employee VALUES (1, 'Alice', 'Smith', 10, 'Extra')
-        """)
-        execute_sql(sf_conn, """
-            INSERT INTO Salary VALUES (1, 5000.0)
-        """)
-        run_employee_bkup_sql(sf_conn)
-        results = get_employee_bkup(sf_conn)
-        assert len(results) == 1
-        assert results[0]['EmployeeNo'] == 1
-        assert results[0]['NetPay'] == 5000.0
-
-    def test_time_travel_restore(self, sf_conn):
-        employees = [{'EmployeeNo': 1, 'FirstName': 'Alice', 'LastName': 'Smith', 'DepartmentNo': 10}]
-        salaries = [{'EmployeeNo': 1, 'NetPay': 5000.0}]
-        setup_employee_salary(sf_conn, employees, salaries)
-        run_employee_bkup_sql(sf_conn)
-        execute_sql(sf_conn, "DROP TABLE employee_bkup")
-        execute_sql(sf_conn, "UNDROP TABLE employee_bkup")
-        results = get_employee_bkup(sf_conn)
-        assert len(results) == 1
-        assert results[0]['EmployeeNo'] == 1
-
-    def test_semi_structured_employee(self, sf_conn):
-        cleanup_tables(sf_conn, ['Employee', 'Salary', 'employee_bkup'])
-        execute_sql(sf_conn, """
-            CREATE TABLE Employee (
-                EmployeeNo INT,
-                FirstName STRING,
-                LastName STRING,
-                DepartmentNo INT,
-                Info VARIANT
-            )
-        """)
-        execute_sql(sf_conn, """
-            CREATE TABLE Salary (
-                EmployeeNo INT,
-                NetPay FLOAT
-            )
-        """)
-        execute_sql(sf_conn, """
-            INSERT INTO Employee VALUES (1, 'Alice', 'Smith', 10, PARSE_JSON('{"hobby": "skiing"}'))
-        """)
-        execute_sql(sf_conn, """
-            INSERT INTO Salary VALUES (1, 5000.0)
-        """)
-        run_employee_bkup_sql(sf_conn)
-        results = get_employee_bkup(sf_conn)
-        assert len(results) == 1
-        assert results[0]['EmployeeNo'] == 1
-        assert results[0]['NetPay'] == 5000.0
-
-    def test_large_dataset_performance(self, sf_conn):
-        employees = [
-            {'EmployeeNo': i, 'FirstName': f'Name{i}', 'LastName': f'Last{i}', 'DepartmentNo': i % 5}
-            for i in range(1, 1001)
-        ]
-        salaries = [
-            {'EmployeeNo': i, 'NetPay': float(i * 100)}
-            for i in range(1, 1001)
-        ]
-        setup_employee_salary(sf_conn, employees, salaries)
-        import time
-        start = time.time()
-        run_employee_bkup_sql(sf_conn)
-        duration = time.time() - start
-        results = get_employee_bkup(sf_conn)
-        assert len(results) == 1000
-        assert duration < 10
-
-# To run: pytest <this_file.py>
-# Ensure snowflake-connector-python is installed and credentials are configured.
+        cursor.execute("SELECT * FROM employee_bkup;")
+        results = cursor.fetchall()
+        # If it gets here, Snowflake allowed the string, which is unexpected
+        assert False, "Unexpected data type should raise error"
+    except Exception as e:
+        assert "Numeric value" in str(e) or "conversion" in str(e), f"Unexpected error: {e}"
+    cursor.close()
 
 
-**Cost Analysis:**  
-API Cost Consumed: $0.05
+**Cost Analysis:**
+API Cost: $0.05
