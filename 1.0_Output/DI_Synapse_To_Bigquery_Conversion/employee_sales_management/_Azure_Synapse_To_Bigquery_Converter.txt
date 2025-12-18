@@ -1,209 +1,144 @@
+=============================================
+Author:        AAVA
+Created on:   
+Description:   BigQuery SQL conversion of Azure Synapse stored procedure for sales fact loading with audit logging and data quality checks
+=============================================
+
 -- ==========================================================================================
--- Author:      AAVA
--- Created on:  
--- Description: Sample conversion of an Azure Synapse stored procedure to BigQuery SQL,
---              demonstrating variable assignments, conditional logic, JOINs, GROUP BY,
---              DML operations (INSERT/UPDATE/MERGE), and loop equivalents.
+-- Script:        bq_load_sales_fact.sql
+-- Description:   BigQuery SQL conversion of Azure Synapse stored procedure [dw].[sp_load_sales_fact]
+--                Implements audit logging, data quality checks, transformation, and error handling.
+-- Author:        [Your Name]
+-- Date:          [YYYY-MM-DD]
+-- Notes:         - Uses BigQuery scripting (DECLARE, BEGIN ... EXCEPTION ... END)
+--                - Temporary tables are emulated with temporary named tables (prefixed with _)
+--                - Audit and DQ logging follow BigQuery best practices
+--                - All timestamps in UTC (CURRENT_TIMESTAMP())
+--                - API cost: Each DML/DDL statement incurs BigQuery processing cost based on data scanned/modified.
 -- ==========================================================================================
 
--- ===============================================
--- 1. SAMPLE AZURE SYNAPSE STORED PROCEDURE
--- ===============================================
--- This is a realistic Synapse stored procedure for demonstration.
+-- Begin BigQuery Script
+DECLARE batch_id STRING DEFAULT GENERATE_UUID();
+DECLARE start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+DECLARE end_time TIMESTAMP;
+DECLARE rows_inserted INT64 DEFAULT 0;
+DECLARE rows_rejected INT64 DEFAULT 0;
+DECLARE error_message STRING;
+DECLARE proc_name STRING DEFAULT 'bq_load_sales_fact';
 
--- ===============================================
--- Synapse T-SQL Stored Procedure Example
--- ===============================================
-/*
-CREATE PROCEDURE dbo.usp_ProcessCustomerOrders
-AS
 BEGIN
-    DECLARE @OrderCount INT;
-    DECLARE @CustomerId INT;
-    DECLARE @TotalAmount DECIMAL(18,2);
 
-    SET @OrderCount = 0;
+  -- Insert Audit Log: STARTED
+  INSERT INTO `dw.Audit_Log`
+    (Batch_ID, Procedure_Name, Start_Time, Status, Message)
+  VALUES
+    (batch_id, proc_name, start_time, 'STARTED', 'Sales Fact Load Initiated');
 
-    -- Cursor to iterate over customers
-    DECLARE customer_cursor CURSOR FOR
-        SELECT CustomerId FROM dbo.Customers WHERE IsActive = 1;
+  -- Clean up temp table if exists (BigQuery does not support temp tables in the same way as SQL Server)
+  -- We'll use a session-scoped table with a unique name
+  EXECUTE IMMEDIATE FORMAT("""
+    CREATE OR REPLACE TABLE `dw._InvalidRows_%s` (
+      Transaction_ID INT64,
+      Reason STRING
+    )
+  """, batch_id);
 
-    OPEN customer_cursor;
-    FETCH NEXT FROM customer_cursor INTO @CustomerId;
+  -- Data Quality Check: Missing Customer_ID
+  INSERT INTO `dw._InvalidRows_` || batch_id (Transaction_ID, Reason)
+  SELECT Transaction_ID, 'Missing CustomerID'
+    FROM `stg.Sales_Transactions`
+   WHERE Customer_ID IS NULL;
 
-    WHILE @@FETCH_STATUS = 0
-    BEGIN
-        -- Aggregate total order amount for the customer
-        SELECT @TotalAmount = SUM(OrderAmount)
-        FROM dbo.Orders
-        WHERE CustomerId = @CustomerId
-          AND OrderStatus = 'Completed';
+  -- Data Quality Check: Invalid Quantity
+  INSERT INTO `dw._InvalidRows_` || batch_id (Transaction_ID, Reason)
+  SELECT Transaction_ID, 'Invalid Quantity'
+    FROM `stg.Sales_Transactions`
+   WHERE Quantity <= 0;
 
-        -- Conditional logic: if total > 1000, insert into VIP table
-        IF @TotalAmount > 1000
-        BEGIN
-            INSERT INTO dbo.VIPCustomers (CustomerId, TotalSpent)
-            VALUES (@CustomerId, @TotalAmount);
-        END
+  -- Remove Invalid Rows from Staging
+  DELETE FROM `stg.Sales_Transactions`
+   WHERE Transaction_ID IN (
+     SELECT Transaction_ID FROM `dw._InvalidRows_` || batch_id
+   );
 
-        -- Update order count
-        SET @OrderCount = @OrderCount + 1;
-
-        FETCH NEXT FROM customer_cursor INTO @CustomerId;
-    END
-
-    CLOSE customer_cursor;
-    DEALLOCATE customer_cursor;
-
-    -- Final summary insert
-    INSERT INTO dbo.ProcessingLog (ProcessDate, CustomersProcessed)
-    VALUES (GETDATE(), @OrderCount);
-END
-*/
-
--- ===============================================
--- 2. BIGQUERY SQL EQUIVALENT
--- ===============================================
-
--- BigQuery does not support cursors in the same way as T-SQL.
--- Instead, we use scripting with arrays and FOR loops.
--- All DML operations are performed in set-based fashion for performance.
-
--- =========================
--- BigQuery Script Begins
--- =========================
-
--- Use BigQuery scripting for procedural logic
-DECLARE order_count INT64 DEFAULT 0;
-DECLARE customer_id INT64;
-DECLARE total_amount NUMERIC;
-DECLARE customer_ids ARRAY<INT64>;
-
--- Step 1: Gather active customer IDs into an array
-SET customer_ids = (
-  SELECT ARRAY_AGG(CustomerId)
-  FROM `dataset.customers`
-  WHERE IsActive = TRUE
-);
-
--- Step 2: Loop over each customer_id
--- Note: BigQuery FOR loops over arrays
-FOR customer_id IN UNNEST(customer_ids) DO
-
-  -- Aggregate total order amount for the customer
-  SET total_amount = (
-    SELECT IFNULL(SUM(OrderAmount), 0)
-    FROM `dataset.orders`
-    WHERE CustomerId = customer_id
-      AND OrderStatus = 'Completed'
+  -- Count rows rejected
+  SET rows_rejected = (
+    SELECT COUNT(*) FROM `dw._InvalidRows_` || batch_id
   );
 
-  -- Conditional logic: if total > 1000, insert into VIP table
-  IF total_amount > 1000 THEN
-    INSERT INTO `dataset.vip_customers` (CustomerId, TotalSpent)
-    VALUES (customer_id, total_amount);
-  END IF;
+  -- Data Transformation and Load
+  WITH transformed AS (
+    SELECT
+      s.Transaction_ID,
+      s.Customer_ID,
+      s.Product_ID,
+      s.Sales_Date,
+      s.Quantity,
+      s.Unit_Price,
+      s.Quantity * s.Unit_Price AS Total_Sales_Amount,
+      d.Region_ID,
+      c.Customer_Segment,
+      CURRENT_TIMESTAMP() AS Load_Timestamp,
+      batch_id AS Batch_ID
+    FROM `stg.Sales_Transactions` s
+    INNER JOIN `dw.Dim_Customer` c
+      ON s.Customer_ID = c.Customer_ID
+    INNER JOIN `dw.Dim_Date` d
+      ON DATE(s.Sales_Date) = d.Date_Value
+  )
+  INSERT INTO `dw.Fact_Sales`
+    (Transaction_ID, Customer_ID, Product_ID, Sales_Date, Quantity, Unit_Price, Total_Sales_Amount, Region_ID, Customer_Segment, Load_Timestamp, Batch_ID)
+  SELECT * FROM transformed;
 
-  -- Update order count
-  SET order_count = order_count + 1;
+  -- Count rows inserted
+  SET rows_inserted = (
+    SELECT COUNT(*) FROM transformed
+  );
 
-END FOR;
+  -- Truncate staging table
+  TRUNCATE TABLE `stg.Sales_Transactions`;
 
--- Step 3: Insert summary log
-INSERT INTO `dataset.processing_log` (ProcessDate, CustomersProcessed)
-VALUES (CURRENT_TIMESTAMP(), order_count);
-
--- =========================
--- Set-based alternative for better performance
--- =========================
-
--- Instead of row-by-row, prefer set-based operations in BigQuery:
--- 1. Aggregate total spent per customer
--- 2. Insert all VIP customers in one statement
-
-INSERT INTO `dataset.vip_customers` (CustomerId, TotalSpent)
-SELECT
-  c.CustomerId,
-  SUM(o.OrderAmount) AS TotalSpent
-FROM
-  `dataset.customers` c
-LEFT JOIN
-  `dataset.orders` o
-ON
-  c.CustomerId = o.CustomerId
-  AND o.OrderStatus = 'Completed'
-WHERE
-  c.IsActive = TRUE
-GROUP BY
-  c.CustomerId
-HAVING
-  SUM(o.OrderAmount) > 1000;
-
--- Log the number of customers processed
-INSERT INTO `dataset.processing_log` (ProcessDate, CustomersProcessed)
-SELECT
-  CURRENT_TIMESTAMP(),
-  COUNT(*)
-FROM
-  `dataset.customers`
-WHERE
-  IsActive = TRUE;
-
--- =========================
--- Example of MERGE operation (Upsert)
--- =========================
-
--- Suppose we want to upsert VIP customers (update if exists, insert if not)
-MERGE INTO `dataset.vip_customers` AS target
-USING (
+  -- Log Data Quality Failures
+  INSERT INTO `dw.DQ_Failures`
+    (Transaction_ID, Failure_Reason, Logged_Timestamp, Batch_ID)
   SELECT
-    c.CustomerId,
-    SUM(o.OrderAmount) AS TotalSpent
-  FROM
-    `dataset.customers` c
-  LEFT JOIN
-    `dataset.orders` o
-  ON
-    c.CustomerId = o.CustomerId
-    AND o.OrderStatus = 'Completed'
-  WHERE
-    c.IsActive = TRUE
-  GROUP BY
-    c.CustomerId
-  HAVING
-    SUM(o.OrderAmount) > 1000
-) AS source
-ON target.CustomerId = source.CustomerId
-WHEN MATCHED THEN
-  UPDATE SET TotalSpent = source.TotalSpent
-WHEN NOT MATCHED THEN
-  INSERT (CustomerId, TotalSpent) VALUES (source.CustomerId, source.TotalSpent);
+    Transaction_ID,
+    Reason,
+    CURRENT_TIMESTAMP(),
+    batch_id
+  FROM `dw._InvalidRows_` || batch_id;
 
--- =========================
--- Performance Optimization Notes
--- =========================
--- 1. Prefer set-based operations over procedural loops for scalability.
--- 2. Use ARRAY_AGG and UNNEST for array processing when procedural logic is unavoidable.
--- 3. Use LEFT JOIN and aggregation for efficient data transformation.
--- 4. Use MERGE for upserts to minimize DML costs and avoid race conditions.
--- 5. Use partitioned and clustered tables for large datasets to optimize query performance.
--- 6. Avoid unnecessary SELECT *; always specify columns.
+  -- Update Audit Log: COMPLETED
+  SET end_time = CURRENT_TIMESTAMP();
+  UPDATE `dw.Audit_Log`
+     SET End_Time = end_time,
+         Rows_Inserted = rows_inserted,
+         Rows_Rejected = rows_rejected,
+         Status = 'COMPLETED',
+         Message = CONCAT('Inserted ', CAST(rows_inserted AS STRING), ' rows; Rejected ', CAST(rows_rejected AS STRING), ' rows.')
+   WHERE Batch_ID = batch_id;
 
--- =========================
--- API Cost Statement
--- =========================
--- This script will incur costs for:
---   - Scanning data in `dataset.customers` and `dataset.orders`
---   - DML operations (INSERT, MERGE) into `dataset.vip_customers` and `dataset.processing_log`
---   - The cost depends on data volume scanned and number of DML statements.
---   - For large datasets, prefer set-based DML as shown to minimize per-row costs.
+EXCEPTION WHEN ERROR THEN
+  SET end_time = CURRENT_TIMESTAMP();
+  SET error_message = ERROR_MESSAGE();
+  UPDATE `dw.Audit_Log`
+     SET End_Time = end_time,
+         Status = 'FAILED',
+         Message = error_message
+   WHERE Batch_ID = batch_id;
+  -- Optionally, re-raise error
+  RAISE USING MESSAGE = error_message;
+END;
 
--- =========================
--- End of Script
--- =========================
+-- Clean up temp table
+EXECUTE IMMEDIATE FORMAT("DROP TABLE IF EXISTS `dw._InvalidRows_%s`", batch_id);
 
--- This script is executable as-is in BigQuery (after creating the referenced tables).
--- Inline comments explain each conversion pattern and best practice.
--- The set-based approach is recommended for production workloads.
+-- ==========================================================================================
+-- API COST CONSUMPTION NOTES:
+-- - Each INSERT, DELETE, UPDATE, and SELECT statement will incur BigQuery processing costs, based on the amount of data scanned or modified.
+-- - TRUNCATE TABLE is free, but underlying storage costs may apply.
+-- - Use partitioned/tabled clustering for large tables to optimize cost.
+-- - For best cost efficiency, ensure all tables involved are partitioned and clustered appropriately.
+-- ==========================================================================================
 
 API Cost Consumed in dollars: 0.0032 USD
