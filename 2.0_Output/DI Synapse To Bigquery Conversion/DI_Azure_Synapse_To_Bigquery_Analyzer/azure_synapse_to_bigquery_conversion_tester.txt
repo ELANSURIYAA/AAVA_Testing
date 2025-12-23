@@ -1,0 +1,143 @@
+=============================================
+Author:    AAVA
+Created on:    
+Description:   Loads sales fact table with data quality validation and audit logging in BigQuery
+=============================================
+
+Transformation Change Detection
+
+**Expression Transformation Mapping:**
+- Azure Synapse uses `NEWID()` for batch ID; BigQuery uses `GENERATE_UUID()`.
+- Azure Synapse uses `SYSDATETIME()` for timestamps; BigQuery uses `CURRENT_DATETIME()`.
+- Azure Synapse uses `OBJECT_NAME(@@PROCID)` for procedure name; BigQuery assigns manually.
+- Azure Synapse uses `@@ROWCOUNT`; BigQuery uses explicit `SELECT COUNT(*)`.
+- Azure Synapse uses `CAST(s.Sales_Date AS DATE)`; BigQuery uses `DATE(s.Sales_Date)`.
+- Temporary tables (`#InvalidRows`) in Synapse are replaced by CTEs in BigQuery.
+
+**Aggregator Transformations:**
+- Both use `COUNT(*)` for row counts, but BigQuery does so via CTEs.
+- No GROUP BY or window functions required for this workflow.
+
+**Join Strategies:**
+- INNER JOINs for dimension lookups are preserved.
+- LEFT JOIN used for filtering out invalid rows in BigQuery.
+
+**Data Type Transformations:**
+- `UNIQUEIDENTIFIER` → `STRING`
+- `DATETIME` → `DATETIME`
+- `NVARCHAR` → `STRING`
+- `BIGINT`/`INT` → `INT64`
+
+**Null Handling and Case Sensitivity Adjustments:**
+- Explicit checks for `Customer_ID IS NULL` and `Quantity <= 0` are preserved.
+- BigQuery may require careful handling of NULLs in string concatenation.
+
+Recommended Manual Interventions
+
+- **Audit Table Schema:** Ensure audit and DQ_Failures tables are compatible with BigQuery types.
+- **Error Handling:** Confirm BigQuery exception handling covers all error scenarios.
+- **Performance:** Consider partitioning/clustering for `Fact_Sales` table.
+- **Edge Cases:** Validate that all invalid data is captured and logged.
+- **String Manipulation:** Ensure `CONCAT` in BigQuery handles NULLs as expected.
+- **Monitoring:** Update external monitoring to capture BigQuery procedure errors.
+
+Test Case List:
+| Test Case ID | Test Case Description | Expected Outcome |
+|--------------|----------------------|------------------|
+| TC01 | Valid sales transaction is loaded into Fact_Sales | Row appears in Fact_Sales, not in DQ_Failures |
+| TC02 | Transaction with NULL Customer_ID is rejected | Row appears in DQ_Failures with reason 'Missing CustomerID', not in Fact_Sales |
+| TC03 | Transaction with Quantity <= 0 is rejected | Row appears in DQ_Failures with reason 'Invalid Quantity', not in Fact_Sales |
+| TC04 | Audit_Log entry is created at start and completed at end | Audit_Log has 'STARTED' and 'COMPLETED' entries for batch |
+| TC05 | Batch_ID is generated as UUID and propagated | Batch_ID is a valid UUID in all target tables |
+| TC06 | Error in dimension lookup (missing Customer_ID in Dim_Customer) | Transaction is not loaded into Fact_Sales, error logged if applicable |
+| TC07 | All invalid rows are deleted from staging after procedure | stg.Sales_Transactions contains only valid rows post-procedure |
+| TC08 | Procedure fails gracefully and logs error in Audit_Log | Audit_Log status is 'FAILED' and error message is captured |
+| TC09 | Total_Sales_Amount calculation is correct | Total_Sales_Amount = Quantity * Unit_Price for loaded rows |
+| TC10 | Load_Timestamp and Batch_ID are correctly assigned | All loaded rows have non-null Load_Timestamp and Batch_ID |
+
+Pytest Script for Each Test Case
+
+```python
+import pytest
+from uuid import UUID
+
+# Mocked BigQuery client and test data setup assumed
+
+def test_TC01_valid_sales_transaction_loaded(bigquery_client, setup_valid_transaction):
+    # Run procedure
+    bigquery_client.call_procedure('dw.sp_load_sales_fact')
+    # Check Fact_Sales
+    result = bigquery_client.query("SELECT * FROM dw.Fact_Sales WHERE Transaction_ID = @id", id=setup_valid_transaction['Transaction_ID'])
+    assert result, "Valid transaction not loaded"
+    # Check DQ_Failures
+    dq_result = bigquery_client.query("SELECT * FROM dw.DQ_Failures WHERE Transaction_ID = @id", id=setup_valid_transaction['Transaction_ID'])
+    assert not dq_result, "Valid transaction incorrectly logged as failure"
+
+def test_TC02_null_customer_id_rejected(bigquery_client, setup_null_customer_transaction):
+    bigquery_client.call_procedure('dw.sp_load_sales_fact')
+    dq_result = bigquery_client.query("SELECT * FROM dw.DQ_Failures WHERE Transaction_ID = @id", id=setup_null_customer_transaction['Transaction_ID'])
+    assert dq_result, "Transaction with NULL Customer_ID not logged as failure"
+    assert dq_result[0]['Failure_Reason'] == 'Missing CustomerID'
+    fact_result = bigquery_client.query("SELECT * FROM dw.Fact_Sales WHERE Transaction_ID = @id", id=setup_null_customer_transaction['Transaction_ID'])
+    assert not fact_result, "Invalid transaction loaded into Fact_Sales"
+
+def test_TC03_invalid_quantity_rejected(bigquery_client, setup_invalid_quantity_transaction):
+    bigquery_client.call_procedure('dw.sp_load_sales_fact')
+    dq_result = bigquery_client.query("SELECT * FROM dw.DQ_Failures WHERE Transaction_ID = @id", id=setup_invalid_quantity_transaction['Transaction_ID'])
+    assert dq_result, "Transaction with invalid Quantity not logged as failure"
+    assert dq_result[0]['Failure_Reason'] == 'Invalid Quantity'
+    fact_result = bigquery_client.query("SELECT * FROM dw.Fact_Sales WHERE Transaction_ID = @id", id=setup_invalid_quantity_transaction['Transaction_ID'])
+    assert not fact_result, "Invalid transaction loaded into Fact_Sales"
+
+def test_TC04_audit_log_entries(bigquery_client):
+    bigquery_client.call_procedure('dw.sp_load_sales_fact')
+    batch_id = bigquery_client.query("SELECT Batch_ID FROM dw.Audit_Log ORDER BY Start_Time DESC LIMIT 1")[0]['Batch_ID']
+    started = bigquery_client.query("SELECT * FROM dw.Audit_Log WHERE Batch_ID = @batch_id AND Status = 'STARTED'", batch_id=batch_id)
+    completed = bigquery_client.query("SELECT * FROM dw.Audit_Log WHERE Batch_ID = @batch_id AND Status = 'COMPLETED'", batch_id=batch_id)
+    assert started, "Audit log STARTED entry missing"
+    assert completed, "Audit log COMPLETED entry missing"
+
+def test_TC05_batch_id_uuid(bigquery_client):
+    bigquery_client.call_procedure('dw.sp_load_sales_fact')
+    batch_id = bigquery_client.query("SELECT Batch_ID FROM dw.Fact_Sales ORDER BY Load_Timestamp DESC LIMIT 1")[0]['Batch_ID']
+    try:
+        UUID(batch_id)
+    except ValueError:
+        pytest.fail("Batch_ID is not a valid UUID")
+
+def test_TC06_missing_dim_customer(bigquery_client, setup_missing_dim_customer_transaction):
+    bigquery_client.call_procedure('dw.sp_load_sales_fact')
+    fact_result = bigquery_client.query("SELECT * FROM dw.Fact_Sales WHERE Transaction_ID = @id", id=setup_missing_dim_customer_transaction['Transaction_ID'])
+    assert not fact_result, "Transaction with missing Dim_Customer loaded into Fact_Sales"
+
+def test_TC07_staging_cleanup(bigquery_client):
+    bigquery_client.call_procedure('dw.sp_load_sales_fact')
+    staging_rows = bigquery_client.query("SELECT COUNT(*) as cnt FROM stg.Sales_Transactions")
+    assert staging_rows[0]['cnt'] == 0, "Staging table not cleaned up"
+
+def test_TC08_error_handling(bigquery_client, induce_error):
+    # induce_error sets up a scenario that causes procedure to fail
+    with pytest.raises(Exception):
+        bigquery_client.call_procedure('dw.sp_load_sales_fact')
+    batch_id = bigquery_client.query("SELECT Batch_ID FROM dw.Audit_Log ORDER BY Start_Time DESC LIMIT 1")[0]['Batch_ID']
+    failed = bigquery_client.query("SELECT * FROM dw.Audit_Log WHERE Batch_ID = @batch_id AND Status = 'FAILED'", batch_id=batch_id)
+    assert failed, "Audit log FAILED entry missing"
+
+def test_TC09_total_sales_amount(bigquery_client, setup_valid_transaction):
+    bigquery_client.call_procedure('dw.sp_load_sales_fact')
+    result = bigquery_client.query("SELECT Quantity, Unit_Price, Total_Sales_Amount FROM dw.Fact_Sales WHERE Transaction_ID = @id", id=setup_valid_transaction['Transaction_ID'])
+    assert result, "Valid transaction not loaded"
+    expected = result[0]['Quantity'] * result[0]['Unit_Price']
+    assert result[0]['Total_Sales_Amount'] == expected, "Total_Sales_Amount calculation incorrect"
+
+def test_TC10_load_timestamp_and_batch_id(bigquery_client, setup_valid_transaction):
+    bigquery_client.call_procedure('dw.sp_load_sales_fact')
+    result = bigquery_client.query("SELECT Load_Timestamp, Batch_ID FROM dw.Fact_Sales WHERE Transaction_ID = @id", id=setup_valid_transaction['Transaction_ID'])
+    assert result, "Valid transaction not loaded"
+    assert result[0]['Load_Timestamp'] is not None, "Load_Timestamp missing"
+    assert result[0]['Batch_ID'] is not None, "Batch_ID missing"
+```
+
+API Cost Estimation
+
+apiCost: 0.0040 USD
