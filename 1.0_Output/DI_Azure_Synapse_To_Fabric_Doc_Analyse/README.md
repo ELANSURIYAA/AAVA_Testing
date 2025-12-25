@@ -1,12 +1,7 @@
 # DI_Azure_Synapse_To_Fabric_Doc_Analyse
 
-## Workflow Information
-- Pipeline ID: 7658
-- Triggered By: jahnavi.lingutla@ascendion.com
+Pipeline ID: 7658
+Triggered By: jahnavi.lingutla@ascendion.com
 
-## Folder Structure
-- Each subfolder represents one input file
-- Each file inside the subfolder represents an agent output
-
-## Notes
-This README is auto-generated during workflow execution.
+Execution ID: 9e5a769d-453a-4881-be26-b4b9e31f08dd
+Execution Time: 2025-12-25 12:14:43 UTC
