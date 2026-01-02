@@ -1,0 +1,354 @@
+```python
+=============================================
+Author:        Ascendion AVA+
+Created on:   
+Description:   Python script to automate Teradata to Snowflake migration validation, including execution, data transfer, comparison, and reporting for employee backup logic.
+=============================================
+
+import os
+import sys
+import logging
+import time
+import traceback
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import teradatasql
+import snowflake.connector
+from datetime import datetime
+
+# -------------------- CONFIGURATION --------------------
+# Use environment variables for credentials
+TERADATA_HOST = os.getenv('TERADATA_HOST')
+TERADATA_USER = os.getenv('TERADATA_USER')
+TERADATA_PASSWORD = os.getenv('TERADATA_PASSWORD')
+TERADATA_DATABASE = os.getenv('TERADATA_DATABASE')
+
+SNOWFLAKE_USER = os.getenv('SNOWFLAKE_USER')
+SNOWFLAKE_PASSWORD = os.getenv('SNOWFLAKE_PASSWORD')
+SNOWFLAKE_ACCOUNT = os.getenv('SNOWFLAKE_ACCOUNT')
+SNOWFLAKE_DATABASE = os.getenv('SNOWFLAKE_DATABASE')
+SNOWFLAKE_SCHEMA = os.getenv('SNOWFLAKE_SCHEMA', 'PUBLIC')
+SNOWFLAKE_STAGE = os.getenv('SNOWFLAKE_STAGE', 'EMPLOYEE_STAGE')
+
+# Logging setup
+logging.basicConfig(
+    filename='migration_validation.log',
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s'
+)
+
+def log_and_print(msg):
+    print(msg)
+    logging.info(msg)
+
+# -------------------- UTILITY FUNCTIONS --------------------
+def get_timestamp():
+    return datetime.now().strftime('%Y%m%d_%H%M%S')
+
+def safe_execute(cursor, query, params=None):
+    try:
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+    except Exception as e:
+        logging.error(f"Error executing query: {query}\n{traceback.format_exc()}")
+        raise
+
+def fetch_table(cursor, table_name):
+    safe_execute(cursor, f"SELECT * FROM {table_name}")
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+    df = pd.DataFrame(rows, columns=columns)
+    return df
+
+def export_to_csv(df, table_name):
+    filename = f"{table_name}_{get_timestamp()}.csv"
+    df.to_csv(filename, index=False)
+    return filename
+
+def convert_csv_to_parquet(csv_file):
+    df = pd.read_csv(csv_file)
+    table = pa.Table.from_pandas(df)
+    parquet_file = csv_file.replace('.csv', '.parquet')
+    pq.write_table(table, parquet_file)
+    return parquet_file
+
+def snowflake_connect():
+    return snowflake.connector.connect(
+        user=SNOWFLAKE_USER,
+        password=SNOWFLAKE_PASSWORD,
+        account=SNOWFLAKE_ACCOUNT,
+        database=SNOWFLAKE_DATABASE,
+        schema=SNOWFLAKE_SCHEMA
+    )
+
+def teradata_connect():
+    return teradatasql.connect(
+        host=TERADATA_HOST,
+        user=TERADATA_USER,
+        password=TERADATA_PASSWORD,
+        database=TERADATA_DATABASE
+    )
+
+# -------------------- 1. ANALYZE INPUTS --------------------
+TERADATA_SQL = """
+.LOGON 192.168.1.102/dbc,dbc; 
+DATABASE tduser;
+CREATE TABLE employee_bkup (EmployeeNo INTEGER,FirstName CHAR(30),LastName CHAR(30),DepartmentNo SMALLINT,NetPay INTEGER 
+)Unique Primary Index(EmployeeNo);
+.IF ERRORCODE <> 0 THEN .EXIT ERRORCODE;  
+SELECT * FROM  
+EmployeeSample 1;
+.IF ACTIVITYCOUNT <> 0 THEN .GOTO InsertEmployee;  
+
+DROP TABLE employee_bkup;
+.IF ERRORCODE <> 0 THEN .EXIT ERRORCODE;
+.LABEL InsertEmployee 
+INSERT INTO employee_bkup 
+SELECT a.EmployeeNo, 
+   a.FirstName, 
+   a.LastName, 
+   a.DepartmentNo, 
+   b.NetPay 
+FROM  
+Employee a INNER JOIN Salary b 
+ON (a.EmployeeNo = b.EmployeeNo);
+.IF ERRORCODE <> 0 THEN .EXIT ERRORCODE;
+.LOGOFF;
+"""
+
+SNOWFLAKE_SQL = """
+DROP TABLE IF EXISTS employee_bkup;
+CREATE TABLE employee_bkup (
+    EmployeeNo NUMBER,
+    FirstName VARCHAR,
+    LastName VARCHAR,
+    Salary NUMBER
+    -- Add other columns as needed
+);
+INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, Salary)
+SELECT 
+    e.EmployeeNo,
+    e.FirstName,
+    e.LastName,
+    s.Salary
+FROM 
+    Employee e
+    INNER JOIN Salary s ON e.EmployeeNo = s.EmployeeNo;
+"""
+
+TARGET_TABLES_TERADATA = ['employee_bkup']
+TARGET_TABLES_SNOWFLAKE = ['employee_bkup']
+
+# -------------------- 2. TERADATA EXECUTION --------------------
+def execute_teradata_code():
+    log_and_print("Connecting to Teradata...")
+    conn = teradata_connect()
+    cursor = conn.cursor()
+    try:
+        log_and_print("Executing Teradata SQL for migration validation...")
+        # Drop table if exists
+        safe_execute(cursor, "DROP TABLE employee_bkup")
+        # Create table
+        safe_execute(cursor, "CREATE TABLE employee_bkup (EmployeeNo INTEGER,FirstName CHAR(30),LastName CHAR(30),DepartmentNo SMALLINT,NetPay INTEGER)")
+        # Insert data
+        safe_execute(cursor, """
+            INSERT INTO employee_bkup 
+            SELECT a.EmployeeNo, a.FirstName, a.LastName, a.DepartmentNo, b.NetPay 
+            FROM Employee a INNER JOIN Salary b ON (a.EmployeeNo = b.EmployeeNo)
+        """)
+        # Export table
+        df = fetch_table(cursor, "employee_bkup")
+        log_and_print(f"Exported {len(df)} rows from Teradata employee_bkup.")
+        return df
+    except Exception as e:
+        log_and_print(f"Teradata execution failed: {e}")
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+# -------------------- 3. DATA EXPORT & TRANSFORMATION --------------------
+def export_and_transform(df, table_name):
+    log_and_print(f"Exporting {table_name} to CSV...")
+    csv_file = export_to_csv(df, table_name)
+    log_and_print(f"Converting {csv_file} to Parquet...")
+    parquet_file = convert_csv_to_parquet(csv_file)
+    log_and_print(f"Parquet file created: {parquet_file}")
+    return parquet_file
+
+# -------------------- 4. SNOWFLAKE TRANSFER --------------------
+def transfer_to_snowflake(parquet_file, stage):
+    log_and_print(f"Uploading {parquet_file} to Snowflake stage {stage}...")
+    conn = snowflake_connect()
+    cursor = conn.cursor()
+    try:
+        put_cmd = f"PUT file://{parquet_file} @{stage} AUTO_COMPRESS=TRUE"
+        safe_execute(cursor, put_cmd)
+        # Integrity check
+        safe_execute(cursor, f"LIST @{stage}")
+        files = cursor.fetchall()
+        found = any(parquet_file.split('/')[-1] in f[0] for f in files)
+        if not found:
+            raise Exception(f"File {parquet_file} not found in Snowflake stage after upload.")
+        log_and_print(f"File {parquet_file} successfully uploaded to Snowflake stage.")
+    except Exception as e:
+        log_and_print(f"Snowflake file transfer failed: {e}")
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+# -------------------- 5. SNOWFLAKE EXTERNAL TABLES --------------------
+def create_external_table(parquet_file, table_name, stage):
+    log_and_print(f"Creating external table {table_name}_ext in Snowflake...")
+    conn = snowflake_connect()
+    cursor = conn.cursor()
+    try:
+        # Infer schema from Parquet file using pandas
+        df = pd.read_parquet(parquet_file)
+        cols = []
+        for col, dtype in zip(df.columns, df.dtypes):
+            if pd.api.types.is_integer_dtype(dtype):
+                snow_type = "NUMBER"
+            elif pd.api.types.is_float_dtype(dtype):
+                snow_type = "FLOAT"
+            elif pd.api.types.is_object_dtype(dtype):
+                snow_type = "VARCHAR"
+            else:
+                snow_type = "VARCHAR"
+            cols.append(f"{col} {snow_type}")
+        schema_str = ', '.join(cols)
+        ext_table = f"{table_name}_ext"
+        safe_execute(cursor, f"DROP TABLE IF EXISTS {ext_table}")
+        create_sql = f"""
+            CREATE EXTERNAL TABLE {ext_table} (
+                {schema_str}
+            )
+            LOCATION=@{stage}
+            FILE_FORMAT=(TYPE=PARQUET)
+        """
+        safe_execute(cursor, create_sql)
+        log_and_print(f"External table {ext_table} created.")
+    except Exception as e:
+        log_and_print(f"External table creation failed: {e}")
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+# -------------------- 6. SNOWFLAKE EXECUTION --------------------
+def execute_snowflake_code():
+    log_and_print("Connecting to Snowflake and executing migration logic...")
+    conn = snowflake_connect()
+    cursor = conn.cursor()
+    try:
+        for stmt in SNOWFLAKE_SQL.split(';'):
+            stmt = stmt.strip()
+            if stmt:
+                safe_execute(cursor, stmt)
+        df = fetch_table(cursor, "employee_bkup")
+        log_and_print(f"Exported {len(df)} rows from Snowflake employee_bkup.")
+        return df
+    except Exception as e:
+        log_and_print(f"Snowflake execution failed: {e}")
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+# -------------------- 7. COMPARISON LOGIC --------------------
+def compare_tables(df_teradata, df_snowflake):
+    log_and_print("Comparing Teradata and Snowflake tables...")
+    report = {}
+    # Row count comparison
+    td_count = len(df_teradata)
+    sf_count = len(df_snowflake)
+    report['row_count_teradata'] = td_count
+    report['row_count_snowflake'] = sf_count
+    report['row_count_match'] = td_count == sf_count
+
+    # Column comparison
+    td_cols = set(df_teradata.columns)
+    sf_cols = set(df_snowflake.columns)
+    report['columns_teradata'] = list(td_cols)
+    report['columns_snowflake'] = list(sf_cols)
+    report['column_match'] = td_cols == sf_cols
+
+    # Data comparison
+    mismatches = []
+    match_rows = 0
+    for idx, row in df_teradata.iterrows():
+        match = False
+        for _, sf_row in df_snowflake.iterrows():
+            # Compare all columns present in both
+            if all(pd.isna(row[col]) and pd.isna(sf_row[col]) or row[col] == sf_row[col] for col in td_cols & sf_cols):
+                match = True
+                break
+        if match:
+            match_rows += 1
+        else:
+            mismatches.append(row.to_dict())
+    match_pct = match_rows / td_count if td_count else 1
+    report['match_percentage'] = round(match_pct * 100, 2)
+    report['mismatches'] = mismatches[:10]  # Sample up to 10 mismatches
+
+    # Status
+    if report['row_count_match'] and report['column_match'] and report['match_percentage'] == 100:
+        report['status'] = "MATCH"
+    elif report['match_percentage'] > 0:
+        report['status'] = "PARTIAL MATCH"
+    else:
+        report['status'] = "NO MATCH"
+    return report
+
+# -------------------- 8. REPORTING --------------------
+def generate_report(report, table_name):
+    log_and_print(f"Generating comparison report for {table_name}...")
+    summary = (
+        f"Table: {table_name}\n"
+        f"Status: {report['status']}\n"
+        f"Row Count Teradata: {report['row_count_teradata']}\n"
+        f"Row Count Snowflake: {report['row_count_snowflake']}\n"
+        f"Row Count Match: {report['row_count_match']}\n"
+        f"Column Match: {report['column_match']}\n"
+        f"Match Percentage: {report['match_percentage']}%\n"
+        f"Sample Mismatches: {report['mismatches']}\n"
+    )
+    log_and_print(summary)
+    with open(f"comparison_report_{table_name}_{get_timestamp()}.txt", "w") as f:
+        f.write(summary)
+    return summary
+
+# -------------------- 9. MAIN EXECUTION --------------------
+def main():
+    try:
+        log_and_print("=== Teradata to Snowflake Migration Validation Started ===")
+        # Step 1: Execute Teradata code and export table
+        df_teradata = execute_teradata_code()
+        parquet_file = export_and_transform(df_teradata, "employee_bkup")
+
+        # Step 2: Transfer Parquet to Snowflake stage
+        transfer_to_snowflake(parquet_file, SNOWFLAKE_STAGE)
+
+        # Step 3: Create external table in Snowflake
+        create_external_table(parquet_file, "employee_bkup", SNOWFLAKE_STAGE)
+
+        # Step 4: Execute Snowflake code and export table
+        df_snowflake = execute_snowflake_code()
+
+        # Step 5: Compare tables and generate report
+        report = compare_tables(df_teradata, df_snowflake)
+        generate_report(report, "employee_bkup")
+
+        log_and_print("=== Migration Validation Completed ===")
+    except Exception as e:
+        log_and_print(f"Migration validation failed: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+```
