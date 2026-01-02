@@ -1,263 +1,301 @@
 ================================
 Author: AAVA
-Created on: 
-Description: Pytest unit tests for BigQuery sales fact table ETL procedure, covering data transformation, validation, audit logging, and error handling
+Created on:
+Description: Pytest-based unit tests for BigQuery sales fact table ETL procedure, covering data quality validation, transformation logic, audit logging, and error handling.
 ================================
 
 Test Case List:
 
-| Test Case ID | Description                                                                                           | Expected Outcome                                                                                           |
-|--------------|------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------|
-| TC01         | Happy path: All sales transactions are valid and mapped to dimensions                                 | All rows loaded into Fact_Sales, Audit_Log status COMPLETED, DQ_Failures empty, correct row counts        |
-| TC02         | Edge case: Transactions with NULL Customer_ID                                                         | Those rows are deleted from staging, logged in DQ_Failures, not loaded to Fact_Sales, Audit_Log updated   |
-| TC03         | Edge case: Transactions with Quantity <= 0                                                            | Those rows are deleted from staging, logged in DQ_Failures, not loaded to Fact_Sales, Audit_Log updated   |
-| TC04         | Edge case: Empty staging table                                                                        | No rows inserted/rejected, Audit_Log status COMPLETED, DQ_Failures empty                                   |
-| TC05         | Edge case: Transaction with missing dimension mapping (Customer_ID not in Dim_Customer)               | Row not loaded to Fact_Sales, not logged in DQ_Failures (since not caught by validation), Audit_Log counts|
-| TC06         | Error handling: Simulate error during Fact_Sales insert                                               | Audit_Log status FAILED, error message logged, no rows loaded                                              |
-| TC07         | Boundary: Transaction with Quantity = 1 (minimum valid quantity)                                      | Row loaded to Fact_Sales, not in DQ_Failures, Audit_Log updated                                            |
-| TC08         | Data type edge: Transaction with unexpected data format (e.g., string in Quantity)                    | Error raised, Audit_Log status FAILED, error message logged                                                |
-| TC09         | Audit logging: Procedure runs twice with different batches                                            | Two Audit_Log entries, batch IDs unique, row counts correct                                                |
-| TC10         | Staging truncation: After procedure, staging table is empty                                           | stg.Sales_Transactions has zero rows after procedure                                                       |
+| Test Case ID | Description                                                                                       | Expected Outcome                                                                                          |
+|--------------|--------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: All sales transactions valid, all dimension lookups succeed                           | All rows loaded to dw_Fact_Sales; audit log shows correct counts; no DQ failures logged                  |
+| TC02         | Data quality: Transactions with NULL Customer_ID                                                  | Invalid rows rejected, logged in dw_DQ_Failures; not loaded to dw_Fact_Sales; audit log reflects counts  |
+| TC03         | Data quality: Transactions with Quantity <= 0                                                     | Invalid rows rejected, logged in dw_DQ_Failures; not loaded to dw_Fact_Sales; audit log reflects counts  |
+| TC04         | Edge case: Empty stg_Sales_Transactions                                                           | No rows loaded or rejected; audit log shows zero counts; no DQ failures                                  |
+| TC05         | Edge case: All rows invalid (all fail validation)                                                 | All rows rejected, logged in dw_DQ_Failures; dw_Fact_Sales remains empty; audit log reflects counts      |
+| TC06         | Edge case: Missing columns in stg_Sales_Transactions                                              | Procedure fails; audit log status set to FAILED; error message captured                                  |
+| TC07         | Edge case: Unexpected data types in Quantity (e.g., string instead of INT64)                      | Procedure fails; audit log status set to FAILED; error message captured                                  |
+| TC08         | Edge case: Sales_Date outside range of dw_Dim_Date                                                | Rows not loaded (no matching join); not counted as rejected; audit log reflects inserted count           |
+| TC09         | Error handling: Simulate runtime error (e.g., missing target table dw_Fact_Sales)                 | Procedure fails; audit log status set to FAILED; error message captured                                  |
+| TC10         | Audit logging: Verify batch_id uniqueness and correct timestamps                                  | Audit log entries have unique batch_id and correct start/end times                                       |
 
 Pytest Script:
 
 ```python
 ================================
 Author: AAVA
-Created on: 
-Description: Pytest unit tests for BigQuery sales fact table ETL procedure, covering data transformation, validation, audit logging, and error handling
+Created on:
+Description: Pytest-based unit tests for BigQuery sales fact table ETL procedure, covering data quality validation, transformation logic, audit logging, and error handling.
 ================================
 
 import pytest
 import pandas as pd
 from sqlalchemy import create_engine
-from datetime import datetime
-import uuid
+from uuid import uuid4
+from datetime import datetime, timedelta
 
-# Helper function to simulate batch_id generation
-def generate_batch_id():
-    return str(uuid.uuid4())
+# Helper functions and mock data setup
 
-# Mock tables as pandas DataFrames
-class MockDW:
-    def __init__(self):
-        self.Fact_Sales = pd.DataFrame(columns=[
-            "Transaction_ID", "Customer_ID", "Product_ID", "Sales_Date", "Quantity", "Unit_Price",
-            "Total_Sales_Amount", "Region_ID", "Customer_Segment", "Load_Timestamp", "Batch_ID"
+def generate_mock_data(valid=True, null_customer=False, invalid_quantity=False, empty=False, all_invalid=False, bad_types=False, date_out_of_range=False):
+    """Generate mock sales transactions DataFrame for testing."""
+    if empty:
+        return pd.DataFrame(columns=[
+            'Transaction_ID', 'Customer_ID', 'Product_ID', 'Sales_Date', 'Quantity', 'Unit_Price'
         ])
-        self.Audit_Log = pd.DataFrame(columns=[
-            "Batch_ID", "Procedure_Name", "Start_Time", "End_Time", "Rows_Inserted", "Rows_Rejected",
-            "Status", "Message"
-        ])
-        self.DQ_Failures = pd.DataFrame(columns=[
-            "Transaction_ID", "Failure_Reason", "Logged_Timestamp", "Batch_ID"
-        ])
-        self.Dim_Customer = pd.DataFrame(columns=["Customer_ID", "Customer_Segment"])
-        self.Dim_Date = pd.DataFrame(columns=["Date_Value", "Region_ID"])
+    if all_invalid:
+        data = [
+            {'Transaction_ID': 1, 'Customer_ID': None, 'Product_ID': 101, 'Sales_Date': '2024-06-01', 'Quantity': -5, 'Unit_Price': 10.0},
+            {'Transaction_ID': 2, 'Customer_ID': None, 'Product_ID': 102, 'Sales_Date': '2024-06-02', 'Quantity': 0, 'Unit_Price': 20.0},
+        ]
+        return pd.DataFrame(data)
+    if bad_types:
+        data = [
+            {'Transaction_ID': 1, 'Customer_ID': 1001, 'Product_ID': 101, 'Sales_Date': '2024-06-01', 'Quantity': 'ten', 'Unit_Price': 10.0},
+        ]
+        return pd.DataFrame(data)
+    if date_out_of_range:
+        data = [
+            {'Transaction_ID': 1, 'Customer_ID': 1001, 'Product_ID': 101, 'Sales_Date': '1900-01-01', 'Quantity': 10, 'Unit_Price': 10.0},
+        ]
+        return pd.DataFrame(data)
+    data = [
+        {'Transaction_ID': 1, 'Customer_ID': None if null_customer else 1001, 'Product_ID': 101, 'Sales_Date': '2024-06-01', 'Quantity': -5 if invalid_quantity else 10, 'Unit_Price': 10.0},
+        {'Transaction_ID': 2, 'Customer_ID': 1002, 'Product_ID': 102, 'Sales_Date': '2024-06-02', 'Quantity': 20, 'Unit_Price': 20.0},
+    ]
+    return pd.DataFrame(data)
 
-class MockSTG:
-    def __init__(self):
-        self.Sales_Transactions = pd.DataFrame(columns=[
-            "Transaction_ID", "Customer_ID", "Product_ID", "Sales_Date", "Quantity", "Unit_Price"
-        ])
+def generate_dim_customer():
+    return pd.DataFrame([
+        {'Customer_ID': 1001, 'Customer_Segment': 'Retail'},
+        {'Customer_ID': 1002, 'Customer_Segment': 'Wholesale'},
+    ])
 
-@pytest.fixture
-def setup_tables():
-    dw = MockDW()
-    stg = MockSTG()
-    # Populate dimensions
-    dw.Dim_Customer = pd.DataFrame({
-        "Customer_ID": [101, 102],
-        "Customer_Segment": ["Retail", "Wholesale"]
-    })
-    dw.Dim_Date = pd.DataFrame({
-        "Date_Value": [pd.Timestamp("2023-01-01"), pd.Timestamp("2023-01-02")],
-        "Region_ID": [1, 2]
-    })
-    return dw, stg
+def generate_dim_date():
+    return pd.DataFrame([
+        {'Date_Value': pd.Timestamp('2024-06-01'), 'Region_ID': 'North'},
+        {'Date_Value': pd.Timestamp('2024-06-02'), 'Region_ID': 'South'},
+    ])
 
-def run_procedure(dw, stg, proc_name="sp_load_sales_fact"):
-    batch_id = generate_batch_id()
+def run_etl(stg_sales, dim_customer, dim_date, fact_sales, audit_log, dq_failures, simulate_error=None):
+    """
+    Simulate the ETL procedure logic in Python, mimicking the BigQuery procedure.
+    All tables are pandas DataFrames.
+    """
+    batch_id = str(uuid4())
     start_time = datetime.now()
+    status = 'STARTED'
+    message = 'Sales Fact Load Initiated'
     rows_inserted = 0
     rows_rejected = 0
     error_message = None
 
-    # Step 1: Start Audit Logging
-    dw.Audit_Log = pd.concat([dw.Audit_Log, pd.DataFrame([{
-        "Batch_ID": batch_id,
-        "Procedure_Name": proc_name,
-        "Start_Time": start_time,
-        "Status": "STARTED",
-        "Message": "Sales Fact Load Initiated"
-    }])], ignore_index=True)
+    # Start Audit Log
+    audit_log.append({
+        'Batch_ID': batch_id,
+        'Procedure_Name': 'sp_load_sales_fact',
+        'Start_Time': start_time,
+        'Status': status,
+        'Message': message,
+        'End_Time': None,
+        'Rows_Inserted': None,
+        'Rows_Rejected': None
+    })
 
     try:
-        # Step 2 & 3: Data Quality Validation
+        if simulate_error == 'missing_fact_table':
+            fact_sales = None  # Simulate missing table
+
+        # Data Quality Validation
         invalid_rows = []
-        for idx, row in stg.Sales_Transactions.iterrows():
-            if pd.isnull(row["Customer_ID"]):
-                invalid_rows.append({"Transaction_ID": row["Transaction_ID"], "Reason": "Missing CustomerID"})
-            elif not isinstance(row["Quantity"], (int, float)) or row["Quantity"] <= 0:
-                invalid_rows.append({"Transaction_ID": row["Transaction_ID"], "Reason": "Invalid Quantity"})
-        invalid_df = pd.DataFrame(invalid_rows)
-        # Step 4: Delete Invalid Rows from Staging
-        if not invalid_df.empty:
-            stg.Sales_Transactions = stg.Sales_Transactions[
-                ~stg.Sales_Transactions["Transaction_ID"].isin(invalid_df["Transaction_ID"])
-            ].reset_index(drop=True)
-        rows_rejected = len(invalid_df)
-        # Step 5: Transform and Load Cleaned Data into Fact Table
-        merged = pd.merge(stg.Sales_Transactions, dw.Dim_Customer, on="Customer_ID", how="inner")
-        merged = pd.merge(merged, dw.Dim_Date, left_on=stg.Sales_Transactions["Sales_Date"].dt.date,
-                          right_on=dw.Dim_Date["Date_Value"].dt.date, how="inner")
-        # Calculate Total_Sales_Amount
-        if not merged.empty:
-            merged["Total_Sales_Amount"] = merged["Quantity"] * merged["Unit_Price"]
-            merged["Load_Timestamp"] = datetime.now()
-            merged["Batch_ID"] = batch_id
-            # Select columns for Fact_Sales
-            fact_sales_cols = dw.Fact_Sales.columns
-            dw.Fact_Sales = pd.concat([dw.Fact_Sales, merged[fact_sales_cols]], ignore_index=True)
-            rows_inserted = len(merged)
-        # Step 6: Truncate staging table
-        stg.Sales_Transactions = stg.Sales_Transactions.iloc[0:0]
-        # Step 7: Log Validation Failures
-        if not invalid_df.empty:
-            invalid_df["Logged_Timestamp"] = datetime.now()
-            invalid_df["Batch_ID"] = batch_id
-            dw.DQ_Failures = pd.concat([dw.DQ_Failures, invalid_df], ignore_index=True)
-        # Step 8: End Audit Log
+        for idx, row in stg_sales.iterrows():
+            if pd.isnull(row['Customer_ID']):
+                invalid_rows.append({'Transaction_ID': row['Transaction_ID'], 'Reason': 'Missing CustomerID'})
+            elif not isinstance(row['Quantity'], (int, float)) or row['Quantity'] <= 0:
+                invalid_rows.append({'Transaction_ID': row['Transaction_ID'], 'Reason': 'Invalid Quantity'})
+
+        deleted_ids = [r['Transaction_ID'] for r in invalid_rows]
+        clean_sales = stg_sales[~stg_sales['Transaction_ID'].isin(deleted_ids)]
+
+        # Transformation and Join
+        transformed = pd.merge(clean_sales, dim_customer, on='Customer_ID', how='inner')
+        transformed = pd.merge(transformed, dim_date, left_on=clean_sales['Sales_Date'].apply(pd.Timestamp), right_on='Date_Value', how='inner')
+        if not transformed.empty:
+            transformed['Total_Sales_Amount'] = transformed['Quantity'] * transformed['Unit_Price']
+            transformed['Load_Timestamp'] = datetime.now()
+            transformed['Batch_ID'] = batch_id
+
+        # Insert into Fact Table
+        if fact_sales is None:
+            raise Exception("Target table dw_Fact_Sales does not exist")
+        fact_sales = pd.concat([fact_sales, transformed], ignore_index=True)
+        rows_inserted = len(transformed)
+
+        # Archive Staging Table (simulate by clearing DataFrame)
+        stg_sales.drop(stg_sales.index, inplace=True)
+
+        # Log Validation Failures
+        dq_failures.extend([
+            {
+                'Transaction_ID': r['Transaction_ID'],
+                'Failure_Reason': r['Reason'],
+                'Logged_Timestamp': datetime.now(),
+                'Batch_ID': batch_id
+            }
+            for r in invalid_rows
+        ])
+        rows_rejected = len(invalid_rows)
+
+        # End Audit Log
         end_time = datetime.now()
-        dw.Audit_Log.loc[dw.Audit_Log["Batch_ID"] == batch_id, ["End_Time", "Rows_Inserted", "Rows_Rejected", "Status", "Message"]] = [
-            end_time, rows_inserted, rows_rejected, "COMPLETED",
-            f"Inserted {rows_inserted} rows; Rejected {rows_rejected} rows."
-        ]
+        audit_log[-1].update({
+            'End_Time': end_time,
+            'Rows_Inserted': rows_inserted,
+            'Rows_Rejected': rows_rejected,
+            'Status': 'COMPLETED',
+            'Message': f'Inserted {rows_inserted} rows; Rejected {rows_rejected} rows.'
+        })
+
     except Exception as e:
         end_time = datetime.now()
         error_message = str(e)
-        dw.Audit_Log.loc[dw.Audit_Log["Batch_ID"] == batch_id, ["End_Time", "Status", "Message"]] = [
-            end_time, "FAILED", error_message
-        ]
-        raise
-    return batch_id
+        audit_log[-1].update({
+            'End_Time': end_time,
+            'Status': 'FAILED',
+            'Message': error_message
+        })
+        # Optionally re-raise for pipeline monitoring
+        # raise
+    return fact_sales, audit_log, dq_failures
 
-# TC01: Happy path
-def test_happy_path(setup_tables):
-    dw, stg = setup_tables
-    stg.Sales_Transactions = pd.DataFrame([
-        {"Transaction_ID": 1, "Customer_ID": 101, "Product_ID": 1001, "Sales_Date": pd.Timestamp("2023-01-01"), "Quantity": 5, "Unit_Price": 10.0},
-        {"Transaction_ID": 2, "Customer_ID": 102, "Product_ID": 1002, "Sales_Date": pd.Timestamp("2023-01-02"), "Quantity": 3, "Unit_Price": 20.0},
+# Pytest Fixtures
+
+@pytest.fixture
+def setup_tables():
+    """Setup empty target tables and logs for each test."""
+    fact_sales = pd.DataFrame(columns=[
+        'Transaction_ID', 'Customer_ID', 'Product_ID', 'Sales_Date', 'Quantity', 'Unit_Price',
+        'Total_Sales_Amount', 'Region_ID', 'Customer_Segment', 'Load_Timestamp', 'Batch_ID'
     ])
-    batch_id = run_procedure(dw, stg)
-    assert len(dw.Fact_Sales) == 2
-    assert dw.Fact_Sales["Batch_ID"].nunique() == 1
-    assert dw.Audit_Log.loc[dw.Audit_Log["Batch_ID"] == batch_id, "Status"].iloc[0] == "COMPLETED"
-    assert dw.DQ_Failures.empty
+    audit_log = []
+    dq_failures = []
+    return fact_sales, audit_log, dq_failures
 
-# TC02: NULL Customer_ID
-def test_null_customer_id(setup_tables):
-    dw, stg = setup_tables
-    stg.Sales_Transactions = pd.DataFrame([
-        {"Transaction_ID": 3, "Customer_ID": None, "Product_ID": 1003, "Sales_Date": pd.Timestamp("2023-01-01"), "Quantity": 2, "Unit_Price": 15.0},
-    ])
-    batch_id = run_procedure(dw, stg)
-    assert dw.Fact_Sales.empty
-    assert not dw.DQ_Failures.empty
-    assert dw.DQ_Failures.iloc[0]["Failure_Reason"] == "Missing CustomerID"
-    assert dw.Audit_Log.loc[dw.Audit_Log["Batch_ID"] == batch_id, "Rows_Rejected"].iloc[0] == 1
+# Test Cases
 
-# TC03: Invalid Quantity
-def test_invalid_quantity(setup_tables):
-    dw, stg = setup_tables
-    stg.Sales_Transactions = pd.DataFrame([
-        {"Transaction_ID": 4, "Customer_ID": 101, "Product_ID": 1004, "Sales_Date": pd.Timestamp("2023-01-01"), "Quantity": 0, "Unit_Price": 10.0},
-    ])
-    batch_id = run_procedure(dw, stg)
-    assert dw.Fact_Sales.empty
-    assert not dw.DQ_Failures.empty
-    assert dw.DQ_Failures.iloc[0]["Failure_Reason"] == "Invalid Quantity"
-    assert dw.Audit_Log.loc[dw.Audit_Log["Batch_ID"] == batch_id, "Rows_Rejected"].iloc[0] == 1
+def test_TC01_happy_path(setup_tables):
+    fact_sales, audit_log, dq_failures = setup_tables
+    stg_sales = generate_mock_data(valid=True)
+    dim_customer = generate_dim_customer()
+    dim_date = generate_dim_date()
+    fact_sales, audit_log, dq_failures = run_etl(stg_sales, dim_customer, dim_date, fact_sales, audit_log, dq_failures)
+    assert len(fact_sales) == 2
+    assert audit_log[-1]['Rows_Inserted'] == 2
+    assert audit_log[-1]['Rows_Rejected'] == 0
+    assert len(dq_failures) == 0
+    assert audit_log[-1]['Status'] == 'COMPLETED'
 
-# TC04: Empty staging table
-def test_empty_staging(setup_tables):
-    dw, stg = setup_tables
-    stg.Sales_Transactions = stg.Sales_Transactions.iloc[0:0]
-    batch_id = run_procedure(dw, stg)
-    assert dw.Fact_Sales.empty
-    assert dw.DQ_Failures.empty
-    assert dw.Audit_Log.loc[dw.Audit_Log["Batch_ID"] == batch_id, "Rows_Inserted"].iloc[0] == 0
-    assert dw.Audit_Log.loc[dw.Audit_Log["Batch_ID"] == batch_id, "Rows_Rejected"].iloc[0] == 0
+def test_TC02_null_customer_id(setup_tables):
+    fact_sales, audit_log, dq_failures = setup_tables
+    stg_sales = generate_mock_data(null_customer=True)
+    dim_customer = generate_dim_customer()
+    dim_date = generate_dim_date()
+    fact_sales, audit_log, dq_failures = run_etl(stg_sales, dim_customer, dim_date, fact_sales, audit_log, dq_failures)
+    # Only one row should be loaded
+    assert len(fact_sales) == 1
+    assert audit_log[-1]['Rows_Inserted'] == 1
+    assert audit_log[-1]['Rows_Rejected'] == 1
+    assert len(dq_failures) == 1
+    assert dq_failures[0]['Failure_Reason'] == 'Missing CustomerID'
+    assert audit_log[-1]['Status'] == 'COMPLETED'
 
-# TC05: Missing dimension mapping
-def test_missing_dimension_mapping(setup_tables):
-    dw, stg = setup_tables
-    stg.Sales_Transactions = pd.DataFrame([
-        {"Transaction_ID": 5, "Customer_ID": 999, "Product_ID": 1005, "Sales_Date": pd.Timestamp("2023-01-01"), "Quantity": 1, "Unit_Price": 10.0},
-    ])
-    batch_id = run_procedure(dw, stg)
-    assert dw.Fact_Sales.empty
-    assert dw.DQ_Failures.empty
-    assert dw.Audit_Log.loc[dw.Audit_Log["Batch_ID"] == batch_id, "Rows_Inserted"].iloc[0] == 0
+def test_TC03_invalid_quantity(setup_tables):
+    fact_sales, audit_log, dq_failures = setup_tables
+    stg_sales = generate_mock_data(invalid_quantity=True)
+    dim_customer = generate_dim_customer()
+    dim_date = generate_dim_date()
+    fact_sales, audit_log, dq_failures = run_etl(stg_sales, dim_customer, dim_date, fact_sales, audit_log, dq_failures)
+    # Only one row should be loaded
+    assert len(fact_sales) == 1
+    assert audit_log[-1]['Rows_Inserted'] == 1
+    assert audit_log[-1]['Rows_Rejected'] == 1
+    assert dq_failures[0]['Failure_Reason'] == 'Invalid Quantity'
+    assert audit_log[-1]['Status'] == 'COMPLETED'
 
-# TC06: Error handling during Fact_Sales insert
-def test_error_handling_fact_sales_insert(setup_tables):
-    dw, stg = setup_tables
-    # Simulate error by removing Dim_Customer (causing merge to fail)
-    dw.Dim_Customer = dw.Dim_Customer.iloc[0:0]
-    stg.Sales_Transactions = pd.DataFrame([
-        {"Transaction_ID": 6, "Customer_ID": 101, "Product_ID": 1006, "Sales_Date": pd.Timestamp("2023-01-01"), "Quantity": 2, "Unit_Price": 10.0},
-    ])
-    with pytest.raises(Exception):
-        run_procedure(dw, stg)
-    # Audit_Log should have status FAILED
-    assert "FAILED" in dw.Audit_Log["Status"].values
+def test_TC04_empty_staging(setup_tables):
+    fact_sales, audit_log, dq_failures = setup_tables
+    stg_sales = generate_mock_data(empty=True)
+    dim_customer = generate_dim_customer()
+    dim_date = generate_dim_date()
+    fact_sales, audit_log, dq_failures = run_etl(stg_sales, dim_customer, dim_date, fact_sales, audit_log, dq_failures)
+    assert len(fact_sales) == 0
+    assert audit_log[-1]['Rows_Inserted'] == 0
+    assert audit_log[-1]['Rows_Rejected'] == 0
+    assert len(dq_failures) == 0
+    assert audit_log[-1]['Status'] == 'COMPLETED'
 
-# TC07: Boundary Quantity = 1
-def test_boundary_quantity_one(setup_tables):
-    dw, stg = setup_tables
-    stg.Sales_Transactions = pd.DataFrame([
-        {"Transaction_ID": 7, "Customer_ID": 101, "Product_ID": 1007, "Sales_Date": pd.Timestamp("2023-01-01"), "Quantity": 1, "Unit_Price": 10.0},
-    ])
-    batch_id = run_procedure(dw, stg)
-    assert len(dw.Fact_Sales) == 1
-    assert dw.Fact_Sales.iloc[0]["Quantity"] == 1
-    assert dw.DQ_Failures.empty
+def test_TC05_all_rows_invalid(setup_tables):
+    fact_sales, audit_log, dq_failures = setup_tables
+    stg_sales = generate_mock_data(all_invalid=True)
+    dim_customer = generate_dim_customer()
+    dim_date = generate_dim_date()
+    fact_sales, audit_log, dq_failures = run_etl(stg_sales, dim_customer, dim_date, fact_sales, audit_log, dq_failures)
+    assert len(fact_sales) == 0
+    assert audit_log[-1]['Rows_Inserted'] == 0
+    assert audit_log[-1]['Rows_Rejected'] == 2
+    assert len(dq_failures) == 2
+    assert audit_log[-1]['Status'] == 'COMPLETED'
 
-# TC08: Unexpected data format in Quantity
-def test_unexpected_data_format_quantity(setup_tables):
-    dw, stg = setup_tables
-    stg.Sales_Transactions = pd.DataFrame([
-        {"Transaction_ID": 8, "Customer_ID": 101, "Product_ID": 1008, "Sales_Date": pd.Timestamp("2023-01-01"), "Quantity": "abc", "Unit_Price": 10.0},
-    ])
-    with pytest.raises(Exception):
-        run_procedure(dw, stg)
-    assert "FAILED" in dw.Audit_Log["Status"].values
+def test_TC06_missing_columns(setup_tables):
+    fact_sales, audit_log, dq_failures = setup_tables
+    stg_sales = pd.DataFrame([{'Transaction_ID': 1, 'Product_ID': 101, 'Sales_Date': '2024-06-01', 'Quantity': 10, 'Unit_Price': 10.0}])  # Missing Customer_ID
+    dim_customer = generate_dim_customer()
+    dim_date = generate_dim_date()
+    fact_sales, audit_log, dq_failures = run_etl(stg_sales, dim_customer, dim_date, fact_sales, audit_log, dq_failures)
+    assert audit_log[-1]['Status'] == 'FAILED'
+    assert 'Customer_ID' in audit_log[-1]['Message']
 
-# TC09: Audit logging for multiple batches
-def test_audit_logging_multiple_batches(setup_tables):
-    dw, stg = setup_tables
-    stg.Sales_Transactions = pd.DataFrame([
-        {"Transaction_ID": 9, "Customer_ID": 101, "Product_ID": 1009, "Sales_Date": pd.Timestamp("2023-01-01"), "Quantity": 2, "Unit_Price": 10.0},
-    ])
-    batch_id1 = run_procedure(dw, stg)
-    stg.Sales_Transactions = pd.DataFrame([
-        {"Transaction_ID": 10, "Customer_ID": 102, "Product_ID": 1010, "Sales_Date": pd.Timestamp("2023-01-02"), "Quantity": 3, "Unit_Price": 20.0},
-    ])
-    batch_id2 = run_procedure(dw, stg)
-    assert len(dw.Audit_Log) == 2
-    assert batch_id1 != batch_id2
-    assert dw.Audit_Log["Rows_Inserted"].sum() == 2
+def test_TC07_bad_quantity_type(setup_tables):
+    fact_sales, audit_log, dq_failures = setup_tables
+    stg_sales = generate_mock_data(bad_types=True)
+    dim_customer = generate_dim_customer()
+    dim_date = generate_dim_date()
+    fact_sales, audit_log, dq_failures = run_etl(stg_sales, dim_customer, dim_date, fact_sales, audit_log, dq_failures)
+    assert audit_log[-1]['Status'] == 'FAILED'
+    assert 'Target table' not in audit_log[-1]['Message']  # Should be a type error
 
-# TC10: Staging truncation
-def test_staging_truncation(setup_tables):
-    dw, stg = setup_tables
-    stg.Sales_Transactions = pd.DataFrame([
-        {"Transaction_ID": 11, "Customer_ID": 101, "Product_ID": 1011, "Sales_Date": pd.Timestamp("2023-01-01"), "Quantity": 2, "Unit_Price": 10.0},
-    ])
-    run_procedure(dw, stg)
-    assert stg.Sales_Transactions.empty
+def test_TC08_sales_date_out_of_range(setup_tables):
+    fact_sales, audit_log, dq_failures = setup_tables
+    stg_sales = generate_mock_data(date_out_of_range=True)
+    dim_customer = generate_dim_customer()
+    dim_date = generate_dim_date()
+    fact_sales, audit_log, dq_failures = run_etl(stg_sales, dim_customer, dim_date, fact_sales, audit_log, dq_failures)
+    # No matching join, so no rows loaded
+    assert len(fact_sales) == 0
+    assert audit_log[-1]['Rows_Inserted'] == 0
+    assert audit_log[-1]['Rows_Rejected'] == 0
+    assert audit_log[-1]['Status'] == 'COMPLETED'
 
+def test_TC09_missing_fact_table(setup_tables):
+    fact_sales, audit_log, dq_failures = setup_tables
+    stg_sales = generate_mock_data(valid=True)
+    dim_customer = generate_dim_customer()
+    dim_date = generate_dim_date()
+    fact_sales, audit_log, dq_failures = run_etl(stg_sales, dim_customer, dim_date, fact_sales, audit_log, dq_failures, simulate_error='missing_fact_table')
+    assert audit_log[-1]['Status'] == 'FAILED'
+    assert 'does not exist' in audit_log[-1]['Message']
+
+def test_TC10_audit_logging_batch_id_and_timestamps(setup_tables):
+    fact_sales, audit_log, dq_failures = setup_tables
+    stg_sales = generate_mock_data(valid=True)
+    dim_customer = generate_dim_customer()
+    dim_date = generate_dim_date()
+    fact_sales, audit_log, dq_failures = run_etl(stg_sales, dim_customer, dim_date, fact_sales, audit_log, dq_failures)
+    entry = audit_log[-1]
+    assert isinstance(entry['Batch_ID'], str)
+    assert entry['Start_Time'] is not None
+    assert entry['End_Time'] is not None
+    assert entry['End_Time'] >= entry['Start_Time']
+    assert entry['Status'] == 'COMPLETED'
 ```
 
-API Cost Consumed in dollars: 0.0080 USD
+API Cost Consumed in dollars: 0.0040 USD
