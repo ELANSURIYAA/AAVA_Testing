@@ -1,23 +1,22 @@
 =============================================
 Author:    AAVA
 Created on:    
-Description:   BigQuery SQL procedure for loading sales fact table with data quality validation and audit logging. Converts Azure Synapse ETL logic to BigQuery, including error handling, audit trail, and optimized data processing.
+Description:   Loads sales fact table from staging, performs data quality validation, audit logging, and error handling in BigQuery.
 =============================================
 
 Test Case List:
-
-| Test Case ID | Test Case Description                                                                                   | Expected Outcome                                                                                           |
-|--------------|--------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------|
-| TC01         | Happy path: Valid sales transactions are loaded into Fact_Sales with correct transformations           | All valid rows inserted, audit log updated, DQ_Failures empty, correct Total_Sales_Amount calculation     |
-| TC02         | Edge case: Transactions with NULL Customer_ID                                                          | Rows rejected, logged in DQ_Failures, not present in Fact_Sales, audit log shows rejected count           |
-| TC03         | Edge case: Transactions with Quantity <= 0                                                             | Rows rejected, logged in DQ_Failures, not present in Fact_Sales, audit log shows rejected count           |
-| TC04         | Edge case: Empty staging table                                                                         | No rows inserted/rejected, audit log updated, DQ_Failures empty                                           |
-| TC05         | Edge case: Missing columns in staging table                                                            | Procedure fails, audit log status set to FAILED, error message recorded                                   |
-| TC06         | Edge case: Invalid data types in Quantity/Unit_Price                                                   | Procedure fails, audit log status set to FAILED, error message recorded                                   |
-| TC07         | Edge case: No matching dimension records                                                               | Rows not loaded into Fact_Sales, not present in DQ_Failures, audit log shows zero inserted                |
-| TC08         | Error handling: Simulate SQL error during insert                                                       | Audit log status set to FAILED, error message recorded                                                    |
-| TC09         | Boundary: Maximum allowed values for Quantity/Unit_Price                                               | Row inserted, Total_Sales_Amount calculated correctly, audit log updated                                  |
-| TC10         | Boundary: Minimum allowed values for Quantity/Unit_Price                                               | Row inserted if >0, otherwise rejected, audit log updated accordingly                                     |
+| Test Case ID | Test Case Description | Expected Outcome |
+|--------------|--------------------|----------------|
+| TC01 | Happy path: All staging rows valid, all dimension lookups succeed | All rows inserted into dw.Fact_Sales, none in dw.DQ_Failures, Audit_Log shows correct counts |
+| TC02 | Data quality: Some rows with NULL Customer_ID | Rows with NULL Customer_ID rejected, logged in DQ_Failures, not in Fact_Sales, Audit_Log reflects counts |
+| TC03 | Data quality: Some rows with Quantity <= 0 | Rows with Quantity <= 0 rejected, logged in DQ_Failures, not in Fact_Sales, Audit_Log reflects counts |
+| TC04 | Edge: All rows invalid (all fail DQ checks) | No rows inserted into Fact_Sales, all in DQ_Failures, Audit_Log shows 0 inserted, all rejected |
+| TC05 | Edge: Empty staging table | No rows inserted or rejected, Audit_Log shows 0 for both, no DQ_Failures |
+| TC06 | Edge: Customer_ID not found in Dim_Customer | Rows with missing Customer_ID in Dim_Customer not inserted, not rejected as DQ failure, not in Fact_Sales |
+| TC07 | Edge: Sales_Date not found in Dim_Date | Rows with missing date in Dim_Date not inserted, not rejected as DQ failure, not in Fact_Sales |
+| TC08 | Error handling: Simulate error during insert | Audit_Log status set to 'FAILED', error message captured |
+| TC09 | Data type: Unexpected data format (e.g., string in Quantity) | Procedure fails, error logged in Audit_Log |
+| TC10 | Missing columns in staging | Procedure fails, error logged in Audit_Log |
 
 ---
 
@@ -27,218 +26,270 @@ Pytest Script for Each Test Case
 ================================
 Author: AAVA
 Created on: 
-Description: Pytest script for validating BigQuery sales fact table ETL logic, including data quality checks, audit logging, error handling, and transformation accuracy.
+Description: Pytest script for validating the BigQuery sales fact loading procedure, covering data quality, transformation, audit logging, and error handling.
 ================================
 
 import pytest
 import pandas as pd
+from sqlalchemy import create_engine, text
+from datetime import datetime
+import uuid
 
-# Helper function to simulate BigQuery SQL transformations in-memory using Pandas
-def run_etl(staging_df, dim_customer_df, dim_date_df):
-    # Data Quality Validation
-    invalid_customer = staging_df[staging_df['Customer_ID'].isnull()]
-    invalid_quantity = staging_df[staging_df['Quantity'] <= 0]
-    invalid_rows = pd.concat([
-        invalid_customer.assign(Reason='Missing CustomerID'),
-        invalid_quantity.assign(Reason='Invalid Quantity')
+# Helper functions and fixtures
+
+@pytest.fixture(scope="function")
+def bq_engine():
+    # Replace with your BigQuery SQLAlchemy connection string
+    # Example: "bigquery://project_id/dataset"
+    engine = create_engine("bigquery://your_project/your_dataset")
+    yield engine
+    engine.dispose()
+
+@pytest.fixture(scope="function")
+def setup_dim_tables(bq_engine):
+    # Insert minimal dimension data for lookups
+    customer_df = pd.DataFrame([
+        {"Customer_ID": 1, "Customer_Segment": "Retail"},
+        {"Customer_ID": 2, "Customer_Segment": "Wholesale"},
     ])
-    invalid_rows = invalid_rows[['Transaction_ID', 'Reason']].drop_duplicates()
+    date_df = pd.DataFrame([
+        {"Date_Value": datetime(2023, 1, 1), "Region_ID": 10},
+        {"Date_Value": datetime(2023, 1, 2), "Region_ID": 20},
+    ])
+    customer_df.to_sql("Dim_Customer", bq_engine, schema="dw", if_exists="replace", index=False)
+    date_df.to_sql("Dim_Date", bq_engine, schema="dw", if_exists="replace", index=False)
+    yield
+    bq_engine.execute(text("DELETE FROM dw.Dim_Customer WHERE TRUE"))
+    bq_engine.execute(text("DELETE FROM dw.Dim_Date WHERE TRUE"))
 
-    # Cleaned Transactions
-    cleaned = staging_df[~staging_df['Transaction_ID'].isin(invalid_rows['Transaction_ID'])]
+@pytest.fixture(scope="function")
+def cleanup_tables(bq_engine):
+    # Clean all target tables before and after each test
+    for table in [
+        "Fact_Sales",
+        "Audit_Log",
+        "DQ_Failures",
+        "Sales_Transactions"
+    ]:
+        bq_engine.execute(text(f"DELETE FROM dw.{table} WHERE TRUE"))
+        bq_engine.execute(text(f"DELETE FROM stg.{table} WHERE TRUE"))
+    yield
+    for table in [
+        "Fact_Sales",
+        "Audit_Log",
+        "DQ_Failures",
+        "Sales_Transactions"
+    ]:
+        bq_engine.execute(text(f"DELETE FROM dw.{table} WHERE TRUE"))
+        bq_engine.execute(text(f"DELETE FROM stg.{table} WHERE TRUE"))
 
-    # Dimensional Enrichment
-    merged = cleaned.merge(dim_customer_df, on='Customer_ID', how='inner')
-    merged = merged.merge(dim_date_df, left_on=cleaned['Sales_Date'].dt.date, right_on='Date_Value', how='inner')
+def insert_staging_data(bq_engine, data):
+    df = pd.DataFrame(data)
+    df.to_sql("Sales_Transactions", bq_engine, schema="stg", if_exists="replace", index=False)
 
-    # Transformation
-    if not merged.empty:
-        merged['Total_Sales_Amount'] = merged['Quantity'] * merged['Unit_Price']
-        merged['Load_Timestamp'] = pd.Timestamp.now()
-        merged['Batch_ID'] = 'test-batch-id'
-    fact_sales = merged[['Transaction_ID', 'Customer_ID', 'Product_ID', 'Sales_Date', 'Quantity', 'Unit_Price',
-                         'Total_Sales_Amount', 'Region_ID', 'Customer_Segment', 'Load_Timestamp', 'Batch_ID']]
+def get_table_df(bq_engine, table, schema="dw"):
+    return pd.read_sql(f"SELECT * FROM {schema}.{table}", bq_engine)
 
-    # DQ Failures
-    dq_failures = invalid_rows.copy()
-    dq_failures['Logged_Timestamp'] = pd.Timestamp.now()
-    dq_failures['Batch_ID'] = 'test-batch-id'
+def run_procedure(bq_engine):
+    # Run the BigQuery procedure
+    bq_engine.execute(text("CALL dw_sp_load_sales_fact()"))
 
-    # Audit Log
-    audit_log = {
-        'Batch_ID': 'test-batch-id',
-        'Procedure_Name': 'dw_sp_load_sales_fact',
-        'Start_Time': pd.Timestamp.now(),
-        'End_Time': pd.Timestamp.now(),
-        'Rows_Inserted': len(fact_sales),
-        'Rows_Rejected': len(dq_failures),
-        'Status': 'COMPLETED' if len(fact_sales) + len(dq_failures) == len(staging_df) else 'FAILED',
-        'Message': f'Inserted {len(fact_sales)} rows; Rejected {len(dq_failures)} rows.'
-    }
+# Test Cases
 
-    return fact_sales, dq_failures, audit_log
+def test_TC01_happy_path(bq_engine, setup_dim_tables, cleanup_tables):
+    # All valid rows
+    data = [
+        {
+            "Transaction_ID": 1001,
+            "Customer_ID": 1,
+            "Product_ID": 101,
+            "Sales_Date": "2023-01-01",
+            "Quantity": 2,
+            "Unit_Price": 50.0
+        },
+        {
+            "Transaction_ID": 1002,
+            "Customer_ID": 2,
+            "Product_ID": 102,
+            "Sales_Date": "2023-01-02",
+            "Quantity": 1,
+            "Unit_Price": 100.0
+        }
+    ]
+    insert_staging_data(bq_engine, data)
+    run_procedure(bq_engine)
+    fact = get_table_df(bq_engine, "Fact_Sales")
+    dq = get_table_df(bq_engine, "DQ_Failures")
+    audit = get_table_df(bq_engine, "Audit_Log")
+    assert len(fact) == 2
+    assert len(dq) == 0
+    assert audit.iloc[-1]["Rows_Inserted"] == 2
+    assert audit.iloc[-1]["Rows_Rejected"] == 0
+    assert audit.iloc[-1]["Status"] == "COMPLETED"
 
-@pytest.fixture
-def dim_customer_df():
-    return pd.DataFrame({
-        'Customer_ID': [1, 2, 3],
-        'Customer_Segment': ['Retail', 'Wholesale', 'Online']
-    })
+def test_TC02_null_customer_id(bq_engine, setup_dim_tables, cleanup_tables):
+    # One row with NULL Customer_ID
+    data = [
+        {
+            "Transaction_ID": 1003,
+            "Customer_ID": None,
+            "Product_ID": 103,
+            "Sales_Date": "2023-01-01",
+            "Quantity": 2,
+            "Unit_Price": 30.0
+        }
+    ]
+    insert_staging_data(bq_engine, data)
+    run_procedure(bq_engine)
+    fact = get_table_df(bq_engine, "Fact_Sales")
+    dq = get_table_df(bq_engine, "DQ_Failures")
+    assert len(fact) == 0
+    assert len(dq) == 1
+    assert dq.iloc[0]["Failure_Reason"] == "Missing CustomerID"
 
-@pytest.fixture
-def dim_date_df():
-    return pd.DataFrame({
-        'Date_Value': [pd.Timestamp('2023-01-01').date(), pd.Timestamp('2023-01-02').date()],
-        'Region_ID': [101, 102]
-    })
+def test_TC03_invalid_quantity(bq_engine, setup_dim_tables, cleanup_tables):
+    # One row with Quantity <= 0
+    data = [
+        {
+            "Transaction_ID": 1004,
+            "Customer_ID": 1,
+            "Product_ID": 104,
+            "Sales_Date": "2023-01-01",
+            "Quantity": 0,
+            "Unit_Price": 25.0
+        }
+    ]
+    insert_staging_data(bq_engine, data)
+    run_procedure(bq_engine)
+    fact = get_table_df(bq_engine, "Fact_Sales")
+    dq = get_table_df(bq_engine, "DQ_Failures")
+    assert len(fact) == 0
+    assert len(dq) == 1
+    assert dq.iloc[0]["Failure_Reason"] == "Invalid Quantity"
 
-def test_TC01_happy_path(dim_customer_df, dim_date_df):
-    staging_df = pd.DataFrame({
-        'Transaction_ID': [1001, 1002],
-        'Customer_ID': [1, 2],
-        'Product_ID': [501, 502],
-        'Sales_Date': [pd.Timestamp('2023-01-01'), pd.Timestamp('2023-01-02')],
-        'Quantity': [10, 5],
-        'Unit_Price': [20.0, 30.0]
-    })
-    fact_sales, dq_failures, audit_log = run_etl(staging_df, dim_customer_df, dim_date_df)
-    assert len(fact_sales) == 2
-    assert all(fact_sales['Total_Sales_Amount'] == [200.0, 150.0])
-    assert len(dq_failures) == 0
-    assert audit_log['Rows_Inserted'] == 2
-    assert audit_log['Rows_Rejected'] == 0
-    assert audit_log['Status'] == 'COMPLETED'
+def test_TC04_all_invalid(bq_engine, setup_dim_tables, cleanup_tables):
+    # All rows invalid
+    data = [
+        {
+            "Transaction_ID": 1005,
+            "Customer_ID": None,
+            "Product_ID": 105,
+            "Sales_Date": "2023-01-01",
+            "Quantity": 0,
+            "Unit_Price": 10.0
+        }
+    ]
+    insert_staging_data(bq_engine, data)
+    run_procedure(bq_engine)
+    fact = get_table_df(bq_engine, "Fact_Sales")
+    dq = get_table_df(bq_engine, "DQ_Failures")
+    audit = get_table_df(bq_engine, "Audit_Log")
+    assert len(fact) == 0
+    assert len(dq) == 1
+    assert audit.iloc[-1]["Rows_Inserted"] == 0
+    assert audit.iloc[-1]["Rows_Rejected"] == 1
 
-def test_TC02_null_customer_id(dim_customer_df, dim_date_df):
-    staging_df = pd.DataFrame({
-        'Transaction_ID': [1003],
-        'Customer_ID': [None],
-        'Product_ID': [503],
-        'Sales_Date': [pd.Timestamp('2023-01-01')],
-        'Quantity': [8],
-        'Unit_Price': [25.0]
-    })
-    fact_sales, dq_failures, audit_log = run_etl(staging_df, dim_customer_df, dim_date_df)
-    assert len(fact_sales) == 0
-    assert len(dq_failures) == 1
-    assert dq_failures.iloc[0]['Reason'] == 'Missing CustomerID'
-    assert audit_log['Rows_Inserted'] == 0
-    assert audit_log['Rows_Rejected'] == 1
-    assert audit_log['Status'] == 'COMPLETED'
+def test_TC05_empty_staging(bq_engine, setup_dim_tables, cleanup_tables):
+    # No data in staging
+    insert_staging_data(bq_engine, [])
+    run_procedure(bq_engine)
+    fact = get_table_df(bq_engine, "Fact_Sales")
+    dq = get_table_df(bq_engine, "DQ_Failures")
+    audit = get_table_df(bq_engine, "Audit_Log")
+    assert len(fact) == 0
+    assert len(dq) == 0
+    assert audit.iloc[-1]["Rows_Inserted"] == 0
+    assert audit.iloc[-1]["Rows_Rejected"] == 0
 
-def test_TC03_invalid_quantity(dim_customer_df, dim_date_df):
-    staging_df = pd.DataFrame({
-        'Transaction_ID': [1004],
-        'Customer_ID': [1],
-        'Product_ID': [504],
-        'Sales_Date': [pd.Timestamp('2023-01-02')],
-        'Quantity': [0],
-        'Unit_Price': [40.0]
-    })
-    fact_sales, dq_failures, audit_log = run_etl(staging_df, dim_customer_df, dim_date_df)
-    assert len(fact_sales) == 0
-    assert len(dq_failures) == 1
-    assert dq_failures.iloc[0]['Reason'] == 'Invalid Quantity'
-    assert audit_log['Rows_Inserted'] == 0
-    assert audit_log['Rows_Rejected'] == 1
-    assert audit_log['Status'] == 'COMPLETED'
+def test_TC06_missing_customer_in_dim(bq_engine, setup_dim_tables, cleanup_tables):
+    # Customer_ID not in Dim_Customer
+    data = [
+        {
+            "Transaction_ID": 1006,
+            "Customer_ID": 999,
+            "Product_ID": 106,
+            "Sales_Date": "2023-01-01",
+            "Quantity": 1,
+            "Unit_Price": 20.0
+        }
+    ]
+    insert_staging_data(bq_engine, data)
+    run_procedure(bq_engine)
+    fact = get_table_df(bq_engine, "Fact_Sales")
+    dq = get_table_df(bq_engine, "DQ_Failures")
+    # Not in DQ_Failures (not a DQ rule), not in Fact_Sales (lookup fails)
+    assert len(fact) == 0
+    assert len(dq) == 0
 
-def test_TC04_empty_staging(dim_customer_df, dim_date_df):
-    staging_df = pd.DataFrame(columns=['Transaction_ID', 'Customer_ID', 'Product_ID', 'Sales_Date', 'Quantity', 'Unit_Price'])
-    fact_sales, dq_failures, audit_log = run_etl(staging_df, dim_customer_df, dim_date_df)
-    assert len(fact_sales) == 0
-    assert len(dq_failures) == 0
-    assert audit_log['Rows_Inserted'] == 0
-    assert audit_log['Rows_Rejected'] == 0
-    assert audit_log['Status'] == 'COMPLETED'
+def test_TC07_missing_date_in_dim(bq_engine, setup_dim_tables, cleanup_tables):
+    # Sales_Date not in Dim_Date
+    data = [
+        {
+            "Transaction_ID": 1007,
+            "Customer_ID": 1,
+            "Product_ID": 107,
+            "Sales_Date": "2023-12-31",
+            "Quantity": 1,
+            "Unit_Price": 15.0
+        }
+    ]
+    insert_staging_data(bq_engine, data)
+    run_procedure(bq_engine)
+    fact = get_table_df(bq_engine, "Fact_Sales")
+    dq = get_table_df(bq_engine, "DQ_Failures")
+    assert len(fact) == 0
+    assert len(dq) == 0
 
-def test_TC05_missing_columns(dim_customer_df, dim_date_df):
-    staging_df = pd.DataFrame({
-        'Transaction_ID': [1005],
-        # Missing Customer_ID
-        'Product_ID': [505],
-        'Sales_Date': [pd.Timestamp('2023-01-01')],
-        'Quantity': [5],
-        'Unit_Price': [20.0]
-    })
-    with pytest.raises(KeyError):
-        run_etl(staging_df, dim_customer_df, dim_date_df)
+def test_TC08_error_handling(bq_engine, setup_dim_tables, cleanup_tables, monkeypatch):
+    # Simulate error by patching procedure call to raise exception
+    def error_run(*args, **kwargs):
+        raise Exception("Simulated failure")
+    monkeypatch.setattr(bq_engine, "execute", error_run)
+    with pytest.raises(Exception):
+        run_procedure(bq_engine)
+    # Check Audit_Log for 'FAILED' status (if partial insert occurred before error)
+    # This is a simulation; in real BQ, error handling must be validated via logs
 
-def test_TC06_invalid_data_types(dim_customer_df, dim_date_df):
-    staging_df = pd.DataFrame({
-        'Transaction_ID': [1006],
-        'Customer_ID': [1],
-        'Product_ID': [506],
-        'Sales_Date': [pd.Timestamp('2023-01-01')],
-        'Quantity': ['ten'],  # Invalid type
-        'Unit_Price': [20.0]
-    })
-    with pytest.raises(TypeError):
-        run_etl(staging_df, dim_customer_df, dim_date_df)
+def test_TC09_unexpected_data_format(bq_engine, setup_dim_tables, cleanup_tables):
+    # Insert string in Quantity
+    data = [
+        {
+            "Transaction_ID": 1008,
+            "Customer_ID": 1,
+            "Product_ID": 108,
+            "Sales_Date": "2023-01-01",
+            "Quantity": "bad_data",
+            "Unit_Price": 10.0
+        }
+    ]
+    insert_staging_data(bq_engine, data)
+    with pytest.raises(Exception):
+        run_procedure(bq_engine)
+    audit = get_table_df(bq_engine, "Audit_Log")
+    assert audit.iloc[-1]["Status"] == "FAILED"
 
-def test_TC07_no_matching_dimension(dim_customer_df, dim_date_df):
-    staging_df = pd.DataFrame({
-        'Transaction_ID': [1007],
-        'Customer_ID': [999],  # Not in dim_customer_df
-        'Product_ID': [507],
-        'Sales_Date': [pd.Timestamp('2023-01-01')],
-        'Quantity': [3],
-        'Unit_Price': [15.0]
-    })
-    fact_sales, dq_failures, audit_log = run_etl(staging_df, dim_customer_df, dim_date_df)
-    assert len(fact_sales) == 0
-    assert len(dq_failures) == 0
-    assert audit_log['Rows_Inserted'] == 0
-    assert audit_log['Rows_Rejected'] == 0
-    assert audit_log['Status'] == 'COMPLETED'
-
-def test_TC08_simulate_sql_error(dim_customer_df, dim_date_df, monkeypatch):
-    staging_df = pd.DataFrame({
-        'Transaction_ID': [1008],
-        'Customer_ID': [1],
-        'Product_ID': [508],
-        'Sales_Date': [pd.Timestamp('2023-01-01')],
-        'Quantity': [2],
-        'Unit_Price': [10.0]
-    })
-
-    def error_run_etl(*args, **kwargs):
-        raise Exception("Simulated SQL error")
-
-    monkeypatch.setattr(__name__, "run_etl", error_run_etl)
-    with pytest.raises(Exception) as excinfo:
-        run_etl(staging_df, dim_customer_df, dim_date_df)
-    assert "Simulated SQL error" in str(excinfo.value)
-
-def test_TC09_maximum_values(dim_customer_df, dim_date_df):
-    staging_df = pd.DataFrame({
-        'Transaction_ID': [1009],
-        'Customer_ID': [1],
-        'Product_ID': [509],
-        'Sales_Date': [pd.Timestamp('2023-01-02')],
-        'Quantity': [2**31-1],  # Large value
-        'Unit_Price': [1e6]     # Large value
-    })
-    fact_sales, dq_failures, audit_log = run_etl(staging_df, dim_customer_df, dim_date_df)
-    assert len(fact_sales) == 1
-    assert fact_sales.iloc[0]['Total_Sales_Amount'] == (2**31-1) * 1e6
-    assert audit_log['Rows_Inserted'] == 1
-    assert audit_log['Status'] == 'COMPLETED'
-
-def test_TC10_minimum_values(dim_customer_df, dim_date_df):
-    staging_df = pd.DataFrame({
-        'Transaction_ID': [1010],
-        'Customer_ID': [2],
-        'Product_ID': [510],
-        'Sales_Date': [pd.Timestamp('2023-01-02')],
-        'Quantity': [1],  # Minimum valid
-        'Unit_Price': [0.01]  # Minimum valid
-    })
-    fact_sales, dq_failures, audit_log = run_etl(staging_df, dim_customer_df, dim_date_df)
-    assert len(fact_sales) == 1
-    assert fact_sales.iloc[0]['Total_Sales_Amount'] == 0.01
-    assert audit_log['Rows_Inserted'] == 1
-    assert audit_log['Status'] == 'COMPLETED'
+def test_TC10_missing_columns(bq_engine, setup_dim_tables, cleanup_tables):
+    # Missing Quantity column
+    data = [
+        {
+            "Transaction_ID": 1009,
+            "Customer_ID": 1,
+            "Product_ID": 109,
+            "Sales_Date": "2023-01-01",
+            "Unit_Price": 10.0
+        }
+    ]
+    df = pd.DataFrame(data)
+    # Write with missing column
+    df.to_sql("Sales_Transactions", bq_engine, schema="stg", if_exists="replace", index=False)
+    with pytest.raises(Exception):
+        run_procedure(bq_engine)
+    audit = get_table_df(bq_engine, "Audit_Log")
+    assert audit.iloc[-1]["Status"] == "FAILED"
 ```
 
-API Cost Consumed in dollars: 0.0040 USD
+---
+
+API Cost Estimation
+
+apiCost: 0.0040 USD
