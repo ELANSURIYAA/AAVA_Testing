@@ -1,11 +1,24 @@
 # DI Synapse To Bigquery Conversion
 
-Pipeline ID: 2499
-Triggered By: abhishekjaiswal.d@ascendion.com
+## Workflow Information
 
-Inputs:
+- **Pipeline ID:** 2499
+- **Triggered By:** abhishekjaiswal.d@ascendion.com
+
+## Folder Structure
+
+- Each subfolder represents one input file
+- Each file inside the subfolder represents an agent output
+
+## Inputs
 - employee_sales_management
 - DI_Azure_Synapse_To_Bigquery_Analyzer
 
-Execution ID: 4573da7f-b98d-4026-ac76-70679d56b2a9
-Execution Time: 2025-12-23 07:33:21 UTC
+## Execution Details
+
+- Execution Time: 2026-01-02 03:33:04 UTC
+- Execution ID: 8dd2d130-3a01-449f-afa0-7b3b18dd3fcc
+
+## Notes
+
+This README is auto-generated during workflow execution.
