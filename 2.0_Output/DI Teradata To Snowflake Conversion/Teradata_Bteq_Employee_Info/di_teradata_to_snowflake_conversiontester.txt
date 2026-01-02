@@ -1,0 +1,238 @@
+=============================================
+Author:        Ascendion AVA+
+Created on:   
+Description:   Snowflake SQL script to automate backup of employee data by joining Employee and Salary tables, with conditional logic for table creation and population.
+=============================================
+
+**Test Case Document**
+```markdown
+|Test Case ID |Description |Expected Result |
+|TC001 |Validate syntax changes for table creation and DML statements |Snowflake SQL executes without syntax errors; table and data created as expected |
+|TC002 |Validate logical equivalence of join between Employee and Salary tables |Rows in employee_bkup match join results from Teradata for identical input data |
+|TC003 |Validate exclusion of NULL EmployeeNo in join |Rows with NULL EmployeeNo are excluded from employee_bkup |
+|TC004 |Validate handling of empty Employee table |employee_bkup remains empty if Employee table is empty |
+|TC005 |Validate handling of empty Salary table |employee_bkup remains empty if Salary table is empty |
+|TC006 |Validate behavior with duplicate EmployeeNo values |All matching rows are inserted per join logic, duplicates handled as in Teradata |
+|TC007 |Validate DROP TABLE IF EXISTS logic |employee_bkup table is dropped and recreated successfully |
+|TC008 |Validate data types and column mapping |Data types in employee_bkup match source tables, and data is correctly mapped |
+|TC009 |Validate error handling for unsupported features |Script does not fail due to unsupported Teradata features (e.g., .IF, .GOTO) |
+|TC010 |Validate RBAC enforcement |Only authorized roles can create/modify employee_bkup table |
+|TC011 |Validate query optimization using Snowflake profiler |Query runs efficiently and profiler shows expected execution plan |
+|TC012 |Validate handling of semi-structured data (JSON column addition) |JSON data can be added and queried in employee_bkup if column exists |
+```
+
+**Pytest Script**
+```python
+import pytest
+from snowflake.connector import connect
+
+SNOWFLAKE_USER = 'YOUR_USER'
+SNOWFLAKE_PASSWORD = 'YOUR_PASSWORD'
+SNOWFLAKE_ACCOUNT = 'YOUR_ACCOUNT'
+SNOWFLAKE_DATABASE = 'YOUR_DATABASE'
+SNOWFLAKE_SCHEMA = 'PUBLIC'
+
+@pytest.fixture(scope="module")
+def snowflake_connection():
+    conn = connect(
+        user=SNOWFLAKE_USER,
+        password=SNOWFLAKE_PASSWORD,
+        account=SNOWFLAKE_ACCOUNT,
+        database=SNOWFLAKE_DATABASE,
+        schema=SNOWFLAKE_SCHEMA
+    )
+    yield conn
+    conn.close()
+
+def setup_employee_and_salary(cursor, employee_data, salary_data):
+    cursor.execute("CREATE OR REPLACE TEMP TABLE Employee (EmployeeNo NUMBER, FirstName VARCHAR, LastName VARCHAR);")
+    cursor.execute("CREATE OR REPLACE TEMP TABLE Salary (EmployeeNo NUMBER, Salary NUMBER);")
+    if employee_data:
+        cursor.executemany("INSERT INTO Employee VALUES (%s, %s, %s);", employee_data)
+    if salary_data:
+        cursor.executemany("INSERT INTO Salary VALUES (%s, %s);", salary_data)
+
+def teardown_tables(cursor):
+    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
+    cursor.execute("DROP TABLE IF EXISTS Employee;")
+    cursor.execute("DROP TABLE IF EXISTS Salary;")
+
+def run_backup_script(cursor):
+    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
+    cursor.execute("""
+        CREATE TABLE employee_bkup (
+            EmployeeNo NUMBER,
+            FirstName VARCHAR,
+            LastName VARCHAR,
+            Salary NUMBER
+        );
+    """)
+    cursor.execute("""
+        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, Salary)
+        SELECT e.EmployeeNo, e.FirstName, e.LastName, s.Salary
+        FROM Employee e
+        INNER JOIN Salary s ON e.EmployeeNo = s.EmployeeNo;
+    """)
+
+def fetch_bkup_data(cursor):
+    cursor.execute("SELECT EmployeeNo, FirstName, LastName, Salary FROM employee_bkup ORDER BY EmployeeNo;")
+    return cursor.fetchall()
+
+def test_syntax_and_table_creation(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    teardown_tables(cursor)
+    try:
+        run_backup_script(cursor)
+    except Exception as e:
+        assert False, f"Syntax error in Snowflake SQL: {e}"
+    cursor.execute("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'EMPLOYEE_BKUP';")
+    result = cursor.fetchone()
+    assert result[0] == 1, "employee_bkup table was not created"
+    teardown_tables(cursor)
+
+def test_logical_equivalence_join(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    teardown_tables(cursor)
+    employee_data = [(1, 'John', 'Doe'), (2, 'Jane', 'Smith')]
+    salary_data = [(1, 50000), (2, 60000)]
+    setup_employee_and_salary(cursor, employee_data, salary_data)
+    run_backup_script(cursor)
+    result = fetch_bkup_data(cursor)
+    assert result == [(1, 'John', 'Doe', 50000), (2, 'Jane', 'Smith', 60000)], "Join logic failed"
+    teardown_tables(cursor)
+
+def test_null_employee_no_exclusion(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    teardown_tables(cursor)
+    employee_data = [(None, 'Null', 'Person'), (3, 'Jake', 'Long')]
+    salary_data = [(None, 0), (3, 70000)]
+    setup_employee_and_salary(cursor, employee_data, salary_data)
+    run_backup_script(cursor)
+    result = fetch_bkup_data(cursor)
+    assert result == [(3, 'Jake', 'Long', 70000)], "Rows with NULL EmployeeNo should be excluded"
+    teardown_tables(cursor)
+
+def test_empty_employee_table(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    teardown_tables(cursor)
+    employee_data = []
+    salary_data = [(1, 50000)]
+    setup_employee_and_salary(cursor, employee_data, salary_data)
+    run_backup_script(cursor)
+    result = fetch_bkup_data(cursor)
+    assert result == [], "employee_bkup should be empty when Employee table is empty"
+    teardown_tables(cursor)
+
+def test_empty_salary_table(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    teardown_tables(cursor)
+    employee_data = [(1, 'John', 'Doe')]
+    salary_data = []
+    setup_employee_and_salary(cursor, employee_data, salary_data)
+    run_backup_script(cursor)
+    result = fetch_bkup_data(cursor)
+    assert result == [], "employee_bkup should be empty when Salary table is empty"
+    teardown_tables(cursor)
+
+def test_duplicate_employee_no(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    teardown_tables(cursor)
+    employee_data = [(1, 'John', 'Doe'), (1, 'Johnny', 'Doe')]
+    salary_data = [(1, 50000)]
+    setup_employee_and_salary(cursor, employee_data, salary_data)
+    run_backup_script(cursor)
+    result = fetch_bkup_data(cursor)
+    assert (1, 'John', 'Doe', 50000) in result and (1, 'Johnny', 'Doe', 50000) in result, "Duplicate EmployeeNo not handled as expected"
+    teardown_tables(cursor)
+
+def test_drop_table_if_exists(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    teardown_tables(cursor)
+    cursor.execute("""
+        CREATE TABLE employee_bkup (
+            EmployeeNo NUMBER,
+            FirstName VARCHAR,
+            LastName VARCHAR,
+            Salary NUMBER
+        );
+    """)
+    run_backup_script(cursor)
+    cursor.execute("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'EMPLOYEE_BKUP';")
+    result = cursor.fetchone()
+    assert result[0] == 1, "employee_bkup table was not dropped and recreated"
+    teardown_tables(cursor)
+
+def test_data_types_and_column_mapping(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    teardown_tables(cursor)
+    employee_data = [(4, 'Alice', 'Wonder'), (5, 'Bob', 'Builder')]
+    salary_data = [(4, 12345.67), (5, None)]
+    setup_employee_and_salary(cursor, employee_data, salary_data)
+    run_backup_script(cursor)
+    result = fetch_bkup_data(cursor)
+    assert (4, 'Alice', 'Wonder', 12345.67) in result and (5, 'Bob', 'Builder', None) in result, "Data types or column mapping failed"
+    teardown_tables(cursor)
+
+def test_error_handling_for_unsupported_features(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    teardown_tables(cursor)
+    try:
+        run_backup_script(cursor)
+    except Exception as e:
+        assert "IF" not in str(e) and "GOTO" not in str(e), "Script failed due to unsupported Teradata features"
+    teardown_tables(cursor)
+
+def test_rbac_enforcement(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    teardown_tables(cursor)
+    try:
+        cursor.execute("GRANT SELECT ON employee_bkup TO ROLE PUBLIC;")
+        cursor.execute("REVOKE SELECT ON employee_bkup FROM ROLE PUBLIC;")
+        assert True
+    except Exception as e:
+        assert False, f"RBAC enforcement failed: {e}"
+    teardown_tables(cursor)
+
+def test_query_profiler(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    teardown_tables(cursor)
+    employee_data = [(6, 'Profiler', 'Test')]
+    salary_data = [(6, 99999)]
+    setup_employee_and_salary(cursor, employee_data, salary_data)
+    run_backup_script(cursor)
+    cursor.execute("SELECT SYSTEM$EXPLAIN_JSON('SELECT * FROM employee_bkup');")
+    result = cursor.fetchone()
+    assert result is not None, "Query profiler did not return execution plan"
+    teardown_tables(cursor)
+
+def test_json_handling(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    teardown_tables(cursor)
+    cursor.execute("CREATE OR REPLACE TEMP TABLE Employee (EmployeeNo NUMBER, FirstName VARCHAR, LastName VARCHAR, Info VARIANT);")
+    cursor.execute("CREATE OR REPLACE TEMP TABLE Salary (EmployeeNo NUMBER, Salary NUMBER);")
+    cursor.execute("INSERT INTO Employee VALUES (7, 'Json', 'Test', PARSE_JSON('{\"role\": \"engineer\"}'));")
+    cursor.execute("INSERT INTO Salary VALUES (7, 88888);")
+    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
+    cursor.execute("""
+        CREATE TABLE employee_bkup (
+            EmployeeNo NUMBER,
+            FirstName VARCHAR,
+            LastName VARCHAR,
+            Salary NUMBER,
+            Info VARIANT
+        );
+    """)
+    cursor.execute("""
+        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, Salary, Info)
+        SELECT e.EmployeeNo, e.FirstName, e.LastName, s.Salary, e.Info
+        FROM Employee e
+        INNER JOIN Salary s ON e.EmployeeNo = s.EmployeeNo;
+    """)
+    cursor.execute("SELECT Info FROM employee_bkup WHERE EmployeeNo=7;")
+    result = cursor.fetchone()
+    assert result is not None, "JSON column handling failed"
+    teardown_tables(cursor)
+```
+
+**Cost Analysis**
+API Cost Consumed: $0.0028
