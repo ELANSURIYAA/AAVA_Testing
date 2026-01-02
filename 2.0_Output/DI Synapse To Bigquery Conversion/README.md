@@ -1,0 +1,11 @@
+# DI Synapse To Bigquery Conversion
+
+Pipeline ID: 2499
+Triggered By: abhishekjaiswal.d@ascendion.com
+
+Inputs:
+- employee_sales_management
+- DI_Azure_Synapse_To_Bigquery_Analyzer
+
+Execution ID: ef16dcce-df6d-4632-bd00-439de7e17f8f
+Execution Time: 2026-01-02 04:33:15 UTC
