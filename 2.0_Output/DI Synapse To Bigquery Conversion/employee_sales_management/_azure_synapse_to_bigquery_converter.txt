@@ -1,0 +1,186 @@
+=============================================
+Author:        AAVA
+Created on:   
+Description:   Sales fact table loading procedure with data quality validation and audit logging
+=============================================
+
+-- BigQuery SQL: Sales Fact Table Loading Procedure with Data Quality Validation and Audit Logging
+
+CREATE OR REPLACE PROCEDURE dw.sp_load_sales_fact()
+BEGIN
+  -- =========================================================================
+  -- 1. Variable Declarations
+  -- =========================================================================
+  DECLARE batch_id STRING DEFAULT GENERATE_UUID();
+  DECLARE start_time DATETIME DEFAULT CURRENT_DATETIME();
+  DECLARE end_time DATETIME;
+  DECLARE rows_inserted INT64 DEFAULT 0;
+  DECLARE rows_rejected INT64 DEFAULT 0;
+  DECLARE error_message STRING;
+  DECLARE proc_name STRING DEFAULT 'dw.sp_load_sales_fact';
+
+  -- =========================================================================
+  -- 2. Start Audit Logging
+  -- =========================================================================
+  INSERT INTO dw.Audit_Log
+  (
+    Batch_ID,
+    Procedure_Name,
+    Start_Time,
+    Status,
+    Message
+  )
+  VALUES
+  (
+    batch_id,
+    proc_name,
+    start_time,
+    'STARTED',
+    'Sales Fact Load Initiated'
+  );
+
+  -- =========================================================================
+  -- 3. Data Quality Checks (CTE for Invalid Rows)
+  -- =========================================================================
+  WITH InvalidRows AS (
+    SELECT Transaction_ID, 'Missing CustomerID' AS Reason
+    FROM stg.Sales_Transactions
+    WHERE Customer_ID IS NULL
+
+    UNION ALL
+
+    SELECT Transaction_ID, 'Invalid Quantity' AS Reason
+    FROM stg.Sales_Transactions
+    WHERE Quantity <= 0
+  ),
+
+  -- =========================================================================
+  -- 4. Cleaned Transactions (Remove Invalid Rows)
+  -- =========================================================================
+  Cleaned_Transactions AS (
+    SELECT *
+    FROM stg.Sales_Transactions s
+    WHERE NOT EXISTS (
+      SELECT 1 FROM InvalidRows i WHERE s.Transaction_ID = i.Transaction_ID
+    )
+  ),
+
+  -- =========================================================================
+  -- 5. Transformed Data for Fact Table Load
+  -- =========================================================================
+  transformed AS (
+    SELECT
+      s.Transaction_ID,
+      s.Customer_ID,
+      s.Product_ID,
+      s.Sales_Date,
+      s.Quantity,
+      s.Unit_Price,
+      s.Quantity * s.Unit_Price AS Total_Sales_Amount,
+      d.Region_ID,
+      c.Customer_Segment,
+      CURRENT_DATETIME() AS Load_Timestamp,
+      batch_id AS Batch_ID
+    FROM Cleaned_Transactions s
+    INNER JOIN dw.Dim_Customer c
+      ON s.Customer_ID = c.Customer_ID
+    INNER JOIN dw.Dim_Date d
+      ON DATE(s.Sales_Date) = d.Date_Value
+  )
+
+  -- =========================================================================
+  -- 6. Load Cleaned and Transformed Data into Fact Table
+  -- =========================================================================
+  INSERT INTO dw.Fact_Sales
+  (
+    Transaction_ID,
+    Customer_ID,
+    Product_ID,
+    Sales_Date,
+    Quantity,
+    Unit_Price,
+    Total_Sales_Amount,
+    Region_ID,
+    Customer_Segment,
+    Load_Timestamp,
+    Batch_ID
+  )
+  SELECT *
+  FROM transformed;
+
+  -- Track number of inserted rows
+  SET rows_inserted = (SELECT COUNT(*) FROM transformed);
+
+  -- =========================================================================
+  -- 7. Delete Invalid Rows from Staging Table
+  -- =========================================================================
+  DELETE FROM stg.Sales_Transactions
+  WHERE Transaction_ID IN (SELECT Transaction_ID FROM InvalidRows);
+
+  -- Track number of rejected rows
+  SET rows_rejected = (SELECT COUNT(*) FROM InvalidRows);
+
+  -- =========================================================================
+  -- 8. Truncate Staging Table (Optional)
+  -- =========================================================================
+  -- If you want to fully truncate the staging table after processing, uncomment:
+  -- TRUNCATE TABLE stg.Sales_Transactions;
+
+  -- =========================================================================
+  -- 9. Log Validation Failures
+  -- =========================================================================
+  INSERT INTO dw.DQ_Failures
+  (
+    Transaction_ID,
+    Failure_Reason,
+    Logged_Timestamp,
+    Batch_ID
+  )
+  SELECT 
+    Transaction_ID,
+    Reason,
+    CURRENT_DATETIME(),
+    batch_id
+  FROM InvalidRows;
+
+  -- =========================================================================
+  -- 10. End Audit Log
+  -- =========================================================================
+  SET end_time = CURRENT_DATETIME();
+
+  UPDATE dw.Audit_Log
+  SET 
+    End_Time = end_time,
+    Rows_Inserted = rows_inserted,
+    Rows_Rejected = rows_rejected,
+    Status = 'COMPLETED',
+    Message = CONCAT('Inserted ', CAST(rows_inserted AS STRING), ' rows; Rejected ', CAST(rows_rejected AS STRING), ' rows.')
+  WHERE Batch_ID = batch_id;
+
+EXCEPTION WHEN ERROR THEN
+  SET end_time = CURRENT_DATETIME();
+  SET error_message = ERROR_MESSAGE();
+
+  UPDATE dw.Audit_Log
+  SET 
+    End_Time = end_time,
+    Status = 'FAILED',
+    Message = error_message
+  WHERE Batch_ID = batch_id;
+
+  -- Optionally, re-raise the error for external monitoring
+  RAISE USING MESSAGE = error_message;
+
+END;
+
+-- =========================================================================
+-- Notes:
+-- - All table names are generic; adjust dataset references as needed.
+-- - For large tables, consider partitioning and clustering for performance.
+-- - All variable assignments, error handling, and audit logging are handled in BigQuery scripting style.
+-- - Data quality checks and invalid row removal are performed via CTEs.
+-- - Staging table truncation is optional and can be enabled as required.
+-- - Ensure all referenced tables exist in your BigQuery environment.
+-- =========================================================================
+
+API Cost Consumed in dollars: 0.0040 USD
