@@ -1,0 +1,371 @@
+=============================================
+Author:        AAVA
+Date:   
+Description:   Unit tests and Pytest script for validating the Fabric implementation of the LOAD_FACT_EXECUTIVE_SUMMARY logic (converted from Synapse stored procedure). Ensures correctness of data transformation, joins, business rules, and error handling for loading FACT_EXECUTIVE_SUMMARY from STG_HOLDING_METRICS.
+=============================================
+
+1. Test Case List:
+
+| Test Case ID | Test Case Description                                                                                  | Expected Outcome                                                                                                    |
+|--------------|-------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: All staging and dimension data present and valid                                           | All records inserted into FACT_EXECUTIVE_SUMMARY with correct mappings and calculations                            |
+| TC02         | Edge: income_amount is NULL                                                                            | income_amount in FACT_EXECUTIVE_SUMMARY is 0                                                                        |
+| TC03         | Edge: income_amount is negative                                                                        | income_amount in FACT_EXECUTIVE_SUMMARY is 0                                                                        |
+| TC04         | Edge: Missing dimension key in DIM_DATE                                                                | Record with missing date_key is not inserted into FACT_EXECUTIVE_SUMMARY                                            |
+| TC05         | Edge: Missing dimension key in DIM_INSTITUTION                                                         | Record with missing institution_id is not inserted into FACT_EXECUTIVE_SUMMARY                                      |
+| TC06         | Edge: Missing dimension key in DIM_CORPORATION                                                         | Record with missing corporation_id is not inserted into FACT_EXECUTIVE_SUMMARY                                      |
+| TC07         | Edge: Missing dimension key in DIM_PRODUCT                                                             | Record with missing product_id is not inserted into FACT_EXECUTIVE_SUMMARY                                          |
+| TC08         | Edge: Empty staging table                                                                              | No records inserted into FACT_EXECUTIVE_SUMMARY                                                                     |
+| TC09         | Error: Staging table missing required column (e.g., a120_amount)                                       | Exception raised or handled; no records inserted, error logged                                                      |
+| TC10         | Error: Unexpected data type in staging (e.g., income_amount is string)                                 | Exception raised or handled; no records inserted, error logged                                                      |
+| TC11         | Edge: All fields NULL except keys (should load with NULLs/0s as per business rules)                    | Record inserted with NULLs/0s as per transformation logic                                                           |
+| TC12         | Edge: Multiple records with same keys (no aggregation, all loaded)                                     | All records loaded as-is (no aggregation performed)                                                                 |
+
+---
+
+2. Pytest Script for Each Test Case
+
+```python
+=============================================
+Author:        AAVA
+Date:   
+Description:   Pytest script for unit testing the Fabric implementation of LOAD_FACT_EXECUTIVE_SUMMARY logic.
+=============================================
+
+import pytest
+import pandas as pd
+from pandas.testing import assert_frame_equal
+
+# Helper function to simulate the transformation logic
+def load_fact_executive_summary(
+    stg_holding_metrics: pd.DataFrame,
+    dim_date: pd.DataFrame,
+    dim_institution: pd.DataFrame,
+    dim_corporation: pd.DataFrame,
+    dim_product: pd.DataFrame
+) -> pd.DataFrame:
+    # Join staging with dimensions
+    df = stg_holding_metrics \
+        .merge(dim_date, left_on='date_value', right_on='date_key', how='inner', suffixes=('', '_dt')) \
+        .merge(dim_institution, left_on='institution_id', right_on='institution_id', how='inner', suffixes=('', '_inst')) \
+        .merge(dim_corporation, left_on='corporation_id', right_on='corporation_id', how='inner', suffixes=('', '_corp')) \
+        .merge(dim_product, left_on='product_id', right_on='product_id', how='inner', suffixes=('', '_prod'))
+
+    # Apply business rule for income_amount
+    df['income_amount'] = df['income_amount'].apply(lambda x: 0 if pd.isnull(x) or (isinstance(x, (int, float)) and x < 0) else x)
+
+    # Select and rename columns as per fact table
+    fact = df[[
+        'date_key', 'institution_id', 'corporation_id', 'product_id',
+        'a120_amount', 'a120_count',
+        'a30_to_59_amount', 'a30_to_59_count',
+        'a60_to_89_amount', 'a60_to_89_count',
+        'a90_to_119_amount', 'a90_to_119_count',
+        'charge_off_amount', 'charge_off_count',
+        'fraud_amount', 'fraud_count',
+        'income_amount', 'number_of_accounts',
+        'purchases_amount', 'purchases_count'
+    ]].copy()
+    return fact
+
+# Fixtures for dimension tables
+@pytest.fixture
+def dim_date():
+    return pd.DataFrame({'date_key': [20230101, 20230102]})
+
+@pytest.fixture
+def dim_institution():
+    return pd.DataFrame({'institution_id': [1, 2]})
+
+@pytest.fixture
+def dim_corporation():
+    return pd.DataFrame({'corporation_id': [10, 20]})
+
+@pytest.fixture
+def dim_product():
+    return pd.DataFrame({'product_id': [100, 200]})
+
+# --- Test Cases ---
+
+def test_happy_path(dim_date, dim_institution, dim_corporation, dim_product):
+    # TC01
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': [1000],
+        'a120_count': [5],
+        'a30_to_59_amount': [200],
+        'a30_to_59_count': [2],
+        'a60_to_89_amount': [300],
+        'a60_to_89_count': [3],
+        'a90_to_119_amount': [400],
+        'a90_to_119_count': [4],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [1],
+        'income_amount': [1234],
+        'number_of_accounts': [10],
+        'purchases_amount': [999],
+        'purchases_count': [6]
+    })
+    expected = stg.copy()
+    expected = expected.rename(columns={'date_value': 'date_key'})
+    expected['income_amount'] = 1234
+    result = load_fact_executive_summary(stg, dim_date, dim_institution, dim_corporation, dim_product)
+    assert_frame_equal(result.reset_index(drop=True), expected[result.columns].reset_index(drop=True))
+
+def test_income_amount_null(dim_date, dim_institution, dim_corporation, dim_product):
+    # TC02
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': [1000],
+        'a120_count': [5],
+        'a30_to_59_amount': [200],
+        'a30_to_59_count': [2],
+        'a60_to_89_amount': [300],
+        'a60_to_89_count': [3],
+        'a90_to_119_amount': [400],
+        'a90_to_119_count': [4],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [1],
+        'income_amount': [None],
+        'number_of_accounts': [10],
+        'purchases_amount': [999],
+        'purchases_count': [6]
+    })
+    result = load_fact_executive_summary(stg, dim_date, dim_institution, dim_corporation, dim_product)
+    assert result['income_amount'].iloc[0] == 0
+
+def test_income_amount_negative(dim_date, dim_institution, dim_corporation, dim_product):
+    # TC03
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': [1000],
+        'a120_count': [5],
+        'a30_to_59_amount': [200],
+        'a30_to_59_count': [2],
+        'a60_to_89_amount': [300],
+        'a60_to_89_count': [3],
+        'a90_to_119_amount': [400],
+        'a90_to_119_count': [4],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [1],
+        'income_amount': [-50],
+        'number_of_accounts': [10],
+        'purchases_amount': [999],
+        'purchases_count': [6]
+    })
+    result = load_fact_executive_summary(stg, dim_date, dim_institution, dim_corporation, dim_product)
+    assert result['income_amount'].iloc[0] == 0
+
+def test_missing_dim_date(dim_institution, dim_corporation, dim_product):
+    # TC04
+    dim_date = pd.DataFrame({'date_key': [20230102]})  # No match for 20230101
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': [1000],
+        'a120_count': [5],
+        'a30_to_59_amount': [200],
+        'a30_to_59_count': [2],
+        'a60_to_89_amount': [300],
+        'a60_to_89_count': [3],
+        'a90_to_119_amount': [400],
+        'a90_to_119_count': [4],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [1],
+        'income_amount': [1234],
+        'number_of_accounts': [10],
+        'purchases_amount': [999],
+        'purchases_count': [6]
+    })
+    result = load_fact_executive_summary(stg, dim_date, dim_institution, dim_corporation, dim_product)
+    assert result.empty
+
+def test_missing_dim_institution(dim_date, dim_corporation, dim_product):
+    # TC05
+    dim_institution = pd.DataFrame({'institution_id': [2]})  # No match for 1
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': [1000],
+        'a120_count': [5],
+        'a30_to_59_amount': [200],
+        'a30_to_59_count': [2],
+        'a60_to_89_amount': [300],
+        'a60_to_89_count': [3],
+        'a90_to_119_amount': [400],
+        'a90_to_119_count': [4],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [1],
+        'income_amount': [1234],
+        'number_of_accounts': [10],
+        'purchases_amount': [999],
+        'purchases_count': [6]
+    })
+    result = load_fact_executive_summary(stg, dim_date, dim_institution, dim_corporation, dim_product)
+    assert result.empty
+
+def test_missing_dim_corporation(dim_date, dim_institution, dim_product):
+    # TC06
+    dim_corporation = pd.DataFrame({'corporation_id': [20]})  # No match for 10
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': [1000],
+        'a120_count': [5],
+        'a30_to_59_amount': [200],
+        'a30_to_59_count': [2],
+        'a60_to_89_amount': [300],
+        'a60_to_89_count': [3],
+        'a90_to_119_amount': [400],
+        'a90_to_119_count': [4],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [1],
+        'income_amount': [1234],
+        'number_of_accounts': [10],
+        'purchases_amount': [999],
+        'purchases_count': [6]
+    })
+    result = load_fact_executive_summary(stg, dim_date, dim_institution, dim_corporation, dim_product)
+    assert result.empty
+
+def test_missing_dim_product(dim_date, dim_institution, dim_corporation):
+    # TC07
+    dim_product = pd.DataFrame({'product_id': [200]})  # No match for 100
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': [1000],
+        'a120_count': [5],
+        'a30_to_59_amount': [200],
+        'a30_to_59_count': [2],
+        'a60_to_89_amount': [300],
+        'a60_to_89_count': [3],
+        'a90_to_119_amount': [400],
+        'a90_to_119_count': [4],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [1],
+        'income_amount': [1234],
+        'number_of_accounts': [10],
+        'purchases_amount': [999],
+        'purchases_count': [6]
+    })
+    result = load_fact_executive_summary(stg, dim_date, dim_institution, dim_corporation, dim_product)
+    assert result.empty
+
+def test_empty_staging(dim_date, dim_institution, dim_corporation, dim_product):
+    # TC08
+    stg = pd.DataFrame(columns=[
+        'date_value', 'institution_id', 'corporation_id', 'product_id',
+        'a120_amount', 'a120_count',
+        'a30_to_59_amount', 'a30_to_59_count',
+        'a60_to_89_amount', 'a60_to_89_count',
+        'a90_to_119_amount', 'a90_to_119_count',
+        'charge_off_amount', 'charge_off_count',
+        'fraud_amount', 'fraud_count',
+        'income_amount', 'number_of_accounts',
+        'purchases_amount', 'purchases_count'
+    ])
+    result = load_fact_executive_summary(stg, dim_date, dim_institution, dim_corporation, dim_product)
+    assert result.empty
+
+def test_missing_column(dim_date, dim_institution, dim_corporation, dim_product):
+    # TC09
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        # 'a120_amount' missing
+        'a120_count': [5],
+        'a30_to_59_amount': [200],
+        'a30_to_59_count': [2],
+        'a60_to_89_amount': [300],
+        'a60_to_89_count': [3],
+        'a90_to_119_amount': [400],
+        'a90_to_119_count': [4],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [1],
+        'income_amount': [1234],
+        'number_of_accounts': [10],
+        'purchases_amount': [999],
+        'purchases_count': [6]
+    })
+    with pytest.raises(KeyError):
+        load_fact_executive_summary(stg, dim_date, dim_institution, dim_corporation, dim_product)
+
+def test_invalid_data_type(dim_date, dim_institution, dim_corporation, dim_product):
+    # TC10
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': [1000],
+        'a120_count': [5],
+        'a30_to_59_amount': [200],
+        'a30_to_59_count': [2],
+        'a60_to_89_amount': [300],
+        'a60_to_89_count': [3],
+        'a90_to_119_amount': [400],
+        'a90_to_119_count': [4],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [1],
+        'income_amount': ['not_a_number'],
+        'number_of_accounts': [10],
+        'purchases_amount': [999],
+        'purchases_count': [6]
+    })
+    # Should raise or coerce error in income_amount transformation
+    with pytest.raises(Exception):
+        load_fact_executive_summary(stg, dim_date, dim_institution, dim_corporation, dim_product)
+
+def test_all_nulls_except_keys(dim_date, dim_institution, dim_corporation, dim_product):
+    # TC11
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': [None],
+        'a120_count': [None],
+        'a30_to_59_amount': [None],
+        'a30_to_59_count': [None],
+        'a60_to_89_amount': [None],
+        'a60_to_89_count': [None],
+        'a90_to_119_amount': [None],
+        'a90_to
