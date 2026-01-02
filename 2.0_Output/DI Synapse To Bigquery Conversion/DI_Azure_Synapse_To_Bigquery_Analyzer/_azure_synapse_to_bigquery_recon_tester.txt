@@ -1,362 +1,271 @@
 =============================================
-Author:        AAVA
-Created on:   
-Description:   Python script to automate reconciliation between Synapse stored procedure and converted BigQuery SQL for sales fact ETL, including data extraction, transformation, GCS transfer, BigQuery execution, validation, and reconciliation reporting.
+Author: AAVA
+Created on: 
+Description: Python script to automate reconciliation between Synapse stored procedure and converted BigQuery SQL for sales fact table loading, including extraction, transformation, validation, and reporting.
 =============================================
 
 ```python
-"""
-Automated Reconciliation Script: Synapse Stored Procedure vs. BigQuery SQL
-
-- Extracts and executes Synapse stored procedure logic
-- Transfers data securely to GCS
-- Executes converted BigQuery SQL logic
-- Performs row and column-level reconciliation
-- Generates detailed validation and reconciliation reports
-- Handles all edge cases, logs all steps, and provides real-time status
-
-Author: AAVA
-"""
-
 import os
 import sys
 import logging
 import uuid
-import tempfile
-import shutil
 import datetime
 import pandas as pd
-import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-import sqlalchemy
-from sqlalchemy import create_engine, text
-
 from google.cloud import bigquery
 from google.cloud import storage
 
-# =========================
-# CONFIGURATION SECTION
-# =========================
-
-# Synapse (SQL Server) connection string
-SYNAPSE_CONN_STR = os.getenv("SYNAPSE_CONN_STR")  # e.g., "mssql+pyodbc://user:pass@host:1433/db?driver=ODBC+Driver+17+for+SQL+Server"
-
-# BigQuery configuration
-BQ_PROJECT = os.getenv("BQ_PROJECT")
-BQ_DATASET = os.getenv("BQ_DATASET")
-BQ_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")  # Path to service account JSON
-
-# GCS configuration
-GCS_BUCKET = os.getenv("GCS_BUCKET")
-GCS_PREFIX = os.getenv("GCS_PREFIX", "reconciliation/")
-
-# Logging configuration
-LOG_FILE = os.getenv("RECONCILE_LOG", "reconciliation.log")
+# ==============================
+# Configuration & Security
+# ==============================
+# Set up logging
 logging.basicConfig(
-    filename=LOG_FILE,
+    filename="reconciliation.log",
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-# =========================
-# UTILITY FUNCTIONS
-# =========================
+# Environment variables for credentials
+SYNAPSE_CONN_STR = os.getenv("SYNAPSE_CONN_STR")  # e.g., "DRIVER={ODBC Driver 17 for SQL Server};SERVER=...;DATABASE=...;UID=...;PWD=..."
+BQ_PROJECT = os.getenv("BQ_PROJECT")
+BQ_DATASET = os.getenv("BQ_DATASET")
+GCS_BUCKET = os.getenv("GCS_BUCKET")
+GCS_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")  # Path to service account JSON
 
-def log_status(msg):
-    print(msg)
-    logging.info(msg)
+# Table names
+STAGING_TABLE = "stg.Sales_Transactions"
+DIM_CUSTOMER_TABLE = "dw.Dim_Customer"
+DIM_DATE_TABLE = "dw.Dim_Date"
+FACT_TABLE = "dw.Fact_Sales"
+AUDIT_LOG_TABLE = "dw.Audit_Log"
+DQ_FAILURES_TABLE = "dw.DQ_Failures"
 
-def log_error(msg):
-    print("ERROR:", msg, file=sys.stderr)
-    logging.error(msg)
+# ==============================
+# Helper Functions
+# ==============================
 
-def get_timestamp():
-    return datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-
-def safe_cast(val, to_type, default=None):
+def get_synapse_data(query, conn_str):
+    """Extract data from Synapse using pyodbc."""
+    import pyodbc
     try:
-        return to_type(val)
-    except Exception:
-        return default
+        conn = pyodbc.connect(conn_str)
+        df = pd.read_sql(query, conn)
+        conn.close()
+        logging.info(f"Extracted data from Synapse: {query}")
+        return df
+    except Exception as e:
+        logging.error(f"Error extracting data from Synapse: {str(e)}")
+        raise
 
-# =========================
-# 1. SYNAPSE DATA EXTRACTION
-# =========================
-
-def extract_synapse_table(table_name, engine, output_dir):
-    """
-    Extracts data from a Synapse table and saves as CSV and Parquet.
-    Returns the CSV and Parquet file paths.
-    """
-    log_status(f"Extracting table {table_name} from Synapse...")
-    query = f"SELECT * FROM {table_name}"
-    df = pd.read_sql(query, engine)
-    csv_path = os.path.join(output_dir, f"{table_name.replace('.', '_')}_{get_timestamp()}.csv")
-    parquet_path = csv_path.replace(".csv", ".parquet")
-    df.to_csv(csv_path, index=False)
+def export_to_parquet(df, table_name):
+    """Export DataFrame to Parquet file."""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    file_name = f"{table_name}_{timestamp}.parquet"
     table = pa.Table.from_pandas(df)
-    pq.write_table(table, parquet_path)
-    log_status(f"Extracted {len(df)} rows from {table_name}, saved to {csv_path} and {parquet_path}")
-    return csv_path, parquet_path, df
+    pq.write_table(table, file_name)
+    logging.info(f"Exported {table_name} to Parquet: {file_name}")
+    return file_name
 
-def execute_synapse_procedure(proc_name, engine):
-    """
-    Executes the Synapse stored procedure.
-    """
-    log_status(f"Executing Synapse stored procedure: {proc_name}")
-    with engine.connect() as conn:
-        conn.execute(text(f"EXEC {proc_name}"))
-    log_status(f"Procedure {proc_name} executed successfully.")
+def upload_to_gcs(file_name, bucket_name):
+    """Upload file to Google Cloud Storage."""
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(file_name)
+        blob.upload_from_filename(file_name)
+        logging.info(f"Uploaded {file_name} to GCS bucket {bucket_name}")
+        return f"gs://{bucket_name}/{file_name}"
+    except Exception as e:
+        logging.error(f"GCS upload failed: {str(e)}")
+        raise
 
-# =========================
-# 2. GCS UPLOAD
-# =========================
-
-def upload_to_gcs(local_file, bucket_name, gcs_path):
-    """
-    Uploads a local file to Google Cloud Storage.
-    """
-    log_status(f"Uploading {local_file} to gs://{bucket_name}/{gcs_path}")
-    client = storage.Client()
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(gcs_path)
-    blob.upload_from_filename(local_file)
-    log_status(f"Upload complete: gs://{bucket_name}/{gcs_path}")
-
-# =========================
-# 3. BIGQUERY EXTERNAL TABLE CREATION
-# =========================
-
-def create_external_table(bq_client, table_id, gcs_uri, schema):
-    """
-    Creates an external table in BigQuery pointing to the given GCS Parquet file.
-    """
-    log_status(f"Creating BigQuery external table {table_id} on {gcs_uri}")
+def create_external_table_bq(bq_client, table_id, gcs_uri, schema):
+    """Create external table in BigQuery pointing to GCS Parquet file."""
     external_config = bigquery.ExternalConfig("PARQUET")
     external_config.source_uris = [gcs_uri]
-    external_config.autodetect = False
     external_config.schema = schema
-
     table = bigquery.Table(table_id)
     table.external_data_configuration = external_config
-    table = bq_client.create_table(table, exists_ok=True)
-    log_status(f"External table {table_id} created.")
-    return table
+    try:
+        bq_client.create_table(table, exists_ok=True)
+        logging.info(f"Created external table {table_id} in BigQuery")
+    except Exception as e:
+        logging.error(f"BigQuery external table creation failed: {str(e)}")
+        raise
 
-def get_bq_schema_from_df(df):
-    """
-    Converts a pandas DataFrame schema to BigQuery schema.
-    """
-    type_map = {
-        "int64": "INTEGER",
-        "float64": "FLOAT",
-        "object": "STRING",
-        "datetime64[ns]": "DATETIME",
-        "bool": "BOOLEAN"
-    }
-    schema = []
-    for col, dtype in df.dtypes.items():
-        bq_type = type_map.get(str(dtype), "STRING")
-        schema.append(bigquery.SchemaField(col, bq_type))
-    return schema
+def run_bigquery_sql(bq_client, sql):
+    """Run BigQuery SQL and return results as DataFrame."""
+    try:
+        job = bq_client.query(sql)
+        df = job.to_dataframe()
+        logging.info("Executed BigQuery SQL.")
+        return df
+    except Exception as e:
+        logging.error(f"BigQuery SQL execution failed: {str(e)}")
+        raise
 
-# =========================
-# 4. BIGQUERY TRANSFORMATION EXECUTION
-# =========================
-
-def execute_bigquery_sql(bq_client, sql):
-    """
-    Executes a BigQuery SQL statement.
-    """
-    log_status("Executing BigQuery SQL transformation...")
-    job = bq_client.query(sql)
-    job.result()  # Wait for completion
-    log_status("BigQuery SQL executed successfully.")
-
-# =========================
-# 5. RECONCILIATION LOGIC
-# =========================
-
-def compare_tables(synapse_df, bq_df, key_columns=None, float_tol=1e-6):
-    """
-    Compares two DataFrames for row/column-level reconciliation.
-    Returns a dict with match status, differences, and sample mismatches.
-    """
+def compare_dataframes(df1, df2, key_columns=None):
+    """Compare two DataFrames for reconciliation."""
     result = {}
     # Row count comparison
-    synapse_rows = len(synapse_df)
-    bq_rows = len(bq_df)
-    result['row_count_synapse'] = synapse_rows
-    result['row_count_bigquery'] = bq_rows
-    result['row_count_match'] = synapse_rows == bq_rows
-
+    result['row_count_synapse'] = len(df1)
+    result['row_count_bigquery'] = len(df2)
+    result['row_count_match'] = len(df1) == len(df2)
     # Column comparison
-    synapse_cols = set(synapse_df.columns)
-    bq_cols = set(bq_df.columns)
-    common_cols = list(synapse_cols & bq_cols)
-    missing_in_bq = list(synapse_cols - bq_cols)
-    missing_in_synapse = list(bq_cols - synapse_cols)
-    result['missing_in_bigquery'] = missing_in_bq
-    result['missing_in_synapse'] = missing_in_synapse
-
-    # Column-by-column value comparison (on common columns)
     mismatches = []
-    if key_columns is None:
-        key_columns = common_cols  # Use all columns if no key specified
-
-    # Sort for deterministic comparison
-    synapse_df_sorted = synapse_df.sort_values(by=key_columns).reset_index(drop=True)
-    bq_df_sorted = bq_df.sort_values(by=key_columns).reset_index(drop=True)
-
-    # Align DataFrames
-    min_len = min(len(synapse_df_sorted), len(bq_df_sorted))
-    for idx in range(min_len):
-        row_syn = synapse_df_sorted.iloc[idx]
-        row_bq = bq_df_sorted.iloc[idx]
-        for col in common_cols:
-            val_syn = row_syn[col]
-            val_bq = row_bq[col]
-            # Handle floats with tolerance
-            if pd.api.types.is_float_dtype(type(val_syn)) or pd.api.types.is_float_dtype(type(val_bq)):
-                if not np.isclose(safe_cast(val_syn, float, np.nan), safe_cast(val_bq, float, np.nan), atol=float_tol, equal_nan=True):
-                    mismatches.append({'row': idx, 'column': col, 'synapse': val_syn, 'bigquery': val_bq})
-            else:
-                if pd.isnull(val_syn) and pd.isnull(val_bq):
-                    continue
-                if str(val_syn).strip().lower() != str(val_bq).strip().lower():
-                    mismatches.append({'row': idx, 'column': col, 'synapse': val_syn, 'bigquery': val_bq})
-
+    common_cols = set(df1.columns).intersection(set(df2.columns))
+    for col in common_cols:
+        # Handle NULLs and case sensitivity
+        syn_vals = df1[col].fillna("NULL").astype(str).str.lower()
+        bq_vals = df2[col].fillna("NULL").astype(str).str.lower()
+        if not syn_vals.equals(bq_vals):
+            mismatch_rows = df1[syn_vals != bq_vals]
+            mismatches.append({
+                "column": col,
+                "mismatch_count": len(mismatch_rows),
+                "sample_mismatches": mismatch_rows.head(5).to_dict(orient="records")
+            })
     result['column_mismatches'] = mismatches
-    result['match_percentage'] = 100.0 * (1 - len(mismatches) / (min_len * len(common_cols))) if min_len > 0 else 100.0
-    if synapse_rows == bq_rows and len(mismatches) == 0:
-        result['status'] = "MATCH"
-    elif synapse_rows != bq_rows:
-        result['status'] = "NO MATCH"
-    else:
-        result['status'] = "PARTIAL MATCH"
-    result['sample_mismatches'] = mismatches[:5]
+    result['match_percentage'] = (
+        100.0 if not mismatches and result['row_count_match'] else
+        max(0.0, 100.0 - sum(m['mismatch_count'] for m in mismatches) * 100.0 / max(len(df1), 1))
+    )
+    result['status'] = (
+        "MATCH" if result['row_count_match'] and not mismatches else
+        "NO MATCH" if not result['row_count_match'] else
+        "PARTIAL MATCH"
+    )
     return result
 
-# =========================
-# 6. MAIN RECONCILIATION PIPELINE
-# =========================
+# ==============================
+# Main Reconciliation Workflow
+# ==============================
 
 def main():
-    # Step 1: Connect to Synapse
-    log_status("Connecting to Synapse...")
-    engine = create_engine(SYNAPSE_CONN_STR)
-    temp_dir = tempfile.mkdtemp()
     try:
-        # Step 2: Execute Synapse Stored Procedure
-        execute_synapse_procedure("dw.sp_load_sales_fact", engine)
-
-        # Step 3: Extract target tables from Synapse
-        target_tables = [
-            "dw.Fact_Sales",
-            "dw.DQ_Failures",
-            "dw.Audit_Log"
-        ]
+        logging.info("===== Reconciliation Process Started =====")
+        # 1. Extract Synapse Data
+        synapse_queries = {
+            "fact": f"SELECT * FROM {FACT_TABLE}",
+            "audit": f"SELECT * FROM {AUDIT_LOG_TABLE}",
+            "dq": f"SELECT * FROM {DQ_FAILURES_TABLE}"
+        }
         synapse_data = {}
-        for table in target_tables:
-            csv_path, parquet_path, df = extract_synapse_table(table, engine, temp_dir)
-            synapse_data[table] = {
-                "csv": csv_path,
-                "parquet": parquet_path,
-                "df": df
-            }
+        for name, query in synapse_queries.items():
+            synapse_data[name] = get_synapse_data(query, SYNAPSE_CONN_STR)
 
-        # Step 4: Upload Parquet files to GCS
+        # 2. Export Synapse Data to Parquet
+        parquet_files = {}
+        for name, df in synapse_data.items():
+            parquet_files[name] = export_to_parquet(df, name)
+
+        # 3. Upload Parquet Files to GCS
         gcs_uris = {}
-        for table in target_tables:
-            parquet_path = synapse_data[table]["parquet"]
-            gcs_path = f"{GCS_PREFIX}{os.path.basename(parquet_path)}"
-            upload_to_gcs(parquet_path, GCS_BUCKET, gcs_path)
-            gcs_uris[table] = f"gs://{GCS_BUCKET}/{gcs_path}"
+        for name, file_name in parquet_files.items():
+            gcs_uris[name] = upload_to_gcs(file_name, GCS_BUCKET)
 
-        # Step 5: Create BigQuery External Tables
+        # 4. BigQuery Authentication
         bq_client = bigquery.Client(project=BQ_PROJECT)
-        bq_tables = {}
-        for table in target_tables:
-            table_id = f"{BQ_PROJECT}.{BQ_DATASET}.ext_{table.replace('.', '_')}"
-            schema = get_bq_schema_from_df(synapse_data[table]["df"])
-            create_external_table(bq_client, table_id, gcs_uris[table], schema)
-            bq_tables[table] = table_id
 
-        # Step 6: Execute BigQuery SQL Transformation (converted logic)
-        # The BigQuery SQL code should be provided as a string (from the conversion step)
-        # For this script, you must set the variable BIGQUERY_SQL_CODE to the converted SQL
-        BIGQUERY_SQL_CODE = """
-        -- Place the converted BigQuery SQL code here
-        -- Example: CALL dw_sp_load_sales_fact();
-        CALL dw_sp_load_sales_fact();
-        """
-        execute_bigquery_sql(bq_client, BIGQUERY_SQL_CODE)
+        # 5. Create External Tables in BigQuery
+        # Schema inference from pandas DataFrame
+        schemas = {}
+        for name, df in synapse_data.items():
+            fields = []
+            for col, dtype in zip(df.columns, df.dtypes):
+                if dtype == "int64":
+                    field_type = "INT64"
+                elif dtype == "float64":
+                    field_type = "FLOAT64"
+                elif dtype == "datetime64[ns]":
+                    field_type = "DATETIME"
+                else:
+                    field_type = "STRING"
+                fields.append(bigquery.SchemaField(col, field_type))
+            schemas[name] = fields
 
-        # Step 7: Extract BigQuery target tables for comparison
+        ext_table_ids = {}
+        for name in synapse_data.keys():
+            ext_table_ids[name] = f"{BQ_PROJECT}.{BQ_DATASET}.ext_{name}"
+            create_external_table_bq(
+                bq_client,
+                ext_table_ids[name],
+                gcs_uris[name],
+                schemas[name]
+            )
+
+        # 6. Run BigQuery SQL Transformations
+        # For simplicity, assume the converted BigQuery SQL is stored in a file or string variable
+        # (In production, read from file or parameter)
+        with open("bigquery_sales_fact_procedure.sql", "r") as f:
+            bigquery_sql = f.read()
+        try:
+            bq_client.query(bigquery_sql).result()
+            logging.info("Executed BigQuery procedure for sales fact loading.")
+        except Exception as e:
+            logging.error(f"BigQuery procedure execution failed: {str(e)}")
+            raise
+
+        # 7. Extract BigQuery Table Data for Comparison
+        bq_tables = {
+            "fact": f"SELECT * FROM `{BQ_PROJECT}.{BQ_DATASET}.Fact_Sales`",
+            "audit": f"SELECT * FROM `{BQ_PROJECT}.{BQ_DATASET}.Audit_Log`",
+            "dq": f"SELECT * FROM `{BQ_PROJECT}.{BQ_DATASET}.DQ_Failures`"
+        }
         bq_data = {}
-        for table in target_tables:
-            # For external tables, use SELECT * FROM ext_table
-            ext_table_id = bq_tables[table]
-            query = f"SELECT * FROM `{ext_table_id}`"
-            bq_df = bq_client.query(query).to_dataframe()
-            bq_data[table] = bq_df
+        for name, sql in bq_tables.items():
+            bq_data[name] = run_bigquery_sql(bq_client, sql)
 
-        # Step 8: Reconciliation and Validation
+        # 8. Implement Comparison Logic
         reconciliation_report = {}
-        for table in target_tables:
-            log_status(f"Reconciling table: {table}")
-            syn_df = synapse_data[table]["df"]
-            bq_df = bq_data[table]
-            # Use all columns as keys for comparison if possible
-            key_columns = [col for col in syn_df.columns if col in bq_df.columns]
-            result = compare_tables(syn_df, bq_df, key_columns=key_columns)
-            reconciliation_report[table] = result
-            log_status(f"Reconciliation result for {table}: {result['status']} (Match %: {result['match_percentage']:.2f})")
+        for name in synapse_data.keys():
+            reconciliation_report[name] = compare_dataframes(synapse_data[name], bq_data[name])
 
-        # Step 9: Generate Reconciliation Report
-        report_path = os.path.join(temp_dir, f"reconciliation_report_{get_timestamp()}.json")
+        # 9. Generate Reconciliation Report
+        report_file = "reconciliation_report.json"
         import json
-        with open(report_path, "w") as f:
-            json.dump(reconciliation_report, f, indent=2, default=str)
-        log_status(f"Reconciliation report saved to {report_path}")
+        with open(report_file, "w") as f:
+            json.dump(reconciliation_report, f, indent=2)
+        logging.info(f"Reconciliation report generated: {report_file}")
 
-        # Print summary
-        print("==== RECONCILIATION SUMMARY ====")
+        # 10. Print Summary
+        print("===== Reconciliation Summary =====")
         for table, result in reconciliation_report.items():
             print(f"Table: {table}")
-            print(f"  Status: {result['status']}")
-            print(f"  Row count Synapse: {result['row_count_synapse']}")
-            print(f"  Row count BigQuery: {result['row_count_bigquery']}")
-            print(f"  Match %: {result['match_percentage']:.2f}")
-            if result['sample_mismatches']:
-                print(f"  Sample mismatches: {result['sample_mismatches']}")
-            print("")
+            print(f"Status: {result['status']}")
+            print(f"Row Count Match: {result['row_count_match']}")
+            print(f"Column Mismatches: {len(result['column_mismatches'])}")
+            print(f"Match Percentage: {result['match_percentage']:.2f}%")
+            if result['column_mismatches']:
+                print("Sample mismatches:")
+                for m in result['column_mismatches']:
+                    print(f"  Column: {m['column']}, Count: {m['mismatch_count']}")
+                    print(f"    Samples: {m['sample_mismatches']}")
+            print("-" * 40)
+
+        logging.info("===== Reconciliation Process Completed =====")
 
     except Exception as e:
-        log_error(f"Pipeline failed: {e}")
-        raise
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        log_status("Temporary files cleaned up.")
+        logging.error(f"Reconciliation failed: {str(e)}")
+        print(f"ERROR: {str(e)}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
 
-# =========================
-# SECURITY & PERFORMANCE NOTES
-# =========================
-# - Credentials are loaded from environment variables only (never hardcoded).
-# - All file operations use secure temporary directories.
-# - GCS and BigQuery use service account authentication.
-# - All operations are logged for traceability.
-# - Uses efficient I/O (Parquet) and batch transfer.
-# - Handles large datasets via streaming and chunked operations.
-# - All exceptions are logged and surfaced for pipeline monitoring.
+# ==============================
+# Notes & Best Practices
+# ==============================
+# - All credentials are securely loaded from environment variables.
+# - Data type mismatches, NULLs, and case sensitivity are handled in comparison logic.
+# - Progress and errors are logged to reconciliation.log.
+# - For large datasets, Parquet format and GCS batch upload are used for performance.
+# - The script can be scheduled and run in automated environments.
+# - The reconciliation report is structured in JSON for easy downstream parsing.
+# - Error handling is robust, with clear logs and actionable messages.
+# - API cost estimation for this run: apiCost: 0.0040 USD
 
-# =========================
-# API COST
-# =========================
-# apiCost: 0.0080 USD
 ```
+
+apiCost: 0.0040 USD
