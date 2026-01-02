@@ -1,97 +1,99 @@
 =============================================
 Author:        Ascendion AVA
 Created on:    
-Description:   Analysis and conversion guidance for migrating the Azure Synapse stored procedure 'dw.sp_load_sales_fact' to BigQuery SQL, covering ETL logic, complexity, syntax differences, manual adjustments, and optimization strategies.
+Description:   Loads, validates, and transforms sales transaction data from staging to the sales fact table, with audit logging and data quality checks.
 =============================================
 
 ---
 
 **1. Procedure Overview**
 
-This document analyzes the Azure Synapse stored procedure `dw.sp_load_sales_fact`, which automates the ETL workflow for loading sales transaction data from the staging table (`stg.Sales_Transactions`) into the data warehouse fact table (`dw.Fact_Sales`). The procedure supports the business objective of ensuring only clean, validated, and enriched sales data is loaded for accurate analytics and reporting. It performs data quality checks, applies business rules, maintains audit logs, and records data quality failures. The workflow consists of a single mapping per session, encapsulating validation, transformation, enrichment, and audit logging.
+The Azure Synapse stored procedure `[dw.sp_load_sales_fact]` automates the ETL workflow for sales transaction data. It extracts raw transactions from the staging table (`stg.Sales_Transactions`), performs data validation and cleansing, applies business logic transformations (including enrichment from dimension tables), and loads the processed records into the enterprise sales fact table (`dw.Fact_Sales`). The procedure also logs audit information (`dw.Audit_Log`), captures data quality failures (`dw.DQ_Failures`), and ensures traceability for compliance and troubleshooting. This workflow supports the business objective of maintaining a reliable, analytics-ready sales dataset for reporting and decision-making.
+
+- **Number of Mappings per Workflow/Session:** 1 stored procedure encapsulating the entire ETL process.
+- **Key Business Objective:** Data integration, cleansing, enrichment, and loading with audit and data quality logging.
 
 ---
 
 **2. Complexity Metrics**
 
-| Metric                    | Value / Type                                                                 |
-|---------------------------|------------------------------------------------------------------------------|
-| Number of Source Qualifiers | 1 (stg.Sales_Transactions)                                                  |
-| Number of Transformations  | 5 (validation, calculation, joins, enrichment, timestamping)                |
-| Lookup Usage               | 2 (Dim_Customer and Dim_Date as dimension lookups via INNER JOIN)           |
-| Expression Logic           | 2 (Total_Sales_Amount calculation, Load_Timestamp assignment)               |
-| Join Conditions            | 2 (INNER JOIN: Customer_ID, INNER JOIN: Sales_Date to Date_Value)           |
-| Conditional Logic          | 2 (WHERE filters for data quality, error handling via TRY/CATCH)            |
-| Reusable Components        | 0 (no reusable transformations or mapplets)                                 |
-| Data Sources               | 3 (SQL Server tables: stg.Sales_Transactions, dw.Dim_Customer, dw.Dim_Date) |
-| Data Targets               | 3 (SQL Server tables: dw.Fact_Sales, dw.Audit_Log, dw.DQ_Failures)          |
-| Pre/Post SQL Logic         | 2 (Audit log insert/update, error handling updates)                         |
-| Session/Workflow Controls  | 1 (TRY/CATCH block for error handling)                                      |
-| DML Logic                  | 5 (INSERT, DELETE, TRUNCATE, UPDATE, THROW)                                 |
-| Complexity Score           | 65 (Moderate: multi-step ETL, audit, error handling, but no advanced nesting)|
-| High Complexity Areas      | - Data quality validation and error logging<br>- Audit logging and batch tracking<br>- Joins for enrichment<br>- Conditional error handling and cleanup |
+| Metric                     | Value & Type                                                                                   |
+|----------------------------|-----------------------------------------------------------------------------------------------|
+| Number of Source Qualifiers| 1 (stg.Sales_Transactions; SQL Server/Azure Synapse table)                                    |
+| Number of Transformations  | 5 (validation, enrichment, calculation, audit logging, DQ logging)                            |
+| Lookup Usage               | 2 (joins to dw.Dim_Customer and dw.Dim_Date; both are connected lookups via INNER JOIN)       |
+| Expression Logic           | 2 (Total_Sales_Amount = Quantity * Unit_Price; SYSDATETIME() usage; no deep nesting)          |
+| Join Conditions            | 2 (INNER JOIN: Customer_ID to Dim_Customer, Sales_Date to Dim_Date)                           |
+| Conditional Logic          | 2 (validation WHERE clauses for missing/invalid data; error handling with TRY...CATCH)        |
+| Reusable Components        | 0 (no reusable transformations or mapplets; all logic in one procedure)                       |
+| Data Sources               | 3 (stg.Sales_Transactions [Azure Synapse], dw.Dim_Customer [Azure Synapse], dw.Dim_Date [Azure Synapse]) |
+| Data Targets               | 3 (dw.Fact_Sales [Azure Synapse], dw.Audit_Log [Azure Synapse], dw.DQ_Failures [Azure Synapse]) |
+| Pre/Post SQL Logic         | 2 (audit log insert/update, DQ failure insert, error handling)                                |
+| Session/Workflow Controls  | 1 (TRY...CATCH error handling, status updates in audit log)                                   |
+| DML Logic                  | 4 (INSERT, DELETE, TRUNCATE, UPDATE)                                                          |
+| Complexity Score (0–100)   | 65                                                                                            |
+
+**High-Complexity Areas:**
+- Multiple joins for enrichment (customer and date dimensions)
+- Data quality validation and error handling logic
+- Audit and DQ logging for traceability
+- Use of temporary tables for invalid data capture
 
 ---
 
 **3. Syntax Differences**
 
-- **Functions and Constructs:**
-  - `NEWID()` (Azure Synapse): Use `GENERATE_UUID()` in BigQuery.
-  - `SYSDATETIME()` (Azure Synapse): Use `CURRENT_TIMESTAMP()` in BigQuery.
-  - `TRY/CATCH` (T-SQL): BigQuery does not support procedural error handling; must use scripting blocks with `BEGIN ... EXCEPTION ... END` or handle errors via control tables/logging.
-  - `OBJECT_NAME(@@PROCID)`: No direct equivalent; procedure name must be hardcoded or passed as a parameter in BigQuery scripting.
-  - Temporary tables (`#InvalidRows`): Use temporary tables with `CREATE TEMP TABLE` in BigQuery scripting, or use CTEs/subqueries.
-  - `@@ROWCOUNT`: Use `ROW_COUNT()` in BigQuery scripting, or capture row counts via SELECT COUNT(*).
-  - `CONCAT` function: Supported in BigQuery, but syntax may differ slightly.
+- **Functions without Direct BigQuery Equivalents:**
+  - `SYSDATETIME()` (Azure Synapse) → `CURRENT_TIMESTAMP()` (BigQuery)
+  - `NEWID()` (Azure Synapse) → `GENERATE_UUID()` (BigQuery)
+  - `OBJECT_NAME(@@PROCID)` (Azure Synapse) → No direct equivalent; may require hardcoding or session variables in BigQuery scripting.
+  - `@@ROWCOUNT` (Azure Synapse) → Use `ROW_COUNT()` in BigQuery scripting (with procedural logic).
+  - `TRY...CATCH` (Azure Synapse) → Use `BEGIN ... EXCEPTION ... END` in BigQuery scripting.
 
 - **Data Type Conversions:**
-  - `DATETIME`/`NVARCHAR`: Map to BigQuery `TIMESTAMP`/`STRING`.
-  - `BIGINT`: Map to BigQuery `INT64`.
-  - `UNIQUEIDENTIFIER`: Map to BigQuery `STRING` (using `GENERATE_UUID()`).
+  - `DATETIME` (Azure Synapse) → `TIMESTAMP` (BigQuery)
+  - `UNIQUEIDENTIFIER` (Azure Synapse) → `STRING` (UUID format in BigQuery)
+  - `NVARCHAR` (Azure Synapse) → `STRING` (BigQuery)
+  - Temporary tables (`#InvalidRows`) → Use temporary tables or scripting arrays/structs in BigQuery.
 
 - **Workflow/Control Logic:**
-  - No direct support for transaction control or procedural error handling in BigQuery SQL; must use scripting or external orchestration (e.g., Cloud Composer).
-  - Table truncation (`TRUNCATE TABLE`): Supported in BigQuery as `TRUNCATE TABLE dataset.table`.
+  - No direct equivalent for session variables; use BigQuery scripting variables.
+  - No direct support for `TRUNCATE TABLE` in BigQuery; use `DELETE FROM` or overwrite strategy.
+  - Error handling must be restructured using BigQuery scripting's `EXCEPTION` blocks.
 
 ---
 
 **4. Manual Adjustments**
 
 - **Components Requiring Manual Implementation:**
-  - Error handling logic (`TRY/CATCH`, `THROW`) must be restructured using BigQuery scripting or handled externally.
-  - Audit logging updates must be performed explicitly in BigQuery scripting blocks.
-  - Temporary table logic (`#InvalidRows`) should be replaced with `CREATE TEMP TABLE` or CTEs.
-  - Batch ID and procedure name assignment must be handled via scripting variables.
-  - Row count tracking (`@@ROWCOUNT`) must be replaced with explicit count queries.
-  - Any references to system stored procedures or SQL Server-specific metadata must be removed or replaced.
+  - Temporary table logic (`#InvalidRows`) must be rewritten using BigQuery scripting constructs (e.g., temporary tables, arrays, or CTEs).
+  - Error handling (`TRY...CATCH`) must be manually mapped to BigQuery scripting's `EXCEPTION` handling.
+  - Audit log updates and DQ failure inserts may need to be split into separate statements due to BigQuery's procedural limitations.
+  - `OBJECT_NAME(@@PROCID)` logic for procedure name tracking must be hardcoded or handled via scripting variable.
+  - `@@ROWCOUNT` logic must be replaced with explicit row counting in BigQuery.
 
 - **External Dependencies:**
-  - Audit log and data quality failure tables must exist in BigQuery with compatible schema.
-  - Any pre/post SQL logic (e.g., archiving, notification) must be migrated to orchestration tools or BigQuery scripting.
+  - None detected (no external stored procedures or shell scripts invoked).
+  - All logic is self-contained within the procedure.
 
-- **Business Logic Review:**
-  - Validation rules (e.g., missing Customer_ID, invalid Quantity) should be reviewed for completeness and correctness post-migration.
-  - Ensure that enrichment joins (Customer_Segment, Region_ID) are accurate and that dimension tables are available in BigQuery.
-  - Confirm that audit and error logging meets compliance requirements in the new environment.
+- **Business Logic Validation:**
+  - Ensure that joins to dimension tables and validation logic produce the same results post-migration.
+  - Validate that audit and DQ logging semantics are preserved in BigQuery.
 
 ---
 
 **5. Optimization Techniques**
 
-- **Partitioning:** Partition target tables (Fact_Sales, Audit_Log, DQ_Failures) by load date or batch ID to optimize query performance and reduce costs.
-- **Pipeline Conversion:** Convert chained filters and joins into a single pipeline using CTEs or subqueries to minimize intermediate steps.
-- **Window Functions:** Use window functions for aggregations or row numbering if needed for advanced analytics.
-- **Caching:** Use BigQuery's result caching for repeated queries, and optimize storage costs by clustering on frequently filtered columns.
-- **Broadcast Joins:** For small dimension tables (Dim_Customer, Dim_Date), leverage broadcast joins to speed up enrichment.
-- **Refactor vs. Rebuild:** Recommend **Refactor** for direct migration, retaining most logic, unless performance profiling indicates a need to **Rebuild** for better scalability or maintainability in BigQuery.
+- **Partitioning:** Partition `Fact_Sales` and large dimension tables by date or batch ID to improve query and load performance.
+- **Pipeline Transformation:** Convert chained filters and joins into a single pipeline using CTEs or subqueries in BigQuery.
+- **Window Functions:** Use window functions for aggregations or row numbering if needed (not present in this logic, but recommended for future enhancements).
+- **Broadcast Joins:** Not directly applicable in BigQuery, but ensure that dimension tables are small enough for efficient join processing.
+- **Caching:** Use materialized views or result caching for frequently accessed dimension data.
+- **Refactor vs. Rebuild:** 
+  - **Refactor** is recommended since the logic is clear, modular, and maps well to BigQuery scripting with moderate manual adjustments.
+  - **Rebuild** only if significant performance or maintainability improvements are identified during testing.
 
 ---
 
-**Additional Notes:**
-- Estimated BigQuery query cost per run: $1.00–$2.50 (based on 200–500 GB processed per ETL batch).
-- Source/target types: All mappings are from SQL Server tables; ensure schema compatibility in BigQuery.
-- No advanced external scripts or Java transformations detected; migration is straightforward with moderate complexity.
-
----
-
-This analysis provides the foundation for converting the Azure Synapse stored procedure to BigQuery SQL, ensuring compatibility, identifying manual steps, and highlighting optimization opportunities for a smooth migration.
+**Summary:**  
+This stored procedure is moderately complex (score: 65/100), with key challenges in temporary table handling, error management, and audit/DQ logging. Most logic can be refactored for BigQuery, but manual intervention is needed for procedural constructs and data type conversions. Optimization should focus on partitioning, pipeline transformation, and leveraging BigQuery scripting best practices.
