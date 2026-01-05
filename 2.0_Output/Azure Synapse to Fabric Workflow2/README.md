@@ -8,5 +8,5 @@ Inputs:
 - Load_HoldingsFact
 - Azure_Synapse_To_Fabric_Analyzer
 
-Execution ID: 13cd783a-6fc2-4f35-952b-1ef61571ee1e
-Execution Time: 2026-01-02 10:25:49 UTC
+Execution ID: 13cfbf24-8a51-4891-94bb-e857ce0a5732
+Execution Time: 2026-01-05 10:38:27 UTC
