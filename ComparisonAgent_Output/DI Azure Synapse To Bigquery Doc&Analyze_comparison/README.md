@@ -1,6 +1,6 @@
 # Comparison: DI Azure Synapse To Bigquery Doc&Analyze
 
-Generated: 2026-01-05 12:56:06
+Generated: 2026-01-05 14:39:56
 
 ## Sources
 - AAVA 1.0: DI_Azure_Synapse_To_Bigquery_Doc_Analyze (3 files)
