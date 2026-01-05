@@ -1,18 +1,11 @@
-# Comparison Agent Output: DI Azure Synapse To Bigquery Doc&Analyze
+# Comparison: DI Azure Synapse To Bigquery Doc&Analyze
 
-## AAVA 1.0 vs AAVA 2.0 Analysis
+Generated: 2026-01-05 12:56:06
 
-Generated at: 2025-12-18 12:11:30
+## Sources
+- AAVA 1.0: DI_Azure_Synapse_To_Bigquery_Doc_Analyze (3 files)
+- AAVA 2.0: DI Azure Synapse To Bigquery Doc&Analyze (3 files)
 
-### AAVA 1.0 Source
-- **Folder**: DI_Azure_Synapse_To_Bigquery_Doc_Analyze
-- **Files Count**: 3
+## Comparison Report
 
-### AAVA 2.0 Source
-- **Folder**: DI Azure Synapse To Bigquery Doc&Analyze
-- **Files Count**: 3
-
-### Comparison Results
-This folder contains the detailed comparison analysis between the selected AAVA 1.0 and AAVA 2.0 outputs.
-
-### Output Files
+See detailed outputs below.
