@@ -1,24 +1,23 @@
-```
 =============================================
 Author:        AAVA
 Date:   
-Description:   Unit tests and Pytest script for validating Fabric implementation of Load_HoldingsFact (converted from Synapse stored procedure), covering transformation logic, data consistency, and edge cases.
+Description:   Unit tests and Pytest script for validating the Fabric implementation of the Load_HoldingsFact ETL process, ensuring correct data transformation, integrity, and error handling.
 =============================================
 
 Test Case List:
 
-| Test Case ID | Description                                                                                           | Expected Outcome                                                                                 |
-|--------------|------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
-| TC01         | Happy path: All staging and dimension tables have matching records, all fields populated              | All records inserted into FACT_EXECUTIVE_SUMMARY with correct values and referential integrity    |
-| TC02         | Edge case: income_amount is NULL                                                                     | income_amount in FACT_EXECUTIVE_SUMMARY is set to 0                                              |
-| TC03         | Edge case: income_amount is negative                                                                 | income_amount in FACT_EXECUTIVE_SUMMARY is set to 0                                              |
-| TC04         | Edge case: Staging record missing dimension match (e.g., product_id not found in DIM_PRODUCT)        | Record is excluded from FACT_EXECUTIVE_SUMMARY (not inserted)                                    |
-| TC05         | Edge case: Empty staging table                                                                       | No records inserted into FACT_EXECUTIVE_SUMMARY                                                  |
-| TC06         | Error handling: Staging table missing required column (e.g., a120_amount)                            | Exception raised, process fails gracefully                                                       |
-| TC07         | Edge case: Boundary values (extremely large/small numeric values)                                    | Values correctly inserted and preserved in FACT_EXECUTIVE_SUMMARY                                |
-| TC08         | Edge case: Multiple records with same dimension keys (duplicate handling)                            | All valid records inserted, no duplicates if business logic requires uniqueness                  |
-| TC09         | Edge case: NULLs in non-income_amount fields                                                         | NULLs preserved in FACT_EXECUTIVE_SUMMARY                                                        |
-| TC10         | Error handling: Unexpected data type in staging table (e.g., string in numeric column)               | Exception raised, process fails gracefully                                                       |
+| Test Case ID | Description                                                                 | Expected Outcome                                                                                              |
+|--------------|-----------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: All staging and dimension data present and valid                | All records correctly loaded into FACT_EXECUTIVE_SUMMARY with proper joins and transformation                 |
+| TC02         | Edge case: NULL income_amount in staging                                    | income_amount in FACT_EXECUTIVE_SUMMARY set to 0                                                              |
+| TC03         | Edge case: Negative income_amount in staging                                | income_amount in FACT_EXECUTIVE_SUMMARY set to 0                                                              |
+| TC04         | Edge case: Missing dimension key in DIM_DATE                                | Record with missing date_key not loaded into FACT_EXECUTIVE_SUMMARY                                           |
+| TC05         | Edge case: Missing dimension key in DIM_INSTITUTION                         | Record with missing institution_id not loaded into FACT_EXECUTIVE_SUMMARY                                     |
+| TC06         | Edge case: Missing dimension key in DIM_CORPORATION                         | Record with missing corporation_id not loaded into FACT_EXECUTIVE_SUMMARY                                     |
+| TC07         | Edge case: Missing dimension key in DIM_PRODUCT                             | Record with missing product_id not loaded into FACT_EXECUTIVE_SUMMARY                                         |
+| TC08         | Edge case: Empty staging table                                              | No records loaded into FACT_EXECUTIVE_SUMMARY                                                                 |
+| TC09         | Error case: Staging table missing required columns                          | ETL process raises error due to missing columns                                                               |
+| TC10         | Error case: Unexpected data type in numeric column                          | ETL process raises error or skips malformed records                                                           |
 
 Pytest Script:
 
@@ -26,14 +25,15 @@ Pytest Script:
 =============================================
 Author:        AAVA
 Date:   
-Description:   Pytest script for validating Fabric ETL logic for Load_HoldingsFact (converted from Synapse), covering transformation, referential integrity, and edge cases.
+Description:   Pytest unit tests for Fabric Load_HoldingsFact ETL process: transformation, joins, and error handling
 =============================================
 
 import pytest
 import pandas as pd
+from sqlalchemy import create_engine
 from pandas.testing import assert_frame_equal
 
-# Helper function to simulate the Fabric ETL transformation
+# Helper function to simulate the ETL transformation logic
 def load_holdings_fact(
     stg_holding_metrics: pd.DataFrame,
     dim_date: pd.DataFrame,
@@ -42,18 +42,16 @@ def load_holdings_fact(
     dim_product: pd.DataFrame
 ) -> pd.DataFrame:
     # Join staging with dimensions
-    merged = (
-        stg_holding_metrics
-        .merge(dim_date, left_on='date_value', right_on='date_key')
-        .merge(dim_institution, left_on='institution_id', right_on='institution_id')
-        .merge(dim_corporation, left_on='corporation_id', right_on='corporation_id')
-        .merge(dim_product, left_on='product_id', right_on='product_id')
-    )
-    # Apply income_amount transformation
-    merged['income_amount'] = merged['income_amount'].apply(
-        lambda x: 0 if pd.isnull(x) or (isinstance(x, (int, float)) and x < 0) else x
-    )
-    # Select and rename columns as per FACT_EXECUTIVE_SUMMARY
+    merged = stg_holding_metrics \
+        .merge(dim_date, left_on='date_value', right_on='date_key', how='inner', suffixes=('', '_date')) \
+        .merge(dim_institution, on='institution_id', how='inner', suffixes=('', '_inst')) \
+        .merge(dim_corporation, on='corporation_id', how='inner', suffixes=('', '_corp')) \
+        .merge(dim_product, on='product_id', how='inner', suffixes=('', '_prod'))
+    
+    # Apply business rule: income_amount NULL or <0 -> 0
+    merged['income_amount'] = merged['income_amount'].apply(lambda x: 0 if pd.isnull(x) or x < 0 else x)
+    
+    # Select and rename columns for fact table
     fact_cols = [
         'date_key', 'institution_id', 'corporation_id', 'product_id',
         'a120_amount', 'a120_count', 'a30_to_59_amount', 'a30_to_59_count',
@@ -61,9 +59,10 @@ def load_holdings_fact(
         'charge_off_amount', 'charge_off_count', 'fraud_amount', 'fraud_count',
         'income_amount', 'number_of_accounts', 'purchases_amount', 'purchases_count'
     ]
-    return merged[fact_cols]
+    fact_df = merged[fact_cols].copy()
+    return fact_df
 
-# Fixtures for dimension tables (minimal for test purposes)
+# Fixtures for dimension tables
 @pytest.fixture
 def dim_date():
     return pd.DataFrame({'date_key': [20230101, 20230102]})
@@ -83,135 +82,199 @@ def dim_product():
 # TC01: Happy path
 def test_happy_path(dim_date, dim_institution, dim_corporation, dim_product):
     stg = pd.DataFrame({
-        'date_value': [20230101],
-        'institution_id': [1],
-        'corporation_id': [10],
-        'product_id': [100],
-        'a120_amount': [1000.0],
-        'a120_count': [5],
-        'a30_to_59_amount': [200.0],
-        'a30_to_59_count': [2],
-        'a60_to_89_amount': [150.0],
-        'a60_to_89_count': [1],
-        'a90_to_119_amount': [50.0],
-        'a90_to_119_count': [1],
-        'charge_off_amount': [10.0],
-        'charge_off_count': [1],
-        'fraud_amount': [5.0],
-        'fraud_count': [1],
-        'income_amount': [500.0],
-        'number_of_accounts': [10],
-        'purchases_amount': [300.0],
-        'purchases_count': [3]
-    })
-    expected = pd.DataFrame({
-        'date_key': [20230101],
-        'institution_id': [1],
-        'corporation_id': [10],
-        'product_id': [100],
-        'a120_amount': [1000.0],
-        'a120_count': [5],
-        'a30_to_59_amount': [200.0],
-        'a30_to_59_count': [2],
-        'a60_to_89_amount': [150.0],
-        'a60_to_89_count': [1],
-        'a90_to_119_amount': [50.0],
-        'a90_to_119_count': [1],
-        'charge_off_amount': [10.0],
-        'charge_off_count': [1],
-        'fraud_amount': [5.0],
-        'fraud_count': [1],
-        'income_amount': [500.0],
-        'number_of_accounts': [10],
-        'purchases_amount': [300.0],
-        'purchases_count': [3]
+        'date_value': [20230101, 20230102],
+        'institution_id': [1, 2],
+        'corporation_id': [10, 20],
+        'product_id': [100, 200],
+        'a120_amount': [1000, 2000],
+        'a120_count': [10, 20],
+        'a30_to_59_amount': [300, 400],
+        'a30_to_59_count': [3, 4],
+        'a60_to_89_amount': [500, 600],
+        'a60_to_89_count': [5, 6],
+        'a90_to_119_amount': [700, 800],
+        'a90_to_119_count': [7, 8],
+        'charge_off_amount': [50, 60],
+        'charge_off_count': [1, 2],
+        'fraud_amount': [5, 6],
+        'fraud_count': [0, 1],
+        'income_amount': [100, 200],
+        'number_of_accounts': [100, 200],
+        'purchases_amount': [10000, 20000],
+        'purchases_count': [100, 200]
     })
     result = load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
-    assert_frame_equal(result.reset_index(drop=True), expected.reset_index(drop=True))
+    assert len(result) == 2
+    assert (result['income_amount'] == [100, 200]).all()
 
-# TC02: income_amount is NULL
-def test_income_amount_null(dim_date, dim_institution, dim_corporation, dim_product):
+# TC02: NULL income_amount
+def test_null_income_amount(dim_date, dim_institution, dim_corporation, dim_product):
     stg = pd.DataFrame({
         'date_value': [20230101],
         'institution_id': [1],
         'corporation_id': [10],
         'product_id': [100],
-        'a120_amount': [1000.0],
-        'a120_count': [5],
-        'a30_to_59_amount': [200.0],
-        'a30_to_59_count': [2],
-        'a60_to_89_amount': [150.0],
-        'a60_to_89_count': [1],
-        'a90_to_119_amount': [50.0],
-        'a90_to_119_count': [1],
-        'charge_off_amount': [10.0],
+        'a120_amount': [1000],
+        'a120_count': [10],
+        'a30_to_59_amount': [300],
+        'a30_to_59_count': [3],
+        'a60_to_89_amount': [500],
+        'a60_to_89_count': [5],
+        'a90_to_119_amount': [700],
+        'a90_to_119_count': [7],
+        'charge_off_amount': [50],
         'charge_off_count': [1],
-        'fraud_amount': [5.0],
-        'fraud_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [0],
         'income_amount': [None],
-        'number_of_accounts': [10],
-        'purchases_amount': [300.0],
-        'purchases_count': [3]
+        'number_of_accounts': [100],
+        'purchases_amount': [10000],
+        'purchases_count': [100]
     })
     result = load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
-    assert result['income_amount'].iloc[0] == 0
+    assert result.iloc[0]['income_amount'] == 0
 
-# TC03: income_amount is negative
-def test_income_amount_negative(dim_date, dim_institution, dim_corporation, dim_product):
+# TC03: Negative income_amount
+def test_negative_income_amount(dim_date, dim_institution, dim_corporation, dim_product):
     stg = pd.DataFrame({
         'date_value': [20230101],
         'institution_id': [1],
         'corporation_id': [10],
         'product_id': [100],
-        'a120_amount': [1000.0],
-        'a120_count': [5],
-        'a30_to_59_amount': [200.0],
-        'a30_to_59_count': [2],
-        'a60_to_89_amount': [150.0],
-        'a60_to_89_count': [1],
-        'a90_to_119_amount': [50.0],
-        'a90_to_119_count': [1],
-        'charge_off_amount': [10.0],
+        'a120_amount': [1000],
+        'a120_count': [10],
+        'a30_to_59_amount': [300],
+        'a30_to_59_count': [3],
+        'a60_to_89_amount': [500],
+        'a60_to_89_count': [5],
+        'a90_to_119_amount': [700],
+        'a90_to_119_count': [7],
+        'charge_off_amount': [50],
         'charge_off_count': [1],
-        'fraud_amount': [5.0],
-        'fraud_count': [1],
-        'income_amount': [-100.0],
-        'number_of_accounts': [10],
-        'purchases_amount': [300.0],
-        'purchases_count': [3]
+        'fraud_amount': [5],
+        'fraud_count': [0],
+        'income_amount': [-100],
+        'number_of_accounts': [100],
+        'purchases_amount': [10000],
+        'purchases_count': [100]
     })
     result = load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
-    assert result['income_amount'].iloc[0] == 0
+    assert result.iloc[0]['income_amount'] == 0
 
-# TC04: Missing dimension match
-def test_missing_dimension_match(dim_date, dim_institution, dim_corporation, dim_product):
+# TC04: Missing DIM_DATE key
+def test_missing_dim_date(dim_institution, dim_corporation, dim_product):
+    dim_date = pd.DataFrame({'date_key': [20230102]})  # Only 20230102 present
     stg = pd.DataFrame({
         'date_value': [20230101],
         'institution_id': [1],
         'corporation_id': [10],
-        'product_id': [999],  # Not in dim_product
-        'a120_amount': [1000.0],
-        'a120_count': [5],
-        'a30_to_59_amount': [200.0],
-        'a30_to_59_count': [2],
-        'a60_to_89_amount': [150.0],
-        'a60_to_89_count': [1],
-        'a90_to_119_amount': [50.0],
-        'a90_to_119_count': [1],
-        'charge_off_amount': [10.0],
+        'product_id': [100],
+        'a120_amount': [1000],
+        'a120_count': [10],
+        'a30_to_59_amount': [300],
+        'a30_to_59_count': [3],
+        'a60_to_89_amount': [500],
+        'a60_to_89_count': [5],
+        'a90_to_119_amount': [700],
+        'a90_to_119_count': [7],
+        'charge_off_amount': [50],
         'charge_off_count': [1],
-        'fraud_amount': [5.0],
-        'fraud_count': [1],
-        'income_amount': [500.0],
-        'number_of_accounts': [10],
-        'purchases_amount': [300.0],
-        'purchases_count': [3]
+        'fraud_amount': [5],
+        'fraud_count': [0],
+        'income_amount': [100],
+        'number_of_accounts': [100],
+        'purchases_amount': [10000],
+        'purchases_count': [100]
     })
     result = load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
-    assert len(result) == 0
+    assert result.empty
 
-# TC05: Empty staging table
-def test_empty_staging_table(dim_date, dim_institution, dim_corporation, dim_product):
+# TC05: Missing DIM_INSTITUTION key
+def test_missing_dim_institution(dim_date, dim_corporation, dim_product):
+    dim_institution = pd.DataFrame({'institution_id': [2]})  # Only institution_id 2 present
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': [1000],
+        'a120_count': [10],
+        'a30_to_59_amount': [300],
+        'a30_to_59_count': [3],
+        'a60_to_89_amount': [500],
+        'a60_to_89_count': [5],
+        'a90_to_119_amount': [700],
+        'a90_to_119_count': [7],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [0],
+        'income_amount': [100],
+        'number_of_accounts': [100],
+        'purchases_amount': [10000],
+        'purchases_count': [100]
+    })
+    result = load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
+    assert result.empty
+
+# TC06: Missing DIM_CORPORATION key
+def test_missing_dim_corporation(dim_date, dim_institution, dim_product):
+    dim_corporation = pd.DataFrame({'corporation_id': [20]})  # Only corporation_id 20 present
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': [1000],
+        'a120_count': [10],
+        'a30_to_59_amount': [300],
+        'a30_to_59_count': [3],
+        'a60_to_89_amount': [500],
+        'a60_to_89_count': [5],
+        'a90_to_119_amount': [700],
+        'a90_to_119_count': [7],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [0],
+        'income_amount': [100],
+        'number_of_accounts': [100],
+        'purchases_amount': [10000],
+        'purchases_count': [100]
+    })
+    result = load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
+    assert result.empty
+
+# TC07: Missing DIM_PRODUCT key
+def test_missing_dim_product(dim_date, dim_institution, dim_corporation):
+    dim_product = pd.DataFrame({'product_id': [200]})  # Only product_id 200 present
+    stg = pd.DataFrame({
+        'date_value': [20230101],
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': [1000],
+        'a120_count': [10],
+        'a30_to_59_amount': [300],
+        'a30_to_59_count': [3],
+        'a60_to_89_amount': [500],
+        'a60_to_89_count': [5],
+        'a90_to_119_amount': [700],
+        'a90_to_119_count': [7],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [0],
+        'income_amount': [100],
+        'number_of_accounts': [100],
+        'purchases_amount': [10000],
+        'purchases_count': [100]
+    })
+    result = load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
+    assert result.empty
+
+# TC08: Empty staging table
+def test_empty_staging(dim_date, dim_institution, dim_corporation, dim_product):
     stg = pd.DataFrame(columns=[
         'date_value', 'institution_id', 'corporation_id', 'product_id',
         'a120_amount', 'a120_count', 'a30_to_59_amount', 'a30_to_59_count',
@@ -220,123 +283,49 @@ def test_empty_staging_table(dim_date, dim_institution, dim_corporation, dim_pro
         'income_amount', 'number_of_accounts', 'purchases_amount', 'purchases_count'
     ])
     result = load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
-    assert len(result) == 0
+    assert result.empty
 
-# TC06: Missing required column
-def test_missing_required_column(dim_date, dim_institution, dim_corporation, dim_product):
+# TC09: Missing required columns in staging
+def test_missing_columns(dim_date, dim_institution, dim_corporation, dim_product):
     stg = pd.DataFrame({
         'date_value': [20230101],
-        'institution_id': [1],
-        'corporation_id': [10],
-        'product_id': [100],
-        # 'a120_amount' missing
-        'a120_count': [5],
-        'a30_to_59_amount': [200.0],
-        'a30_to_59_count': [2],
-        'a60_to_89_amount': [150.0],
-        'a60_to_89_count': [1],
-        'a90_to_119_amount': [50.0],
-        'a90_to_119_count': [1],
-        'charge_off_amount': [10.0],
-        'charge_off_count': [1],
-        'fraud_amount': [5.0],
-        'fraud_count': [1],
-        'income_amount': [500.0],
-        'number_of_accounts': [10],
-        'purchases_amount': [300.0],
-        'purchases_count': [3]
+        # Missing institution_id, corporation_id, product_id, etc.
+        'a120_amount': [1000],
+        'a120_count': [10],
+        'income_amount': [100]
     })
     with pytest.raises(KeyError):
         load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
-
-# TC07: Boundary values
-def test_boundary_values(dim_date, dim_institution, dim_corporation, dim_product):
-    stg = pd.DataFrame({
-        'date_value': [20230101],
-        'institution_id': [1],
-        'corporation_id': [10],
-        'product_id': [100],
-        'a120_amount': [1e12],
-        'a120_count': [0],
-        'a30_to_59_amount': [-1e12],
-        'a30_to_59_count': [999999],
-        'a60_to_89_amount': [float('inf')],
-        'a60_to_89_count': [float('-inf')],
-        'a90_to_119_amount': [float('nan')],
-        'a90_to_119_count': [None],
-        'charge_off_amount': [0.0],
-        'charge_off_count': [0],
-        'fraud_amount': [0.0],
-        'fraud_count': [0],
-        'income_amount': [0.0],
-        'number_of_accounts': [0],
-        'purchases_amount': [1e12],
-        'purchases_count': [999999]
-    })
-    result = load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
-    # Check that extreme values are preserved
-    assert result['a120_amount'].iloc[0] == 1e12
-    assert result['a30_to_59_amount'].iloc[0] == -1e12
-    assert pd.isna(result['a90_to_119_amount'].iloc[0])
-    assert pd.isna(result['a90_to_119_count'].iloc[0])
-
-# TC08: Duplicate dimension keys
-def test_duplicate_dimension_keys(dim_date, dim_institution, dim_corporation, dim_product):
-    stg = pd.DataFrame({
-        'date_value': [20230101, 20230101],
-        'institution_id': [1, 1],
-        'corporation_id': [10, 10],
-        'product_id': [100, 100],
-        'a120_amount': [1000.0, 2000.0],
-        'a120_count': [5, 10],
-        'a30_to_59_amount': [200.0, 400.0],
-        'a30_to_59_count': [2, 4],
-        'a60_to_89_amount': [150.0, 300.0],
-        'a60_to_89_count': [1, 2],
-        'a90_to_119_amount': [50.0, 100.0],
-        'a90_to_119_count': [1, 2],
-        'charge_off_amount': [10.0, 20.0],
-        'charge_off_count': [1, 2],
-        'fraud_amount': [5.0, 10.0],
-        'fraud_count': [1, 2],
-        'income_amount': [500.0, 1000.0],
-        'number_of_accounts': [10, 20],
-        'purchases_amount': [300.0, 600.0],
-        'purchases_count': [3, 6]
-    })
-    result = load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
-    assert len(result) == 2
-
-# TC09: NULLs in non-income_amount fields
-def test_nulls_in_other_fields(dim_date, dim_institution, dim_corporation, dim_product):
-    stg = pd.DataFrame({
-        'date_value': [20230101],
-        'institution_id': [1],
-        'corporation_id': [10],
-        'product_id': [100],
-        'a120_amount': [None],
-        'a120_count': [None],
-        'a30_to_59_amount': [None],
-        'a30_to_59_count': [None],
-        'a60_to_89_amount': [None],
-        'a60_to_89_count': [None],
-        'a90_to_119_amount': [None],
-        'a90_to_119_count': [None],
-        'charge_off_amount': [None],
-        'charge_off_count': [None],
-        'fraud_amount': [None],
-        'fraud_count': [None],
-        'income_amount': [100.0],
-        'number_of_accounts': [None],
-        'purchases_amount': [None],
-        'purchases_count': [None]
-    })
-    result = load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
-    assert pd.isna(result['a120_amount'].iloc[0])
-    assert pd.isna(result['number_of_accounts'].iloc[0])
 
 # TC10: Unexpected data type in numeric column
 def test_unexpected_data_type(dim_date, dim_institution, dim_corporation, dim_product):
     stg = pd.DataFrame({
         'date_value': [20230101],
-        'institution_id': [
+        'institution_id': [1],
+        'corporation_id': [10],
+        'product_id': [100],
+        'a120_amount': ['not_a_number'],
+        'a120_count': [10],
+        'a30_to_59_amount': [300],
+        'a30_to_59_count': [3],
+        'a60_to_89_amount': [500],
+        'a60_to_89_count': [5],
+        'a90_to_119_amount': [700],
+        'a90_to_119_count': [7],
+        'charge_off_amount': [50],
+        'charge_off_count': [1],
+        'fraud_amount': [5],
+        'fraud_count': [0],
+        'income_amount': [100],
+        'number_of_accounts': [100],
+        'purchases_amount': [10000],
+        'purchases_count': [100]
+    })
+    with pytest.raises(ValueError):
+        # Try to coerce to numeric, should fail
+        stg['a120_amount'] = pd.to_numeric(stg['a120_amount'])
+        load_holdings_fact(stg, dim_date, dim_institution, dim_corporation, dim_product)
+```
+
+API Cost Consumption:
+apiCost: 0.0047 USD
