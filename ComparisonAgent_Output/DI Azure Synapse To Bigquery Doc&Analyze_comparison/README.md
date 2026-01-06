@@ -1,6 +1,6 @@
 # Comparison Report
 
-Generated: 2026-01-06 11:39:49
+Generated: 2026-01-06 12:01:03
 
 ## Sources
 - AAVA 1.0: DI_Azure_Synapse_To_Bigquery_Doc_Analyze
