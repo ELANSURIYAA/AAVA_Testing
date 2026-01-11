@@ -1,11 +1,11 @@
 # Comparison Report
 
-Generated: 2026-01-12 02:00:43
+Generated: 2026-01-12 02:46:07
 
 ## Sources
 - AAVA 1.0: DI_Teradata_To_Snowflake_Conversion
 - AAVA 2.0: DI Teradata To Snowflake Conversion
 
 ## Files
-- 📊 Excel Summary: `Comparison_Summary_*.xlsx` - All summary tables extracted
-- 📝 TXT Report: `*.txt` - Full comparison analysis
+- 📊 Excel: `<agent_name>.xlsx` - All tables
+- 📄 JSON: `*.json` - Full structured data
