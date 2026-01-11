@@ -1,11 +1,11 @@
-# Comparison: Azure Synapse to Fabric Workflow1
+# Comparison Report
 
-Generated: 2025-12-18 20:38:02
+Generated: 2026-01-12 03:29:09
 
 ## Sources
-- AAVA 1.0: DI_Azure_Synapse_To_Fabric_Conversion (5 files)
-- AAVA 2.0: Azure Synapse to Fabric Workflow1 (2 files)
+- AAVA 1.0: DI_Azure_Synapse_To_Bigquery_Doc_Analyze
+- AAVA 2.0: Azure Synapse to Fabric Workflow1
 
-## Comparison Report
-
-See detailed outputs below.
+## Files
+- 📊 Excel: `<agent_name>.xlsx` - All tables
+- 📄 JSON: `*.json` - Full structured data
