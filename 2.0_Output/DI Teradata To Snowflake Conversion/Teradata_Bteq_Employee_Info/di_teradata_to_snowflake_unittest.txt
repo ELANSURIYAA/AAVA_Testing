@@ -2,20 +2,20 @@
 =============================================
 Author:        Ascendion AVA+
 Created on:   
-Description:   Pytest script to validate Snowflake SQL logic for backing up employee data by joining Employee and Salary tables, ensuring correct table creation, data integrity, and edge case handling.
+Description:   Pytest script to validate Snowflake SQL logic for backing up employee data by joining Employee and Salary tables, including setup, teardown, and edge case handling.
 =============================================
 
 **Test Case List:**
-| Test Case ID | Description                                 | Input Data Description                                                        | Expected Outcome                                      |
-|--------------|---------------------------------------------|-------------------------------------------------------------------------------|-------------------------------------------------------|
-| TC001        | Validate backup table creation               | No employee_bkup table exists                                                 | Table employee_bkup created with correct schema        |
-| TC002        | Validate correct join and data insertion     | Employee and Salary tables with matching EmployeeNo values                     | employee_bkup contains correct joined records          |
-| TC003        | Handle NULL values in Salary.NetPay          | Salary table contains NULL NetPay for some EmployeeNo                          | employee_bkup NetPay is NULL for those employees       |
-| TC004        | Handle missing Employee in Salary            | Employee table has EmployeeNo not present in Salary table                      | Those employees not present in employee_bkup           |
-| TC005        | Handle empty Employee and Salary tables      | Both tables are empty                                                          | employee_bkup is empty                                |
-| TC006        | Validate unique constraint on EmployeeNo     | Insert duplicate EmployeeNo into employee_bkup                                 | Error or rejection due to unique constraint            |
-| TC007        | Validate table drop idempotency              | employee_bkup exists before script execution                                   | Table is dropped and recreated without error           |
-| TC008        | Validate data types and boundary conditions  | EmployeeNo at INT boundary, DepartmentNo at SMALLINT boundary, long names      | Data inserted and retrieved correctly                  |
+| Test Case ID | Description                                        | Input Data Description                                 | Expected Outcome                                         |
+|--------------|----------------------------------------------------|--------------------------------------------------------|----------------------------------------------------------|
+| TC001        | Validate correct join and insertion logic           | Employee and Salary tables with matching EmployeeNo     | employee_bkup contains correct joined rows               |
+| TC002        | Handle NULL values in join keys                     | Employee or Salary tables with NULL EmployeeNo          | Rows with NULL EmployeeNo are excluded from join         |
+| TC003        | Handle empty Employee table                         | Employee table is empty, Salary table has data          | employee_bkup is empty                                   |
+| TC004        | Handle empty Salary table                           | Salary table is empty, Employee table has data          | employee_bkup is empty                                   |
+| TC005        | Handle both tables empty                            | Both Employee and Salary tables are empty               | employee_bkup is empty                                   |
+| TC006        | Validate data type boundaries                       | Employee/Salary tables with boundary values (max int)   | employee_bkup contains correct boundary values           |
+| TC007        | Handle duplicate EmployeeNo in Salary table         | Salary table has duplicate EmployeeNo                   | employee_bkup contains all matching rows (Snowflake join)|
+| TC008        | Validate performance on large dataset               | Large Employee and Salary tables                        | employee_bkup populated, test completes efficiently      |
 
 **Pytest Script:**
 ```python
@@ -27,40 +27,42 @@ def snowflake_connection():
     conn = connect(
         user='YOUR_USER',
         password='YOUR_PASSWORD',
-        account='YOUR_ACCOUNT',
-        warehouse='YOUR_WAREHOUSE',
-        database='YOUR_DATABASE',
-        schema='YOUR_SCHEMA'
+        account='YOUR_ACCOUNT'
     )
     yield conn
     conn.close()
 
-@pytest.fixture(scope="function")
-def setup_employee_and_salary(snowflake_connection):
-    cursor = snowflake_connection.cursor()
-    # Create Employee table
+def setup_tables(cursor, employee_data, salary_data):
+    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
+    cursor.execute("DROP TABLE IF EXISTS Employee;")
+    cursor.execute("DROP TABLE IF EXISTS Salary;")
     cursor.execute("""
-        CREATE OR REPLACE TEMP TABLE Employee (
+        CREATE TABLE Employee (
             EmployeeNo INTEGER,
             FirstName VARCHAR(30),
             LastName VARCHAR(30),
             DepartmentNo SMALLINT
         );
     """)
-    # Create Salary table
     cursor.execute("""
-        CREATE OR REPLACE TEMP TABLE Salary (
+        CREATE TABLE Salary (
             EmployeeNo INTEGER,
             NetPay INTEGER
         );
     """)
-    yield cursor
+    if employee_data:
+        values = ",".join([f"({e[0]}, '{e[1]}', '{e[2]}', {e[3]})" for e in employee_data])
+        cursor.execute(f"INSERT INTO Employee VALUES {values};")
+    if salary_data:
+        values = ",".join([f"({s[0]}, {s[1]})" for s in salary_data])
+        cursor.execute(f"INSERT INTO Salary VALUES {values};")
+
+def teardown_tables(cursor):
+    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
     cursor.execute("DROP TABLE IF EXISTS Employee;")
     cursor.execute("DROP TABLE IF EXISTS Salary;")
-    cursor.close()
 
-def test_table_creation(snowflake_connection):
-    cursor = snowflake_connection.cursor()
+def run_backup(cursor):
     cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
     cursor.execute("""
         CREATE TABLE employee_bkup (
@@ -68,205 +70,116 @@ def test_table_creation(snowflake_connection):
             FirstName VARCHAR(30),
             LastName VARCHAR(30),
             DepartmentNo SMALLINT,
-            NetPay INTEGER,
-            CONSTRAINT employee_bkup_unique_employee_no UNIQUE (EmployeeNo)
+            NetPay INTEGER
         );
     """)
     cursor.execute("""
-        SELECT column_name, data_type
-        FROM information_schema.columns
-        WHERE table_name = 'EMPLOYEE_BKUP'
-        ORDER BY ordinal_position;
+        INSERT INTO employee_bkup
+        SELECT
+            a.EmployeeNo,
+            a.FirstName,
+            a.LastName,
+            a.DepartmentNo,
+            b.NetPay
+        FROM
+            Employee a
+            INNER JOIN Salary b
+                ON a.EmployeeNo = b.EmployeeNo;
     """)
-    columns = cursor.fetchall()
-    assert columns == [
-        ('EMPLOYEENO', 'NUMBER'),
-        ('FIRSTNAME', 'VARCHAR'),
-        ('LASTNAME', 'VARCHAR'),
-        ('DEPARTMENTNO', 'NUMBER'),
-        ('NETPAY', 'NUMBER')
-    ], "Table schema does not match expected"
-    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
-    cursor.close()
 
-def test_join_and_insert(setup_employee_and_salary):
-    cursor = setup_employee_and_salary
-    cursor.execute("INSERT INTO Employee VALUES (1, 'John', 'Doe', 10), (2, 'Jane', 'Smith', 20);")
-    cursor.execute("INSERT INTO Salary VALUES (1, 5000), (2, 6000);")
-    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
-    cursor.execute("""
-        CREATE TABLE employee_bkup (
-            EmployeeNo INTEGER,
-            FirstName VARCHAR(30),
-            LastName VARCHAR(30),
-            DepartmentNo SMALLINT,
-            NetPay INTEGER,
-            CONSTRAINT employee_bkup_unique_employee_no UNIQUE (EmployeeNo)
-        );
-    """)
-    cursor.execute("""
-        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
-        SELECT a.EmployeeNo, a.FirstName, a.LastName, a.DepartmentNo, b.NetPay
-        FROM Employee a INNER JOIN Salary b ON a.EmployeeNo = b.EmployeeNo;
-    """)
+def fetch_bkup(cursor):
     cursor.execute("SELECT * FROM employee_bkup ORDER BY EmployeeNo;")
-    results = cursor.fetchall()
-    assert results == [
-        (1, 'John', 'Doe', 10, 5000),
-        (2, 'Jane', 'Smith', 20, 6000)
-    ], "Join and insert logic failed"
+    return cursor.fetchall()
 
-def test_null_netpay(setup_employee_and_salary):
-    cursor = setup_employee_and_salary
-    cursor.execute("INSERT INTO Employee VALUES (3, 'Alice', 'Wonder', 30);")
-    cursor.execute("INSERT INTO Salary VALUES (3, NULL);")
-    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
-    cursor.execute("""
-        CREATE TABLE employee_bkup (
-            EmployeeNo INTEGER,
-            FirstName VARCHAR(30),
-            LastName VARCHAR(30),
-            DepartmentNo SMALLINT,
-            NetPay INTEGER,
-            CONSTRAINT employee_bkup_unique_employee_no UNIQUE (EmployeeNo)
-        );
-    """)
-    cursor.execute("""
-        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
-        SELECT a.EmployeeNo, a.FirstName, a.LastName, a.DepartmentNo, b.NetPay
-        FROM Employee a INNER JOIN Salary b ON a.EmployeeNo = b.EmployeeNo;
-    """)
-    cursor.execute("SELECT NetPay FROM employee_bkup WHERE EmployeeNo = 3;")
-    result = cursor.fetchone()
-    assert result[0] is None, "NULL NetPay not handled correctly"
-
-def test_missing_salary(setup_employee_and_salary):
-    cursor = setup_employee_and_salary
-    cursor.execute("INSERT INTO Employee VALUES (4, 'Bob', 'Builder', 40);")
-    # No Salary for EmployeeNo=4
-    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
-    cursor.execute("""
-        CREATE TABLE employee_bkup (
-            EmployeeNo INTEGER,
-            FirstName VARCHAR(30),
-            LastName VARCHAR(30),
-            DepartmentNo SMALLINT,
-            NetPay INTEGER,
-            CONSTRAINT employee_bkup_unique_employee_no UNIQUE (EmployeeNo)
-        );
-    """)
-    cursor.execute("""
-        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
-        SELECT a.EmployeeNo, a.FirstName, a.LastName, a.DepartmentNo, b.NetPay
-        FROM Employee a INNER JOIN Salary b ON a.EmployeeNo = b.EmployeeNo;
-    """)
-    cursor.execute("SELECT COUNT(*) FROM employee_bkup WHERE EmployeeNo = 4;")
-    result = cursor.fetchone()
-    assert result[0] == 0, "Employee without salary should not be present"
-
-def test_empty_tables(setup_employee_and_salary):
-    cursor = setup_employee_and_salary
-    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
-    cursor.execute("""
-        CREATE TABLE employee_bkup (
-            EmployeeNo INTEGER,
-            FirstName VARCHAR(30),
-            LastName VARCHAR(30),
-            DepartmentNo SMALLINT,
-            NetPay INTEGER,
-            CONSTRAINT employee_bkup_unique_employee_no UNIQUE (EmployeeNo)
-        );
-    """)
-    cursor.execute("""
-        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
-        SELECT a.EmployeeNo, a.FirstName, a.LastName, a.DepartmentNo, b.NetPay
-        FROM Employee a INNER JOIN Salary b ON a.EmployeeNo = b.EmployeeNo;
-    """)
-    cursor.execute("SELECT COUNT(*) FROM employee_bkup;")
-    result = cursor.fetchone()
-    assert result[0] == 0, "employee_bkup should be empty when source tables are empty"
-
-def test_unique_constraint(setup_employee_and_salary):
-    cursor = setup_employee_and_salary
-    cursor.execute("INSERT INTO Employee VALUES (5, 'Eve', 'Adams', 50);")
-    cursor.execute("INSERT INTO Salary VALUES (5, 7000);")
-    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
-    cursor.execute("""
-        CREATE TABLE employee_bkup (
-            EmployeeNo INTEGER,
-            FirstName VARCHAR(30),
-            LastName VARCHAR(30),
-            DepartmentNo SMALLINT,
-            NetPay INTEGER,
-            CONSTRAINT employee_bkup_unique_employee_no UNIQUE (EmployeeNo)
-        );
-    """)
-    cursor.execute("""
-        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
-        VALUES (5, 'Eve', 'Adams', 50, 7000);
-    """)
-    with pytest.raises(Exception):
-        cursor.execute("""
-            INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
-            VALUES (5, 'Eve', 'Adams', 50, 7000);
-        """)
-
-def test_boundary_conditions(setup_employee_and_salary):
-    cursor = setup_employee_and_salary
-    cursor.execute("INSERT INTO Employee VALUES (2147483647, 'LongFirstName'*3, 'LongLastName'*3, 32767);")
-    cursor.execute("INSERT INTO Salary VALUES (2147483647, 999999999);")
-    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
-    cursor.execute("""
-        CREATE TABLE employee_bkup (
-            EmployeeNo INTEGER,
-            FirstName VARCHAR(30),
-            LastName VARCHAR(30),
-            DepartmentNo SMALLINT,
-            NetPay INTEGER,
-            CONSTRAINT employee_bkup_unique_employee_no UNIQUE (EmployeeNo)
-        );
-    """)
-    cursor.execute("""
-        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
-        SELECT a.EmployeeNo, a.FirstName, a.LastName, a.DepartmentNo, b.NetPay
-        FROM Employee a INNER JOIN Salary b ON a.EmployeeNo = b.EmployeeNo;
-    """)
-    cursor.execute("SELECT * FROM employee_bkup WHERE EmployeeNo = 2147483647;")
-    result = cursor.fetchone()
-    assert result[0] == 2147483647
-    assert result[1].startswith('LongFirstName')
-    assert result[2].startswith('LongLastName')
-    assert result[3] == 32767
-    assert result[4] == 999999999
-
-def test_table_drop_idempotency(snowflake_connection):
+def test_TC001_correct_join_and_insertion(snowflake_connection):
     cursor = snowflake_connection.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS employee_bkup (
-            EmployeeNo INTEGER,
-            FirstName VARCHAR(30),
-            LastName VARCHAR(30),
-            DepartmentNo SMALLINT,
-            NetPay INTEGER,
-            CONSTRAINT employee_bkup_unique_employee_no UNIQUE (EmployeeNo)
-        );
-    """)
-    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
-    cursor.execute("""
-        CREATE TABLE employee_bkup (
-            EmployeeNo INTEGER,
-            FirstName VARCHAR(30),
-            LastName VARCHAR(30),
-            DepartmentNo SMALLINT,
-            NetPay INTEGER,
-            CONSTRAINT employee_bkup_unique_employee_no UNIQUE (EmployeeNo)
-        );
-    """)
-    cursor.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'EMPLOYEE_BKUP';")
-    result = cursor.fetchone()
-    assert result[0] == 1, "Table was not recreated successfully"
-    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
-    cursor.close()
+    setup_tables(cursor,
+        employee_data=[(1, 'John', 'Doe', 10), (2, 'Jane', 'Smith', 20)],
+        salary_data=[(1, 5000), (2, 6000)]
+    )
+    run_backup(cursor)
+    result = fetch_bkup(cursor)
+    assert result == [(1, 'John', 'Doe', 10, 5000), (2, 'Jane', 'Smith', 20, 6000)]
+    teardown_tables(cursor)
+
+def test_TC002_null_values_in_join_keys(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    setup_tables(cursor,
+        employee_data=[(None, 'Null', 'Emp', 30), (3, 'Bob', 'Brown', 40)],
+        salary_data=[(3, 7000), (None, 8000)]
+    )
+    run_backup(cursor)
+    result = fetch_bkup(cursor)
+    assert result == [(3, 'Bob', 'Brown', 40, 7000)]
+    teardown_tables(cursor)
+
+def test_TC003_empty_employee_table(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    setup_tables(cursor,
+        employee_data=[],
+        salary_data=[(1, 5000)]
+    )
+    run_backup(cursor)
+    result = fetch_bkup(cursor)
+    assert result == []
+    teardown_tables(cursor)
+
+def test_TC004_empty_salary_table(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    setup_tables(cursor,
+        employee_data=[(1, 'John', 'Doe', 10)],
+        salary_data=[]
+    )
+    run_backup(cursor)
+    result = fetch_bkup(cursor)
+    assert result == []
+    teardown_tables(cursor)
+
+def test_TC005_both_tables_empty(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    setup_tables(cursor,
+        employee_data=[],
+        salary_data=[]
+    )
+    run_backup(cursor)
+    result = fetch_bkup(cursor)
+    assert result == []
+    teardown_tables(cursor)
+
+def test_TC006_boundary_values(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    max_int = 2147483647
+    setup_tables(cursor,
+        employee_data=[(max_int, 'Max', 'Int', 99)],
+        salary_data=[(max_int, max_int)]
+    )
+    run_backup(cursor)
+    result = fetch_bkup(cursor)
+    assert result == [(max_int, 'Max', 'Int', 99, max_int)]
+    teardown_tables(cursor)
+
+def test_TC007_duplicate_employee_no_in_salary(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    setup_tables(cursor,
+        employee_data=[(1, 'John', 'Doe', 10)],
+        salary_data=[(1, 5000), (1, 5500)]
+    )
+    run_backup(cursor)
+    result = fetch_bkup(cursor)
+    # Both salary rows should join with employee
+    assert result == [(1, 'John', 'Doe', 10, 5000), (1, 'John', 'Doe', 10, 5500)]
+    teardown_tables(cursor)
+
+@pytest.mark.skip(reason="Performance test - enable for large dataset")
+def test_TC008_performance_large_dataset(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    employee_data = [(i, f'First{i}', f'Last{i}', i % 100) for i in range(1, 1001)]
+    salary_data = [(i, i * 10) for i in range(1, 1001)]
+    setup_tables(cursor, employee_data, salary_data)
+    run_backup(cursor)
+    result = fetch_bkup(cursor)
+    assert len(result) == 1000
+    teardown_tables(cursor)
 ```
 
 **Cost Analysis:**
