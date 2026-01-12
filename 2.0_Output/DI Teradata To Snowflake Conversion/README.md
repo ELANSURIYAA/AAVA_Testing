@@ -7,5 +7,5 @@ Inputs:
 - Teradata_Bteq_Employee_Info
 - DI_Teradata_To_Snowflake_Analyzer
 
-Execution ID: b2598fa6-88eb-4e4d-9c17-3d2f039e2562
-Execution Time: 2026-01-05 10:33:46 UTC
+Execution ID: ba7beba7-4498-4d65-b9a9-b9c49aa60fb1
+Execution Time: 2026-01-12 07:44:42 UTC
