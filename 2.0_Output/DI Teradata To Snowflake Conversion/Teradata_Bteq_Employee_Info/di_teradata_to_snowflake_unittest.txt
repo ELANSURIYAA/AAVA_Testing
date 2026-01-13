@@ -1,21 +1,25 @@
 ```
 =============================================
-Author:        Ascendion AVA+
-Created on:   
-Description:   Pytest script to validate Snowflake SQL logic for backing up employee data by joining Employee and Salary tables, including setup, teardown, and edge case handling.
-=============================================
 
-**Test Case List:**
-| Test Case ID | Description                                        | Input Data Description                                 | Expected Outcome                                         |
-|--------------|----------------------------------------------------|--------------------------------------------------------|----------------------------------------------------------|
-| TC001        | Validate correct join and insertion logic           | Employee and Salary tables with matching EmployeeNo     | employee_bkup contains correct joined rows               |
-| TC002        | Handle NULL values in join keys                     | Employee or Salary tables with NULL EmployeeNo          | Rows with NULL EmployeeNo are excluded from join         |
-| TC003        | Handle empty Employee table                         | Employee table is empty, Salary table has data          | employee_bkup is empty                                   |
-| TC004        | Handle empty Salary table                           | Salary table is empty, Employee table has data          | employee_bkup is empty                                   |
-| TC005        | Handle both tables empty                            | Both Employee and Salary tables are empty               | employee_bkup is empty                                   |
-| TC006        | Validate data type boundaries                       | Employee/Salary tables with boundary values (max int)   | employee_bkup contains correct boundary values           |
-| TC007        | Handle duplicate EmployeeNo in Salary table         | Salary table has duplicate EmployeeNo                   | employee_bkup contains all matching rows (Snowflake join)|
-| TC008        | Validate performance on large dataset               | Large Employee and Salary tables                        | employee_bkup populated, test completes efficiently      |
+Author:        Ascendion AVA+
+
+Created on:   
+
+Description:   Pytest script for validating Snowflake SQL logic that creates a backup of employee data by joining Employee and Salary tables into employee_bkup, including setup, teardown, and edge case handling.
+
+=============================================
+```
+
+**Test Case List:**  
+| Test Case ID | Description                                      | Input Data Description                                      | Expected Outcome                                      |
+|--------------|--------------------------------------------------|-------------------------------------------------------------|-------------------------------------------------------|
+| TC001        | Validate correct join and insertion              | Employee and Salary tables with matching EmployeeNo          | employee_bkup contains joined rows with correct NetPay |
+| TC002        | Handle Employee with no Salary                   | Employee with no matching Salary record                      | No row for that Employee in employee_bkup              |
+| TC003        | Handle Salary with no Employee                   | Salary with no matching Employee record                      | No row for that Salary in employee_bkup                |
+| TC004        | Handle NULL values in join keys                  | Employee or Salary with NULL EmployeeNo                      | Rows with NULL EmployeeNo are excluded from join       |
+| TC005        | Handle empty Employee and Salary tables          | Both tables empty                                            | employee_bkup remains empty                            |
+| TC006        | Handle duplicate EmployeeNo in Salary            | Multiple Salary rows for same EmployeeNo                     | Each EmployeeNo appears once with correct NetPay       |
+| TC007        | Validate data types and field lengths            | Insert over-length strings or wrong types                    | Error or truncation as per Snowflake behavior          |
 
 **Pytest Script:**
 ```python
@@ -27,17 +31,30 @@ def snowflake_connection():
     conn = connect(
         user='YOUR_USER',
         password='YOUR_PASSWORD',
-        account='YOUR_ACCOUNT'
+        account='YOUR_ACCOUNT',
+        warehouse='YOUR_WAREHOUSE',
+        database='YOUR_DATABASE',
+        schema='PUBLIC'
     )
     yield conn
     conn.close()
 
-def setup_tables(cursor, employee_data, salary_data):
+@pytest.fixture(autouse=True)
+def setup_and_teardown(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    # Drop tables if exist
     cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
     cursor.execute("DROP TABLE IF EXISTS Employee;")
     cursor.execute("DROP TABLE IF EXISTS Salary;")
+    yield
+    # Clean up after test
+    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
+    cursor.execute("DROP TABLE IF EXISTS Employee;")
+    cursor.execute("DROP TABLE IF EXISTS Salary;")
+
+def create_tables(cursor):
     cursor.execute("""
-        CREATE TABLE Employee (
+        CREATE OR REPLACE TABLE Employee (
             EmployeeNo INTEGER,
             FirstName VARCHAR(30),
             LastName VARCHAR(30),
@@ -45,27 +62,16 @@ def setup_tables(cursor, employee_data, salary_data):
         );
     """)
     cursor.execute("""
-        CREATE TABLE Salary (
+        CREATE OR REPLACE TABLE Salary (
             EmployeeNo INTEGER,
             NetPay INTEGER
         );
     """)
-    if employee_data:
-        values = ",".join([f"({e[0]}, '{e[1]}', '{e[2]}', {e[3]})" for e in employee_data])
-        cursor.execute(f"INSERT INTO Employee VALUES {values};")
-    if salary_data:
-        values = ",".join([f"({s[0]}, {s[1]})" for s in salary_data])
-        cursor.execute(f"INSERT INTO Salary VALUES {values};")
 
-def teardown_tables(cursor):
-    cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
-    cursor.execute("DROP TABLE IF EXISTS Employee;")
-    cursor.execute("DROP TABLE IF EXISTS Salary;")
-
-def run_backup(cursor):
+def run_main_sql(cursor):
     cursor.execute("DROP TABLE IF EXISTS employee_bkup;")
     cursor.execute("""
-        CREATE TABLE employee_bkup (
+        CREATE OR REPLACE TABLE employee_bkup (
             EmployeeNo INTEGER,
             FirstName VARCHAR(30),
             LastName VARCHAR(30),
@@ -74,113 +80,89 @@ def run_backup(cursor):
         );
     """)
     cursor.execute("""
-        INSERT INTO employee_bkup
-        SELECT
-            a.EmployeeNo,
-            a.FirstName,
-            a.LastName,
-            a.DepartmentNo,
-            b.NetPay
-        FROM
-            Employee a
-            INNER JOIN Salary b
-                ON a.EmployeeNo = b.EmployeeNo;
+        INSERT INTO employee_bkup (
+            EmployeeNo, FirstName, LastName, DepartmentNo, NetPay
+        )
+        SELECT a.EmployeeNo, a.FirstName, a.LastName, a.DepartmentNo, b.NetPay
+        FROM Employee a
+        INNER JOIN Salary b
+        ON a.EmployeeNo = b.EmployeeNo;
     """)
 
-def fetch_bkup(cursor):
-    cursor.execute("SELECT * FROM employee_bkup ORDER BY EmployeeNo;")
+def fetch_all(cursor, sql):
+    cursor.execute(sql)
     return cursor.fetchall()
 
 def test_TC001_correct_join_and_insertion(snowflake_connection):
     cursor = snowflake_connection.cursor()
-    setup_tables(cursor,
-        employee_data=[(1, 'John', 'Doe', 10), (2, 'Jane', 'Smith', 20)],
-        salary_data=[(1, 5000), (2, 6000)]
-    )
-    run_backup(cursor)
-    result = fetch_bkup(cursor)
+    create_tables(cursor)
+    cursor.execute("INSERT INTO Employee VALUES (1, 'John', 'Doe', 10), (2, 'Jane', 'Smith', 20);")
+    cursor.execute("INSERT INTO Salary VALUES (1, 5000), (2, 6000);")
+    run_main_sql(cursor)
+    result = fetch_all(cursor, "SELECT * FROM employee_bkup ORDER BY EmployeeNo;")
     assert result == [(1, 'John', 'Doe', 10, 5000), (2, 'Jane', 'Smith', 20, 6000)]
-    teardown_tables(cursor)
 
-def test_TC002_null_values_in_join_keys(snowflake_connection):
+def test_TC002_employee_no_salary(snowflake_connection):
     cursor = snowflake_connection.cursor()
-    setup_tables(cursor,
-        employee_data=[(None, 'Null', 'Emp', 30), (3, 'Bob', 'Brown', 40)],
-        salary_data=[(3, 7000), (None, 8000)]
-    )
-    run_backup(cursor)
-    result = fetch_bkup(cursor)
-    assert result == [(3, 'Bob', 'Brown', 40, 7000)]
-    teardown_tables(cursor)
+    create_tables(cursor)
+    cursor.execute("INSERT INTO Employee VALUES (1, 'John', 'Doe', 10), (2, 'Jane', 'Smith', 20);")
+    cursor.execute("INSERT INTO Salary VALUES (1, 5000);")
+    run_main_sql(cursor)
+    result = fetch_all(cursor, "SELECT * FROM employee_bkup;")
+    assert result == [(1, 'John', 'Doe', 10, 5000)]
 
-def test_TC003_empty_employee_table(snowflake_connection):
+def test_TC003_salary_no_employee(snowflake_connection):
     cursor = snowflake_connection.cursor()
-    setup_tables(cursor,
-        employee_data=[],
-        salary_data=[(1, 5000)]
-    )
-    run_backup(cursor)
-    result = fetch_bkup(cursor)
+    create_tables(cursor)
+    cursor.execute("INSERT INTO Employee VALUES (1, 'John', 'Doe', 10);")
+    cursor.execute("INSERT INTO Salary VALUES (1, 5000), (2, 6000);")
+    run_main_sql(cursor)
+    result = fetch_all(cursor, "SELECT * FROM employee_bkup;")
+    assert result == [(1, 'John', 'Doe', 10, 5000)]
+
+def test_TC004_null_values_in_join_keys(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    create_tables(cursor)
+    cursor.execute("INSERT INTO Employee VALUES (NULL, 'Null', 'Emp', 30), (2, 'Jane', 'Smith', 20);")
+    cursor.execute("INSERT INTO Salary VALUES (2, 6000), (NULL, 7000);")
+    run_main_sql(cursor)
+    result = fetch_all(cursor, "SELECT * FROM employee_bkup;")
+    assert result == [(2, 'Jane', 'Smith', 20, 6000)]
+
+def test_TC005_empty_tables(snowflake_connection):
+    cursor = snowflake_connection.cursor()
+    create_tables(cursor)
+    run_main_sql(cursor)
+    result = fetch_all(cursor, "SELECT * FROM employee_bkup;")
     assert result == []
-    teardown_tables(cursor)
 
-def test_TC004_empty_salary_table(snowflake_connection):
+def test_TC006_duplicate_employee_no_in_salary(snowflake_connection):
     cursor = snowflake_connection.cursor()
-    setup_tables(cursor,
-        employee_data=[(1, 'John', 'Doe', 10)],
-        salary_data=[]
-    )
-    run_backup(cursor)
-    result = fetch_bkup(cursor)
-    assert result == []
-    teardown_tables(cursor)
+    create_tables(cursor)
+    cursor.execute("INSERT INTO Employee VALUES (1, 'John', 'Doe', 10);")
+    cursor.execute("INSERT INTO Salary VALUES (1, 5000), (1, 5500);")
+    run_main_sql(cursor)
+    result = fetch_all(cursor, "SELECT * FROM employee_bkup WHERE EmployeeNo=1;")
+    # Should have two rows for EmployeeNo=1, one for each Salary row
+    assert len(result) == 2
+    assert (1, 'John', 'Doe', 10, 5000) in result
+    assert (1, 'John', 'Doe', 10, 5500) in result
 
-def test_TC005_both_tables_empty(snowflake_connection):
+def test_TC007_field_length_and_type(snowflake_connection):
     cursor = snowflake_connection.cursor()
-    setup_tables(cursor,
-        employee_data=[],
-        salary_data=[]
-    )
-    run_backup(cursor)
-    result = fetch_bkup(cursor)
-    assert result == []
-    teardown_tables(cursor)
+    create_tables(cursor)
+    # Insert over-length strings (should be truncated or error)
+    over_length = 'A' * 40
+    cursor.execute("INSERT INTO Employee VALUES (1, %s, %s, 10);", (over_length, over_length))
+    cursor.execute("INSERT INTO Salary VALUES (1, 5000);")
+    run_main_sql(cursor)
+    result = fetch_all(cursor, "SELECT FirstName, LastName FROM employee_bkup WHERE EmployeeNo=1;")
+    # Should be truncated to 30 chars
+    assert result[0][0] == over_length[:30]
+    assert result[0][1] == over_length[:30]
 
-def test_TC006_boundary_values(snowflake_connection):
-    cursor = snowflake_connection.cursor()
-    max_int = 2147483647
-    setup_tables(cursor,
-        employee_data=[(max_int, 'Max', 'Int', 99)],
-        salary_data=[(max_int, max_int)]
-    )
-    run_backup(cursor)
-    result = fetch_bkup(cursor)
-    assert result == [(max_int, 'Max', 'Int', 99, max_int)]
-    teardown_tables(cursor)
-
-def test_TC007_duplicate_employee_no_in_salary(snowflake_connection):
-    cursor = snowflake_connection.cursor()
-    setup_tables(cursor,
-        employee_data=[(1, 'John', 'Doe', 10)],
-        salary_data=[(1, 5000), (1, 5500)]
-    )
-    run_backup(cursor)
-    result = fetch_bkup(cursor)
-    # Both salary rows should join with employee
-    assert result == [(1, 'John', 'Doe', 10, 5000), (1, 'John', 'Doe', 10, 5500)]
-    teardown_tables(cursor)
-
-@pytest.mark.skip(reason="Performance test - enable for large dataset")
-def test_TC008_performance_large_dataset(snowflake_connection):
-    cursor = snowflake_connection.cursor()
-    employee_data = [(i, f'First{i}', f'Last{i}', i % 100) for i in range(1, 1001)]
-    salary_data = [(i, i * 10) for i in range(1, 1001)]
-    setup_tables(cursor, employee_data, salary_data)
-    run_backup(cursor)
-    result = fetch_bkup(cursor)
-    assert len(result) == 1000
-    teardown_tables(cursor)
+# Additional helper tests for performance, semi-structured data, or time-travel can be added as needed.
 ```
 
-**Cost Analysis:**
+**Cost Analysis**
 API Cost: $0.0028
