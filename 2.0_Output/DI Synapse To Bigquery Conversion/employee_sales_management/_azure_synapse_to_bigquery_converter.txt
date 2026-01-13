@@ -1,24 +1,30 @@
 =============================================
 Author:        AAVA
 Created on:   
-Description:   Loads sales fact data from staging to fact table with data quality validation, audit logging, and error handling. Implements ETL logic, dimensional lookups, and maintains audit trails in BigQuery.
-=============================================
+Description:   Loads sales fact table from staging, performs data quality validation, dimensional enrichment, and audit logging in BigQuery. Implements ETL logic with error handling and logging.
 
 -- BigQuery SQL Script: Sales Fact Table Loading with Data Quality Validation and Audit Logging
 
-CREATE OR REPLACE PROCEDURE dw.sp_load_sales_fact()
-BEGIN
-  -- Variable Declarations
-  DECLARE batch_id STRING DEFAULT GENERATE_UUID();
-  DECLARE start_time DATETIME DEFAULT CURRENT_DATETIME();
-  DECLARE end_time DATETIME;
-  DECLARE rows_inserted INT64 DEFAULT 0;
-  DECLARE rows_rejected INT64 DEFAULT 0;
-  DECLARE error_message STRING;
-  DECLARE proc_name STRING DEFAULT 'dw.sp_load_sales_fact';
+-- This script replicates the Azure Synapse stored procedure `dw.sp_load_sales_fact` in Google BigQuery.
+-- It loads cleaned sales transactions from staging, performs data quality checks, enriches with dimension data,
+-- logs audit information, and records validation failures.
 
+-- Assumptions:
+-- - Table names: `stg_Sales_Transactions`, `dw_Dim_Customer`, `dw_Dim_Date`, `dw_Fact_Sales`, `dw_Audit_Log`, `dw_DQ_Failures`
+-- - All table schemas are compatible with BigQuery data types.
+-- - This script is intended to be run as a BigQuery stored procedure or script.
+
+DECLARE batch_id STRING DEFAULT GENERATE_UUID();
+DECLARE start_time DATETIME DEFAULT CURRENT_DATETIME();
+DECLARE end_time DATETIME;
+DECLARE rows_inserted INT64 DEFAULT 0;
+DECLARE rows_rejected INT64 DEFAULT 0;
+DECLARE error_message STRING;
+DECLARE proc_name STRING DEFAULT 'sp_load_sales_fact';
+
+BEGIN
   -- 1. Start Audit Logging
-  INSERT INTO dw.Audit_Log (
+  INSERT INTO dw_Audit_Log (
     Batch_ID,
     Procedure_Name,
     Start_Time,
@@ -33,125 +39,108 @@ BEGIN
     'Sales Fact Load Initiated'
   );
 
-  -- Use a BEGIN...EXCEPTION block for error handling
-  BEGIN
-    -- 2. Data Quality Validation: Identify Invalid Rows
-    WITH InvalidRows AS (
-      SELECT Transaction_ID, 'Missing CustomerID' AS Reason
-      FROM stg.Sales_Transactions
-      WHERE Customer_ID IS NULL
-      UNION ALL
-      SELECT Transaction_ID, 'Invalid Quantity' AS Reason
-      FROM stg.Sales_Transactions
-      WHERE Quantity <= 0
-    ),
+  -- 2. Data Quality Checks: Identify Invalid Rows
+  CREATE TEMP TABLE InvalidRows AS
+  SELECT Transaction_ID, 'Missing CustomerID' AS Reason
+    FROM stg_Sales_Transactions
+   WHERE Customer_ID IS NULL
+  UNION ALL
+  SELECT Transaction_ID, 'Invalid Quantity' AS Reason
+    FROM stg_Sales_Transactions
+   WHERE Quantity <= 0;
 
-    -- 3. Cleaned Transactions (valid rows only)
-    Cleaned_Transactions AS (
-      SELECT *
-      FROM stg.Sales_Transactions s
-      WHERE NOT EXISTS (
-        SELECT 1 FROM InvalidRows i WHERE i.Transaction_ID = s.Transaction_ID
-      )
-    ),
+  -- 3. Remove Invalid Rows from Staging (for this batch)
+  DELETE FROM stg_Sales_Transactions
+   WHERE Transaction_ID IN (SELECT Transaction_ID FROM InvalidRows);
 
-    -- 4. Transformed Data for Fact Table
-    transformed AS (
-      SELECT
-        s.Transaction_ID,
-        s.Customer_ID,
-        s.Product_ID,
-        s.Sales_Date,
-        s.Quantity,
-        s.Unit_Price,
-        s.Quantity * s.Unit_Price AS Total_Sales_Amount,
-        d.Region_ID,
-        c.Customer_Segment,
-        CURRENT_DATETIME() AS Load_Timestamp,
-        batch_id AS Batch_ID
-      FROM Cleaned_Transactions s
-      INNER JOIN dw.Dim_Customer c
-        ON s.Customer_ID = c.Customer_ID
-      INNER JOIN dw.Dim_Date d
-        ON DATE(s.Sales_Date) = d.Date_Value
-    )
+  SET rows_rejected = (SELECT COUNT(*) FROM InvalidRows);
 
-    -- 5. Insert Valid Data into Fact Table
-    INSERT INTO dw.Fact_Sales (
-      Transaction_ID,
-      Customer_ID,
-      Product_ID,
-      Sales_Date,
-      Quantity,
-      Unit_Price,
-      Total_Sales_Amount,
-      Region_ID,
-      Customer_Segment,
-      Load_Timestamp,
-      Batch_ID
-    )
-    SELECT *
-    FROM transformed;
-
-    -- 6. Count Inserted Rows
-    SET rows_inserted = (SELECT COUNT(*) FROM transformed);
-
-    -- 7. Delete All Rows from Staging Table (TRUNCATE equivalent)
-    DELETE FROM stg.Sales_Transactions WHERE TRUE;
-
-    -- 8. Log Validation Failures
-    INSERT INTO dw.DQ_Failures (
-      Transaction_ID,
-      Failure_Reason,
-      Logged_Timestamp,
-      Batch_ID
-    )
+  -- 4. Load Cleaned Data into Fact Table with Dimensional Enrichment
+  INSERT INTO dw_Fact_Sales (
+    Transaction_ID,
+    Customer_ID,
+    Product_ID,
+    Sales_Date,
+    Quantity,
+    Unit_Price,
+    Total_Sales_Amount,
+    Region_ID,
+    Customer_Segment,
+    Load_Timestamp,
+    Batch_ID
+  )
+  WITH transformed AS (
     SELECT
-      Transaction_ID,
-      Reason,
-      CURRENT_DATETIME(),
-      batch_id
-    FROM InvalidRows;
+      s.Transaction_ID,
+      s.Customer_ID,
+      s.Product_ID,
+      s.Sales_Date,
+      s.Quantity,
+      s.Unit_Price,
+      s.Quantity * s.Unit_Price AS Total_Sales_Amount,
+      d.Region_ID,
+      c.Customer_Segment,
+      CURRENT_DATETIME() AS Load_Timestamp,
+      batch_id AS Batch_ID
+    FROM stg_Sales_Transactions s
+    INNER JOIN dw_Dim_Customer c
+      ON s.Customer_ID = c.Customer_ID
+    INNER JOIN dw_Dim_Date d
+      ON DATE(s.Sales_Date) = d.Date_Value
+  )
+  SELECT * FROM transformed;
 
-    -- 9. Count Rejected Rows
-    SET rows_rejected = (SELECT COUNT(*) FROM InvalidRows);
+  SET rows_inserted = (SELECT COUNT(*) FROM transformed);
 
-    -- 10. End Audit Log
-    SET end_time = CURRENT_DATETIME();
-    UPDATE dw.Audit_Log
-    SET
-      End_Time = end_time,
-      Rows_Inserted = rows_inserted,
-      Rows_Rejected = rows_rejected,
-      Status = 'COMPLETED',
-      Message = CONCAT('Inserted ', CAST(rows_inserted AS STRING), ' rows; Rejected ', CAST(rows_rejected AS STRING), ' rows.')
-    WHERE Batch_ID = batch_id;
+  -- 5. Truncate Staging Table (delete all rows)
+  DELETE FROM stg_Sales_Transactions WHERE TRUE;
 
-  EXCEPTION WHEN ERROR THEN
-    -- 11. Error Handling and Audit Logging
-    SET end_time = CURRENT_DATETIME();
-    SET error_message = ERROR_MESSAGE();
+  -- 6. Log Validation Failures
+  INSERT INTO dw_DQ_Failures (
+    Transaction_ID,
+    Failure_Reason,
+    Logged_Timestamp,
+    Batch_ID
+  )
+  SELECT
+    Transaction_ID,
+    Reason,
+    CURRENT_DATETIME(),
+    batch_id
+  FROM InvalidRows;
 
-    UPDATE dw.Audit_Log
-    SET
-      End_Time = end_time,
-      Status = 'FAILED',
-      Message = error_message
-    WHERE Batch_ID = batch_id;
+  -- 7. End Audit Log
+  SET end_time = CURRENT_DATETIME();
 
-    -- Optionally, re-raise the error for pipeline monitoring
-    RAISE USING MESSAGE = error_message;
-  END;
+  UPDATE dw_Audit_Log
+     SET End_Time = end_time,
+         Rows_Inserted = rows_inserted,
+         Rows_Rejected = rows_rejected,
+         Status = 'COMPLETED',
+         Message = CONCAT('Inserted ', CAST(rows_inserted AS STRING), ' rows; Rejected ', CAST(rows_rejected AS STRING), ' rows.')
+   WHERE Batch_ID = batch_id;
+
+EXCEPTION WHEN ERROR THEN
+  SET end_time = CURRENT_DATETIME();
+  SET error_message = ERROR_MESSAGE();
+
+  UPDATE dw_Audit_Log
+     SET End_Time = end_time,
+         Status = 'FAILED',
+         Message = error_message
+   WHERE Batch_ID = batch_id;
+
+  -- Optionally: RAISE ERROR to propagate to orchestration layer
+  RAISE USING MESSAGE = error_message;
 END;
 
--- Notes:
--- - All table references are generic (dw.*, stg.*).
--- - Temporary table logic is replaced by CTEs.
--- - Variable assignments and error handling use BigQuery scripting.
--- - All timestamps use CURRENT_DATETIME().
--- - Data types are mapped to BigQuery equivalents.
--- - TRUNCATE is replaced by DELETE WHERE TRUE.
--- - Inline comments explain each step.
--- - Procedure name is hardcoded as 'dw.sp_load_sales_fact' for audit logging.
+-- Cleanup: Drop temporary table (automatically dropped at end of script)
 
-API Cost Consumed in dollars: 0.0040 USD
+-- Notes:
+-- - All variable assignments and procedural logic are mapped to BigQuery scripting.
+-- - Temporary table `InvalidRows` is used for validation failures.
+-- - Error handling is implemented using BigQuery's EXCEPTION block.
+-- - All table references are generic and should be updated to match your dataset/table names if needed.
+-- - Partition and cluster your fact table for optimal performance.
+
+API Cost Consumed in dollars: 0.0047 USD
