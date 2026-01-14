@@ -1,6 +1,6 @@
 # Comparison Report
 
-Generated: 2026-01-14 11:46:54
+Generated: 2026-01-14 11:57:45
 
 ## Sources
 - AAVA 1.0: DI_Teradata_To_Snowflake_Conversion
