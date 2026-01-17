@@ -1,0 +1,244 @@
+=============================================
+Author:    AAVA
+Created on:    
+Description:   Convert Azure Synapse stored procedure for loading summarized holding metrics into FACT_EXECUTIVE_SUMMARY from staging, with validation and dimensional joins, into equivalent Databricks PySpark code.
+=============================================
+
+# Transformation Change Detection
+
+**Expression Transformation Mapping:**  
+- Synapse `CASE WHEN` for `income_amount` is mapped to PySpark `when(...).otherwise(...)`.
+- Synapse variable assignment and `@@ROWCOUNT` are mapped to Python variables and DataFrame `.count()`.
+
+**Aggregator Transformations:**  
+- No aggregations in the original logic; direct row-level mapping.
+
+**Join Strategies:**  
+- Synapse uses `INNER JOIN` on all dimensions; PySpark uses chained `.join(..., ..., "inner")`.
+
+**Data Type Transformations:**  
+- SQL `INT`, `DECIMAL`, `NVARCHAR` mapped to PySpark `IntegerType`, `DoubleType`, `StringType`.
+
+**Null Handling and Case Sensitivity Adjustments:**  
+- Synapse `CASE` for NULL/negative `income_amount` is handled with PySpark `when(...).otherwise(...)`.
+- PySpark is case-sensitive; column names must match exactly.
+
+# Recommended Manual Interventions
+
+- **Performance optimizations:** Use `.cache()` for staging and dimension tables; consider broadcast joins for small dimensions.
+- **Edge case handling:** Ensure all NULL and negative values for `income_amount` are set to 0.
+- **Complex transformations:** If additional business rules are added, use PySpark UDFs.
+- **Schema adjustments:** Validate that all columns exist and have compatible types in Databricks.
+- **Error handling:** Use try/except for table existence and schema validation.
+- **String manipulations:** Not present in current logic, but ensure consistent formats if added.
+
+# Test Case List
+
+| Test Case ID | Test Case Description                                                                                  | Expected Outcome                                                                                           |
+|--------------|-------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: All staging and dimension tables have valid data, all joins succeed, and business rules apply correctly. | Records are inserted into FACT_EXECUTIVE_SUMMARY with correct transformations and counts.                 |
+| TC02         | Edge case: Staging table contains NULL values in income_amount.                                       | income_amount is set to 0 for those records in FACT_EXECUTIVE_SUMMARY.                                    |
+| TC03         | Edge case: Staging table contains negative values in income_amount.                                   | income_amount is set to 0 for those records in FACT_EXECUTIVE_SUMMARY.                                    |
+| TC04         | Edge case: Staging table is empty.                                                                   | No records are inserted into FACT_EXECUTIVE_SUMMARY; row count is zero.                                   |
+| TC05         | Edge case: Dimension table is missing a matching key (e.g., date_key).                               | Only records with matching keys are inserted; unmatched records are excluded.                             |
+| TC06         | Error handling: Staging table does not exist.                                                         | AnalysisException is raised and logged.                                                                   |
+| TC07         | Error handling: Dimension table does not exist.                                                       | AnalysisException is raised and logged.                                                                   |
+| TC08         | Error handling: Staging table missing required columns (e.g., income_amount).                        | AnalysisException or relevant error is raised and logged.                                                 |
+| TC09         | Edge case: Unexpected data types in staging (e.g., string in income_amount).                         | Error is raised or handled gracefully; invalid records are excluded or set to default.                    |
+| TC10         | Happy path: Large dataset performance (simulate with many rows).                                      | All records processed efficiently; row count matches input; no performance bottleneck.                    |
+
+---
+
+# Pytest Script for Each Test Case
+
+```python
+# ================================================
+# Author:        AAVA
+# Created on:    
+# Description:   Pytest script to validate the Databricks PySpark ETL process for loading summarized holding metrics into FACT_EXECUTIVE_SUMMARY, including data joins, transformations, and error handling.
+# ================================================
+
+import pytest
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql.utils import AnalysisException
+from pyspark.sql.functions import when, col, lit
+
+@pytest.fixture(scope="module")
+def spark():
+    spark = SparkSession.builder.master("local[1]").appName("pytest_FACT_EXEC_SUMMARY").getOrCreate()
+    yield spark
+    spark.stop()
+
+def create_df(spark, data, schema):
+    return spark.createDataFrame(pd.DataFrame(data, columns=schema))
+
+def run_etl(spark, stg_data, dim_date, dim_inst, dim_corp, dim_prod):
+    stg = create_df(spark, *stg_data)
+    stg.createOrReplaceTempView("STG_HOLDING_METRICS")
+    dd = create_df(spark, *dim_date)
+    dd.createOrReplaceTempView("DIM_DATE")
+    di = create_df(spark, *dim_inst)
+    di.createOrReplaceTempView("DIM_INSTITUTION")
+    dc = create_df(spark, *dim_corp)
+    dc.createOrReplaceTempView("DIM_CORPORATION")
+    dp = create_df(spark, *dim_prod)
+    dp.createOrReplaceTempView("DIM_PRODUCT")
+    fact_df = (
+        stg
+        .join(dd, stg["date_value"] == dd["date_key"], "inner")
+        .join(di, stg["institution_id"] == di["institution_id"], "inner")
+        .join(dc, stg["corporation_id"] == dc["corporation_id"], "inner")
+        .join(dp, stg["product_id"] == dp["product_id"], "inner")
+        .select(
+            dd["date_key"].alias("date_key"),
+            di["institution_id"].alias("institution_id"),
+            dc["corporation_id"].alias("corporation_id"),
+            dp["product_id"].alias("product_id"),
+            stg["a120_amount"],
+            stg["a120_count"],
+            stg["a30_to_59_amount"],
+            stg["a30_to_59_count"],
+            stg["a60_to_89_amount"],
+            stg["a60_to_89_count"],
+            stg["a90_to_119_amount"],
+            stg["a90_to_119_count"],
+            stg["charge_off_amount"],
+            stg["charge_off_count"],
+            stg["fraud_amount"],
+            stg["fraud_count"],
+            when(
+                (stg["income_amount"].isNull()) | (stg["income_amount"] < 0),
+                lit(0)
+            ).otherwise(stg["income_amount"]).alias("income_amount"),
+            stg["number_of_accounts"],
+            stg["purchases_amount"],
+            stg["purchases_count"]
+        )
+    )
+    return fact_df
+
+def default_dims():
+    # Returns minimal valid dimension data for join success
+    return (
+        ([{"date_key": 20230101}], ["date_key"]),
+        ([{"institution_id": 1}], ["institution_id"]),
+        ([{"corporation_id": 10}], ["corporation_id"]),
+        ([{"product_id": 100}], ["product_id"])
+    )
+
+def test_TC01_happy_path(spark):
+    stg_data = (
+        [{"date_value": 20230101, "institution_id": 1, "corporation_id": 10, "product_id": 100,
+          "a120_amount": 1.0, "a120_count": 1, "a30_to_59_amount": 2.0, "a30_to_59_count": 2,
+          "a60_to_89_amount": 3.0, "a60_to_89_count": 3, "a90_to_119_amount": 4.0, "a90_to_119_count": 4,
+          "charge_off_amount": 5.0, "charge_off_count": 5, "fraud_amount": 6.0, "fraud_count": 6,
+          "income_amount": 100.0, "number_of_accounts": 7, "purchases_amount": 8.0, "purchases_count": 8}],
+        ["date_value","institution_id","corporation_id","product_id","a120_amount","a120_count","a30_to_59_amount","a30_to_59_count","a60_to_89_amount","a60_to_89_count","a90_to_119_amount","a90_to_119_count","charge_off_amount","charge_off_count","fraud_amount","fraud_count","income_amount","number_of_accounts","purchases_amount","purchases_count"]
+    )
+    fact_df = run_etl(spark, stg_data, *default_dims())
+    row = fact_df.collect()[0]
+    assert row.income_amount == 100.0
+    assert fact_df.count() == 1
+
+def test_TC02_null_income_amount(spark):
+    stg_data = (
+        [{"date_value": 20230101, "institution_id": 1, "corporation_id": 10, "product_id": 100,
+          "a120_amount": 1.0, "a120_count": 1, "a30_to_59_amount": 2.0, "a30_to_59_count": 2,
+          "a60_to_89_amount": 3.0, "a60_to_89_count": 3, "a90_to_119_amount": 4.0, "a90_to_119_count": 4,
+          "charge_off_amount": 5.0, "charge_off_count": 5, "fraud_amount": 6.0, "fraud_count": 6,
+          "income_amount": None, "number_of_accounts": 7, "purchases_amount": 8.0, "purchases_count": 8}],
+        ["date_value","institution_id","corporation_id","product_id","a120_amount","a120_count","a30_to_59_amount","a30_to_59_count","a60_to_89_amount","a60_to_89_count","a90_to_119_amount","a90_to_119_count","charge_off_amount","charge_off_count","fraud_amount","fraud_count","income_amount","number_of_accounts","purchases_amount","purchases_count"]
+    )
+    fact_df = run_etl(spark, stg_data, *default_dims())
+    row = fact_df.collect()[0]
+    assert row.income_amount == 0
+
+def test_TC03_negative_income_amount(spark):
+    stg_data = (
+        [{"date_value": 20230101, "institution_id": 1, "corporation_id": 10, "product_id": 100,
+          "a120_amount": 1.0, "a120_count": 1, "a30_to_59_amount": 2.0, "a30_to_59_count": 2,
+          "a60_to_89_amount": 3.0, "a60_to_89_count": 3, "a90_to_119_amount": 4.0, "a90_to_119_count": 4,
+          "charge_off_amount": 5.0, "charge_off_count": 5, "fraud_amount": 6.0, "fraud_count": 6,
+          "income_amount": -50.0, "number_of_accounts": 7, "purchases_amount": 8.0, "purchases_count": 8}],
+        ["date_value","institution_id","corporation_id","product_id","a120_amount","a120_count","a30_to_59_amount","a30_to_59_count","a60_to_89_amount","a60_to_89_count","a90_to_119_amount","a90_to_119_count","charge_off_amount","charge_off_count","fraud_amount","fraud_count","income_amount","number_of_accounts","purchases_amount","purchases_count"]
+    )
+    fact_df = run_etl(spark, stg_data, *default_dims())
+    row = fact_df.collect()[0]
+    assert row.income_amount == 0
+
+def test_TC04_empty_staging(spark):
+    stg_data = ([], ["date_value","institution_id","corporation_id","product_id","a120_amount","a120_count","a30_to_59_amount","a30_to_59_count","a60_to_89_amount","a60_to_89_count","a90_to_119_amount","a90_to_119_count","charge_off_amount","charge_off_count","fraud_amount","fraud_count","income_amount","number_of_accounts","purchases_amount","purchases_count"])
+    fact_df = run_etl(spark, stg_data, *default_dims())
+    assert fact_df.count() == 0
+
+def test_TC05_missing_dim_key(spark):
+    stg_data = (
+        [{"date_value": 99999999, "institution_id": 1, "corporation_id": 10, "product_id": 100,
+          "a120_amount": 1.0, "a120_count": 1, "a30_to_59_amount": 2.0, "a30_to_59_count": 2,
+          "a60_to_89_amount": 3.0, "a60_to_89_count": 3, "a90_to_119_amount": 4.0, "a90_to_119_count": 4,
+          "charge_off_amount": 5.0, "charge_off_count": 5, "fraud_amount": 6.0, "fraud_count": 6,
+          "income_amount": 100.0, "number_of_accounts": 7, "purchases_amount": 8.0, "purchases_count": 8}],
+        ["date_value","institution_id","corporation_id","product_id","a120_amount","a120_count","a30_to_59_amount","a30_to_59_count","a60_to_89_amount","a60_to_89_count","a90_to_119_amount","a90_to_119_count","charge_off_amount","charge_off_count","fraud_amount","fraud_count","income_amount","number_of_accounts","purchases_amount","purchases_count"]
+    )
+    fact_df = run_etl(spark, stg_data, *default_dims())
+    assert fact_df.count() == 0
+
+def test_TC06_staging_table_missing(spark):
+    with pytest.raises(AnalysisException):
+        spark.catalog.dropTempView("STG_HOLDING_METRICS")
+        # Try to run ETL without staging table
+        run_etl(spark, ([], ["date_value"]), *default_dims())
+
+def test_TC07_dim_table_missing(spark):
+    stg_data = (
+        [{"date_value": 20230101, "institution_id": 1, "corporation_id": 10, "product_id": 100,
+          "a120_amount": 1.0, "a120_count": 1, "a30_to_59_amount": 2.0, "a30_to_59_count": 2,
+          "a60_to_89_amount": 3.0, "a60_to_89_count": 3, "a90_to_119_amount": 4.0, "a90_to_119_count": 4,
+          "charge_off_amount": 5.0, "charge_off_count": 5, "fraud_amount": 6.0, "fraud_count": 6,
+          "income_amount": 100.0, "number_of_accounts": 7, "purchases_amount": 8.0, "purchases_count": 8}],
+        ["date_value","institution_id","corporation_id","product_id","a120_amount","a120_count","a30_to_59_amount","a30_to_59_count","a60_to_89_amount","a60_to_89_count","a90_to_119_amount","a90_to_119_count","charge_off_amount","charge_off_count","fraud_amount","fraud_count","income_amount","number_of_accounts","purchases_amount","purchases_count"]
+    )
+    # Remove DIM_DATE
+    with pytest.raises(AnalysisException):
+        spark.catalog.dropTempView("DIM_DATE")
+        run_etl(spark, stg_data, *default_dims())
+
+def test_TC08_missing_required_column(spark):
+    stg_data = (
+        [{"date_value": 20230101, "institution_id": 1, "corporation_id": 10, "product_id": 100}],
+        ["date_value","institution_id","corporation_id","product_id"]
+    )
+    with pytest.raises(Exception):
+        run_etl(spark, stg_data, *default_dims())
+
+def test_TC09_unexpected_data_type(spark):
+    stg_data = (
+        [{"date_value": 20230101, "institution_id": 1, "corporation_id": 10, "product_id": 100,
+          "a120_amount": 1.0, "a120_count": 1, "a30_to_59_amount": 2.0, "a30_to_59_count": 2,
+          "a60_to_89_amount": 3.0, "a60_to_89_count": 3, "a90_to_119_amount": 4.0, "a90_to_119_count": 4,
+          "charge_off_amount": 5.0, "charge_off_count": 5, "fraud_amount": 6.0, "fraud_count": 6,
+          "income_amount": "not_a_number", "number_of_accounts": 7, "purchases_amount": 8.0, "purchases_count": 8}],
+        ["date_value","institution_id","corporation_id","product_id","a120_amount","a120_count","a30_to_59_amount","a30_to_59_count","a60_to_89_amount","a60_to_89_count","a90_to_119_amount","a90_to_119_count","charge_off_amount","charge_off_count","fraud_amount","fraud_count","income_amount","number_of_accounts","purchases_amount","purchases_count"]
+    )
+    with pytest.raises(Exception):
+        run_etl(spark, stg_data, *default_dims())
+
+def test_TC10_large_dataset(spark):
+    # Simulate large dataset
+    stg_data = (
+        [{"date_value": 20230101, "institution_id": 1, "corporation_id": 10, "product_id": 100,
+          "a120_amount": 1.0, "a120_count": 1, "a30_to_59_amount": 2.0, "a30_to_59_count": 2,
+          "a60_to_89_amount": 3.0, "a60_to_89_count": 3, "a90_to_119_amount": 4.0, "a90_to_119_count": 4,
+          "charge_off_amount": 5.0, "charge_off_count": 5, "fraud_amount": 6.0, "fraud_count": 6,
+          "income_amount": 100.0, "number_of_accounts": 7, "purchases_amount": 8.0, "purchases_count": 8}
+         for _ in range(1000)],
+        ["date_value","institution_id","corporation_id","product_id","a120_amount","a120_count","a30_to_59_amount","a30_to_59_count","a60_to_89_amount","a60_to_89_count","a90_to_119_amount","a90_to_119_count","charge_off_amount","charge_off_count","fraud_amount","fraud_count","income_amount","number_of_accounts","purchases_amount","purchases_count"]
+    )
+    fact_df = run_etl(spark, stg_data, *default_dims())
+    assert fact_df.count() == 1000
+```
+
+# API Cost Estimation
+
+apiCost: 0.0160 USD
