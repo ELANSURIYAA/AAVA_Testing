@@ -1,0 +1,334 @@
+=============================================
+Author:    AAVA
+Created on:    
+Description:   Synapse to Databricks PySpark Conversion Test. This document provides a concise summary of the transformation of an Azure Synapse stored procedure for loading summarized holding metrics into FACT_EXECUTIVE_SUMMARY from staging, with validation and dimensional joins, into equivalent Databricks PySpark code. It highlights transformation changes, recommends manual interventions, and provides robust test cases with Pytest scripts to validate the correctness of the converted code.
+=============================================
+
+### Test Case List
+
+| Test Case ID | Test Case Description                                                                                   | Expected Outcome                                                                                                                      |
+|--------------|--------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: All staging and dimension data present, valid values                                       | All records inserted into FACT_EXECUTIVE_SUMMARY with correct joins and business rule applied to income_amount                       |
+| TC02         | Edge: income_amount is NULL                                                                            | income_amount set to 0 in FACT_EXECUTIVE_SUMMARY                                                                                     |
+| TC03         | Edge: income_amount is negative                                                                        | income_amount set to 0 in FACT_EXECUTIVE_SUMMARY                                                                                     |
+| TC04         | Edge: Staging table is empty                                                                           | No records inserted; FACT_EXECUTIVE_SUMMARY remains unchanged                                                                        |
+| TC05         | Edge: Some dimension records missing (join fails)                                                      | Only records with matching dimension keys are inserted; others are dropped                                                           |
+| TC06         | Edge: All columns present but with NULLs in non-key, non-income_amount columns                         | NULLs are inserted as-is for those columns                                                                                           |
+| TC07         | Error: Missing required column in staging (e.g., income_amount missing)                                | Raises AnalysisException or similar error                                                                                            |
+| TC08         | Error: Invalid data type in income_amount (e.g., string instead of numeric)                            | Raises AnalysisException or similar error                                                                                            |
+| TC09         | Edge: Large dataset (performance/sanity, not measured here but logic holds for large input)            | All records processed correctly, business rules and joins still apply                                                                |
+| TC10         | Edge: Duplicate records in staging table                                                               | Duplicates inserted as-is unless deduplication logic is added (current logic allows duplicates)                                      |
+
+---
+
+### Pytest Script for Each Test Case
+
+```python
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql import Row
+from pyspark.sql.types import (
+    StructType, StructField, IntegerType, DoubleType, StringType
+)
+from pyspark.sql.utils import AnalysisException
+from pyspark.sql.functions import when, col, broadcast
+
+# Helper function to create DataFrames for tests
+def create_df(spark, data, schema):
+    return spark.createDataFrame(data, schema=schema)
+
+@pytest.fixture(scope="module")
+def spark():
+    spark = SparkSession.builder.master("local[1]").appName("unit-tests").getOrCreate()
+    yield spark
+    spark.stop()
+
+@pytest.fixture
+def sample_dim_tables(spark):
+    # Minimal dimension tables
+    dim_date = create_df(
+        spark,
+        [Row(date_key=20230101), Row(date_key=20230102)],
+        StructType([StructField("date_key", IntegerType(), False)])
+    )
+    dim_institution = create_df(
+        spark,
+        [Row(institution_id=1), Row(institution_id=2)],
+        StructType([StructField("institution_id", IntegerType(), False)])
+    )
+    dim_corporation = create_df(
+        spark,
+        [Row(corporation_id=10), Row(corporation_id=20)],
+        StructType([StructField("corporation_id", IntegerType(), False)])
+    )
+    dim_product = create_df(
+        spark,
+        [Row(product_id=100), Row(product_id=200)],
+        StructType([StructField("product_id", IntegerType(), False)])
+    )
+    return {
+        "dim_date": dim_date,
+        "dim_institution": dim_institution,
+        "dim_corporation": dim_corporation,
+        "dim_product": dim_product
+    }
+
+def run_etl(
+    spark,
+    stg_holding_metrics_df,
+    dim_tables,
+):
+    # Broadcast dimension tables for join optimization
+    dim_date_df = broadcast(dim_tables["dim_date"])
+    dim_institution_df = broadcast(dim_tables["dim_institution"])
+    dim_corporation_df = broadcast(dim_tables["dim_corporation"])
+    dim_product_df = broadcast(dim_tables["dim_product"])
+
+    # Join staging data with dimension tables and apply business rules
+    fact_exec_summary_df = (
+        stg_holding_metrics_df
+        .join(dim_date_df, dim_date_df.date_key == stg_holding_metrics_df.date_value, "inner")
+        .join(dim_institution_df, dim_institution_df.institution_id == stg_holding_metrics_df.institution_id, "inner")
+        .join(dim_corporation_df, dim_corporation_df.corporation_id == stg_holding_metrics_df.corporation_id, "inner")
+        .join(dim_product_df, dim_product_df.product_id == stg_holding_metrics_df.product_id, "inner")
+        .select(
+            dim_date_df.date_key.alias("date_key"),
+            dim_institution_df.institution_id.alias("institution_id"),
+            dim_corporation_df.corporation_id.alias("corporation_id"),
+            dim_product_df.product_id.alias("product_id"),
+            col("a120_amount"),
+            col("a120_count"),
+            col("a30_to_59_amount"),
+            col("a30_to_59_count"),
+            col("a60_to_89_amount"),
+            col("a60_to_89_count"),
+            col("a90_to_119_amount"),
+            col("a90_to_119_count"),
+            col("charge_off_amount"),
+            col("charge_off_count"),
+            col("fraud_amount"),
+            col("fraud_count"),
+            when(
+                (col("income_amount").isNull()) | (col("income_amount") < 0),
+                0
+            ).otherwise(col("income_amount")).alias("income_amount"),
+            col("number_of_accounts"),
+            col("purchases_amount"),
+            col("purchases_count")
+        )
+    )
+    return fact_exec_summary_df
+
+def default_staging_schema():
+    return StructType([
+        StructField("date_value", IntegerType(), False),
+        StructField("institution_id", IntegerType(), False),
+        StructField("corporation_id", IntegerType(), False),
+        StructField("product_id", IntegerType(), False),
+        StructField("a120_amount", DoubleType(), True),
+        StructField("a120_count", IntegerType(), True),
+        StructField("a30_to_59_amount", DoubleType(), True),
+        StructField("a30_to_59_count", IntegerType(), True),
+        StructField("a60_to_89_amount", DoubleType(), True),
+        StructField("a60_to_89_count", IntegerType(), True),
+        StructField("a90_to_119_amount", DoubleType(), True),
+        StructField("a90_to_119_count", IntegerType(), True),
+        StructField("charge_off_amount", DoubleType(), True),
+        StructField("charge_off_count", IntegerType(), True),
+        StructField("fraud_amount", DoubleType(), True),
+        StructField("fraud_count", IntegerType(), True),
+        StructField("income_amount", DoubleType(), True),
+        StructField("number_of_accounts", IntegerType(), True),
+        StructField("purchases_amount", DoubleType(), True),
+        StructField("purchases_count", IntegerType(), True),
+    ])
+
+# TC01: Happy path
+def test_happy_path(spark, sample_dim_tables):
+    data = [
+        (
+            20230101, 1, 10, 100,
+            1000.0, 5, 200.0, 2, 300.0, 3, 400.0, 4, 500.0, 1, 600.0, 1,
+            700.0, 10, 800.0, 2
+        )
+    ]
+    stg_df = create_df(spark, data, default_staging_schema())
+    result_df = run_etl(spark, stg_df, sample_dim_tables)
+    result = result_df.collect()
+    assert len(result) == 1
+    row = result[0]
+    assert row.date_key == 20230101
+    assert row.institution_id == 1
+    assert row.corporation_id == 10
+    assert row.product_id == 100
+    assert row.income_amount == 700.0
+
+# TC02: income_amount is NULL
+def test_income_amount_null(spark, sample_dim_tables):
+    data = [
+        (
+            20230101, 1, 10, 100,
+            1000.0, 5, 200.0, 2, 300.0, 3, 400.0, 4, 500.0, 1, 600.0, 1,
+            None, 10, 800.0, 2
+        )
+    ]
+    stg_df = create_df(spark, data, default_staging_schema())
+    result_df = run_etl(spark, stg_df, sample_dim_tables)
+    result = result_df.collect()
+    assert result[0].income_amount == 0
+
+# TC03: income_amount is negative
+def test_income_amount_negative(spark, sample_dim_tables):
+    data = [
+        (
+            20230101, 1, 10, 100,
+            1000.0, 5, 200.0, 2, 300.0, 3, 400.0, 4, 500.0, 1, 600.0, 1,
+            -100.0, 10, 800.0, 2
+        )
+    ]
+    stg_df = create_df(spark, data, default_staging_schema())
+    result_df = run_etl(spark, stg_df, sample_dim_tables)
+    result = result_df.collect()
+    assert result[0].income_amount == 0
+
+# TC04: Staging table is empty
+def test_staging_empty(spark, sample_dim_tables):
+    stg_df = create_df(spark, [], default_staging_schema())
+    result_df = run_etl(spark, stg_df, sample_dim_tables)
+    assert result_df.count() == 0
+
+# TC05: Some dimension records missing (join fails)
+def test_missing_dimension(spark, sample_dim_tables):
+    # Add a record with a non-existent institution_id
+    data = [
+        (
+            20230101, 99, 10, 100,
+            1000.0, 5, 200.0, 2, 300.0, 3, 400.0, 4, 500.0, 1, 600.0, 1,
+            700.0, 10, 800.0, 2
+        ),
+        (
+            20230101, 1, 10, 100,
+            1000.0, 5, 200.0, 2, 300.0, 3, 400.0, 4, 500.0, 1, 600.0, 1,
+            700.0, 10, 800.0, 2
+        )
+    ]
+    stg_df = create_df(spark, data, default_staging_schema())
+    result_df = run_etl(spark, stg_df, sample_dim_tables)
+    result = result_df.collect()
+    # Only the second record should join
+    assert len(result) == 1
+    assert result[0].institution_id == 1
+
+# TC06: NULLs in non-key, non-income_amount columns
+def test_nulls_in_non_key_columns(spark, sample_dim_tables):
+    data = [
+        (
+            20230101, 1, 10, 100,
+            None, None, None, None, None, None, None, None, None, None, None, None,
+            700.0, None, None, None
+        )
+    ]
+    stg_df = create_df(spark, data, default_staging_schema())
+    result_df = run_etl(spark, stg_df, sample_dim_tables)
+    row = result_df.collect()[0]
+    assert row.income_amount == 700.0
+    # All other columns (except keys and income_amount) are None
+    assert row.a120_amount is None
+    assert row.a120_count is None
+
+# TC07: Missing required column in staging (income_amount missing)
+def test_missing_column(spark, sample_dim_tables):
+    # Remove income_amount from schema
+    schema = StructType([
+        f for f in default_staging_schema().fields if f.name != "income_amount"
+    ])
+    data = [
+        (
+            20230101, 1, 10, 100,
+            1000.0, 5, 200.0, 2, 300.0, 3, 400.0, 4, 500.0, 1, 600.0, 1,
+            10, 800.0, 2
+        )
+    ]
+    stg_df = create_df(spark, data, schema)
+    with pytest.raises(AnalysisException):
+        run_etl(spark, stg_df, sample_dim_tables).collect()
+
+# TC08: Invalid data type in income_amount (string instead of numeric)
+def test_invalid_income_amount_type(spark, sample_dim_tables):
+    schema = default_staging_schema()
+    # Change income_amount to StringType
+    fields = []
+    for f in schema.fields:
+        if f.name == "income_amount":
+            fields.append(StructField("income_amount", StringType(), True))
+        else:
+            fields.append(f)
+    schema = StructType(fields)
+    data = [
+        (
+            20230101, 1, 10, 100,
+            1000.0, 5, 200.0, 2, 300.0, 3, 400.0, 4, 500.0, 1, 600.0, 1,
+            "not_a_number", 10, 800.0, 2
+        )
+    ]
+    stg_df = create_df(spark, data, schema)
+    with pytest.raises(Exception):
+        run_etl(spark, stg_df, sample_dim_tables).collect()
+
+# TC09: Large dataset (sanity, not performance)
+def test_large_dataset(spark, sample_dim_tables):
+    data = [
+        (
+            20230101, 1, 10, 100,
+            float(i), i, float(i), i, float(i), i, float(i), i, float(i), i, float(i), i,
+            float(i), i, float(i), i
+        )
+        for i in range(1000)
+    ]
+    stg_df = create_df(spark, data, default_staging_schema())
+    result_df = run_etl(spark, stg_df, sample_dim_tables)
+    assert result_df.count() == 1000
+
+# TC10: Duplicate records in staging
+def test_duplicate_records(spark, sample_dim_tables):
+    data = [
+        (
+            20230101, 1, 10, 100,
+            1000.0, 5, 200.0, 2, 300.0, 3, 400.0, 4, 500.0, 1, 600.0, 1,
+            700.0, 10, 800.0, 2
+        ),
+        (
+            20230101, 1, 10, 100,
+            1000.0, 5, 200.0, 2, 300.0, 3, 400.0, 4, 500.0, 1, 600.0, 1,
+            700.0, 10, 800.0, 2
+        )
+    ]
+    stg_df = create_df(spark, data, default_staging_schema())
+    result_df = run_etl(spark, stg_df, sample_dim_tables)
+    assert result_df.count() == 2
+```
+
+---
+
+### Transformation Change Detection & Manual Interventions
+
+**Transformation Changes:**
+- Expression Transformation Mapping: SQL CASE WHEN for `income_amount` is mapped to PySpark `when().otherwise()`.
+- Aggregator Transformations: No aggregations; direct row-level mapping.
+- Join Strategies: SQL INNER JOINs are mapped to DataFrame `.join()` with "inner" type.
+- Data Type Transformations: SQL INT/DECIMAL → PySpark IntegerType/DoubleType; NULL handling via PySpark.
+- Null Handling: SQL IS NULL/CASE → PySpark `.isNull()` and `when()`.
+- Temporary Table: SQL temp table replaced by DataFrame.
+- Row Count: SQL @@ROWCOUNT → PySpark `.count()`.
+
+**Manual Interventions Recommended:**
+- Performance: Use `.cache()` and `broadcast()` for optimization.
+- Edge Cases: Explicitly handle NULLs and negative values for `income_amount`.
+- Error Handling: Use Python exception handling for missing columns or type errors.
+- Schema Adjustments: Ensure PySpark schema matches Synapse schema.
+- Logging: Replace SQL PRINT with Python `print()` or logging.
+
+---
+
+**API Cost Consumed in dollars:**
+apiCost: 0.032 USD
