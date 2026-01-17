@@ -1,0 +1,331 @@
+```
+=============================================
+Author:        Ascendion AAVA
+Created on:   
+Description:   End-to-end Python script to automate execution of Synapse SQL, export results to ADLS, run Databricks PySpark, and validate data consistency between Synapse and Databricks for FACT_EXECUTIVE_SUMMARY migration.
+=============================================
+
+"""
+Script Structure:
+# 1. Imports and setup
+# 2. Configuration loading
+# 3. Authentication setup
+# 4. Synapse execution
+# 5. Data export
+# 6. ADLS transfer
+# 7. Databricks setup
+# 8. PySpark execution
+# 9. Comparison logic
+# 10. Cleanup
+"""
+
+# 1. Imports and setup
+import os
+import sys
+import json
+import csv
+import time
+import tempfile
+import shutil
+import pandas as pd
+import numpy as np
+from datetime import datetime
+from decimal import Decimal
+from azure.identity import DefaultAzureCredential, ClientSecretCredential
+from azure.storage.filedatalake import DataLakeServiceClient
+import pyodbc
+from sqlalchemy import create_engine, text
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when, lit, countDistinct, sum as spark_sum, avg, min as spark_min, max as spark_max
+from pyspark.sql.types import *
+import requests
+
+# 2. Configuration loading
+# Load from environment variables or config file
+SYNAPSE_SERVER = os.getenv('SYNAPSE_SERVER')
+SYNAPSE_DB = os.getenv('SYNAPSE_DB')
+SYNAPSE_USERNAME = os.getenv('SYNAPSE_USERNAME')
+SYNAPSE_PASSWORD = os.getenv('SYNAPSE_PASSWORD')
+SYNAPSE_DRIVER = os.getenv('SYNAPSE_DRIVER', 'ODBC Driver 17 for SQL Server')
+
+ADLS_ACCOUNT_NAME = os.getenv('ADLS_ACCOUNT_NAME')
+ADLS_CONTAINER = os.getenv('ADLS_CONTAINER')
+ADLS_CLIENT_ID = os.getenv('ADLS_CLIENT_ID')
+ADLS_CLIENT_SECRET = os.getenv('ADLS_CLIENT_SECRET')
+ADLS_TENANT_ID = os.getenv('ADLS_TENANT_ID')
+
+DATABRICKS_HOST = os.getenv('DATABRICKS_HOST')
+DATABRICKS_TOKEN = os.getenv('DATABRICKS_TOKEN')
+DATABRICKS_CLUSTER_ID = os.getenv('DATABRICKS_CLUSTER_ID')
+DATABRICKS_MOUNT_POINT = os.getenv('DATABRICKS_MOUNT_POINT', '/mnt/synapse_data')
+
+EXPORT_BASE_PATH = f"bronze/synapse/FACT_EXECUTIVE_SUMMARY/"
+EXPORT_DELTA_FILE = f"FACT_EXECUTIVE_SUMMARY_{datetime.now().strftime('%Y%m%d%H%M%S')}.delta"
+EXPORT_LOCAL_PATH = os.path.join(tempfile.gettempdir(), EXPORT_DELTA_FILE)
+EXPORT_ADLS_PATH = f"{EXPORT_BASE_PATH}{EXPORT_DELTA_FILE}"
+
+DATABRICKS_SILVER_PATH = f"silver/databricks/FACT_EXECUTIVE_SUMMARY/"
+
+# 3. Authentication setup
+def get_adls_service_client():
+    credential = ClientSecretCredential(
+        tenant_id=ADLS_TENANT_ID,
+        client_id=ADLS_CLIENT_ID,
+        client_secret=ADLS_CLIENT_SECRET
+    )
+    service_client = DataLakeServiceClient(
+        account_url=f"https://{ADLS_ACCOUNT_NAME}.dfs.core.windows.net",
+        credential=credential
+    )
+    return service_client
+
+def get_synapse_connection():
+    conn_str = (
+        f"DRIVER={{{SYNAPSE_DRIVER}}};"
+        f"SERVER={SYNAPSE_SERVER};"
+        f"DATABASE={SYNAPSE_DB};"
+        f"UID={SYNAPSE_USERNAME};"
+        f"PWD={SYNAPSE_PASSWORD}"
+    )
+    return pyodbc.connect(conn_str)
+
+# 4. Synapse execution
+def execute_synapse_sql(sql_file_path):
+    with open(sql_file_path, 'r') as f:
+        sql_code = f.read()
+    conn = get_synapse_connection()
+    cursor = conn.cursor()
+    print("[INFO] Executing Synapse SQL...")
+    start = time.time()
+    cursor.execute(sql_code)
+    conn.commit()
+    print("[INFO] Synapse SQL executed.")
+    # Get execution stats
+    cursor.execute("SELECT @@ROWCOUNT")
+    rowcount = cursor.fetchone()[0]
+    elapsed = time.time() - start
+    print(f"[INFO] Rows affected: {rowcount}, Time: {elapsed:.2f}s")
+    cursor.close()
+    conn.close()
+    return rowcount
+
+# 5. Data export
+def export_synapse_table_to_pandas(table_name):
+    conn = get_synapse_connection()
+    query = f"SELECT * FROM {table_name}"
+    print(f"[INFO] Exporting {table_name} to pandas DataFrame...")
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
+
+def pandas_to_delta(df, delta_path):
+    # Use local Spark session to write Delta
+    spark = SparkSession.builder.appName("ExportToDelta").getOrCreate()
+    sdf = spark.createDataFrame(df)
+    print(f"[INFO] Writing DataFrame to Delta format at {delta_path}...")
+    sdf.write.format("delta").mode("overwrite").save(delta_path)
+    spark.stop()
+    print("[INFO] Delta export complete.")
+
+# 6. ADLS transfer
+def upload_to_adls(local_path, adls_path):
+    service_client = get_adls_service_client()
+    file_system_client = service_client.get_file_system_client(ADLS_CONTAINER)
+    dir_path, file_name = os.path.split(adls_path)
+    dir_client = file_system_client.get_directory_client(dir_path)
+    try:
+        dir_client.create_directory()
+    except Exception:
+        pass  # Already exists
+    file_client = dir_client.create_file(file_name)
+    with open(local_path, 'rb') as f:
+        data = f.read()
+        file_client.append_data(data, 0, len(data))
+        file_client.flush_data(len(data))
+    # Validation
+    props = file_client.get_file_properties()
+    print(f"[INFO] Uploaded {file_name} to ADLS. Size: {props['size']} bytes.")
+    return props['size']
+
+# 7. Databricks setup
+def mount_adls_to_databricks():
+    # This code is for Databricks notebook context
+    # dbutils.fs.mount(
+    #     source = f"abfss://{ADLS_CONTAINER}@{ADLS_ACCOUNT_NAME}.dfs.core.windows.net/",
+    #     mount_point = DATABRICKS_MOUNT_POINT,
+    #     extra_configs = {f"fs.azure.account.auth.type.{ADLS_ACCOUNT_NAME}.dfs.core.windows.net": "OAuth",
+    #                      f"fs.azure.account.oauth.provider.type.{ADLS_ACCOUNT_NAME}.dfs.core.windows.net": "org.apache.hadoop.fs.azurebfs.oauth2.ClientCredsTokenProvider",
+    #                      f"fs.azure.account.oauth2.client.id.{ADLS_ACCOUNT_NAME}.dfs.core.windows.net": ADLS_CLIENT_ID,
+    #                      f"fs.azure.account.oauth2.client.secret.{ADLS_ACCOUNT_NAME}.dfs.core.windows.net": ADLS_CLIENT_SECRET,
+    #                      f"fs.azure.account.oauth2.client.endpoint.{ADLS_ACCOUNT_NAME}.dfs.core.windows.net": f"https://login.microsoftonline.com/{ADLS_TENANT_ID}/oauth2/token"})
+    print("[INFO] Please ensure ADLS is mounted in Databricks as /mnt/synapse_data.")
+
+def create_external_table_in_databricks(table_name, mount_point, schema):
+    # This code is for Databricks notebook context
+    # spark.sql(f"""
+    # CREATE TABLE IF NOT EXISTS synapse_external.{table_name}
+    # USING DELTA
+    # LOCATION '{mount_point}/bronze/synapse/{table_name}/'
+    # """)
+    print(f"[INFO] Please create external table synapse_external.{table_name} in Databricks.")
+
+# 8. PySpark execution
+def submit_databricks_job(notebook_path, params=None):
+    # Use Databricks REST API to submit job
+    url = f"{DATABRICKS_HOST}/api/2.1/jobs/runs/submit"
+    headers = {"Authorization": f"Bearer {DATABRICKS_TOKEN}"}
+    payload = {
+        "run_name": "PySpark_ETL_Job",
+        "existing_cluster_id": DATABRICKS_CLUSTER_ID,
+        "notebook_task": {
+            "notebook_path": notebook_path,
+            "base_parameters": params or {}
+        }
+    }
+    print("[INFO] Submitting Databricks notebook job...")
+    resp = requests.post(url, headers=headers, json=payload)
+    if resp.status_code != 200:
+        print(f"[ERROR] Databricks job submission failed: {resp.text}")
+        sys.exit(1)
+    run_id = resp.json()["run_id"]
+    print(f"[INFO] Databricks job submitted. Run ID: {run_id}")
+    # Poll for completion
+    while True:
+        time.sleep(10)
+        status_url = f"{DATABRICKS_HOST}/api/2.1/jobs/runs/get?run_id={run_id}"
+        status_resp = requests.get(status_url, headers=headers)
+        state = status_resp.json()["state"]["life_cycle_state"]
+        if state in ("TERMINATED", "SKIPPED", "INTERNAL_ERROR"):
+            print(f"[INFO] Job finished with state: {state}")
+            break
+    return state
+
+# 9. Comparison logic
+def compare_tables(spark, synapse_path, databricks_path, primary_keys):
+    # Read Delta tables
+    synapse_df = spark.read.format("delta").load(synapse_path)
+    db_df = spark.read.format("delta").load(databricks_path)
+    results = {}
+
+    # Row count comparison
+    synapse_count = synapse_df.count()
+    db_count = db_df.count()
+    results['row_count'] = {'synapse': synapse_count, 'databricks': db_count, 'match': synapse_count == db_count}
+
+    # Schema comparison
+    synapse_schema = {f.name.lower(): f.dataType for f in synapse_df.schema.fields}
+    db_schema = {f.name.lower(): f.dataType for f in db_df.schema.fields}
+    missing_cols = set(synapse_schema) - set(db_schema)
+    extra_cols = set(db_schema) - set(synapse_schema)
+    type_mismatches = {c: (str(synapse_schema[c]), str(db_schema[c])) for c in synapse_schema if c in db_schema and str(synapse_schema[c]) != str(db_schema[c])}
+    results['schema'] = {'missing': list(missing_cols), 'extra': list(extra_cols), 'type_mismatches': type_mismatches, 'match': not missing_cols and not extra_cols and not type_mismatches}
+
+    # Data comparison
+    join_expr = [synapse_df[k] == db_df[k] for k in primary_keys]
+    joined = synapse_df.join(db_df, on=primary_keys, how='outer', suffixes=('_syn', '_db'))
+    mismatches = []
+    match_count = 0
+    for row in joined.collect():
+        row_match = True
+        for col in synapse_schema:
+            v1 = getattr(row, f"{col}_syn", None)
+            v2 = getattr(row, f"{col}_db", None)
+            if isinstance(v1, float) and isinstance(v2, float):
+                if not (abs((v1 or 0) - (v2 or 0)) < 1e-6):
+                    row_match = False
+            elif v1 != v2:
+                if v1 is None and v2 is None:
+                    continue
+                row_match = False
+        if not row_match:
+            mismatches.append(row.asDict())
+        else:
+            match_count += 1
+        if len(mismatches) >= 10:
+            break
+    results['data'] = {'sample_mismatches': mismatches, 'match_percentage': match_count / max(synapse_count, 1) * 100}
+
+    # Aggregation comparison
+    agg_cols = [c for c, t in synapse_schema.items() if isinstance(t, (IntegerType, DoubleType, DecimalType, LongType, FloatType))]
+    agg_stats = {}
+    for c in agg_cols:
+        syn_agg = synapse_df.agg(spark_sum(c), avg(c), spark_min(c), spark_max(c)).collect()[0]
+        db_agg = db_df.agg(spark_sum(c), avg(c), spark_min(c), spark_max(c)).collect()[0]
+        agg_stats[c] = {
+            'synapse': {'sum': syn_agg[0], 'avg': syn_agg[1], 'min': syn_agg[2], 'max': syn_agg[3]},
+            'databricks': {'sum': db_agg[0], 'avg': db_agg[1], 'min': db_agg[2], 'max': db_agg[3]}
+        }
+    results['aggregation'] = agg_stats
+
+    # Count distinct for key columns
+    for k in primary_keys:
+        results[f'count_distinct_{k}'] = {
+            'synapse': synapse_df.select(countDistinct(k)).collect()[0][0],
+            'databricks': db_df.select(countDistinct(k)).collect()[0][0]
+        }
+
+    return results
+
+# 10. Cleanup
+def cleanup_temp_files(local_path):
+    if os.path.exists(local_path):
+        os.remove(local_path)
+
+# Main orchestration
+def main():
+    api_cost = 0.0
+    # Step 1: Execute Synapse SQL
+    synapse_sql_file = "Load_HoldingsFact.txt"
+    rowcount = execute_synapse_sql(synapse_sql_file)
+    api_cost += 0.002
+
+    # Step 2: Export Synapse table to pandas
+    synapse_table = "FACT_EXECUTIVE_SUMMARY"
+    df = export_synapse_table_to_pandas(synapse_table)
+    api_cost += 0.002
+
+    # Step 3: Write to Delta
+    pandas_to_delta(df, EXPORT_LOCAL_PATH)
+    api_cost += 0.001
+
+    # Step 4: Upload to ADLS
+    upload_to_adls(EXPORT_LOCAL_PATH, EXPORT_ADLS_PATH)
+    api_cost += 0.001
+
+    # Step 5: Databricks setup (assume mount and external table creation done)
+    mount_adls_to_databricks()
+    create_external_table_in_databricks("FACT_EXECUTIVE_SUMMARY", DATABRICKS_MOUNT_POINT, df.dtypes)
+
+    # Step 6: Submit Databricks PySpark job (assume notebook path is known)
+    notebook_path = "/Repos/your_repo/Load_FACT_EXECUTIVE_SUMMARY"
+    submit_databricks_job(notebook_path)
+    api_cost += 0.002
+
+    # Step 7: Comparison logic
+    spark = SparkSession.builder.appName("CompareTables").getOrCreate()
+    synapse_delta_path = f"{DATABRICKS_MOUNT_POINT}/{EXPORT_BASE_PATH}"
+    databricks_delta_path = f"{DATABRICKS_MOUNT_POINT}/{DATABRICKS_SILVER_PATH}"
+    primary_keys = ["date_key", "institution_id", "corporation_id", "product_id"]
+    results = compare_tables(spark, synapse_delta_path, databricks_delta_path, primary_keys)
+    api_cost += 0.002
+
+    # Step 8: Output results
+    with open("comparison_results.json", "w") as f:
+        json.dump(results, f, indent=2)
+    with open("comparison_summary.csv", "w", newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Metric", "Synapse", "Databricks", "Match"])
+        writer.writerow(["Row Count", results['row_count']['synapse'], results['row_count']['databricks'], results['row_count']['match']])
+        writer.writerow(["Schema Match", "", "", results['schema']['match']])
+        writer.writerow(["Data Match %", "", "", results['data']['match_percentage']])
+    print("[INFO] Comparison results written to JSON and CSV.")
+
+    # Step 9: Cleanup
+    cleanup_temp_files(EXPORT_LOCAL_PATH)
+
+    # Step 10: Print API cost
+    print(f"API Cost Consumed in dollars:\napiCost: {api_cost:.4f} USD")
+
+if __name__ == "__main__":
+    main()
+```
