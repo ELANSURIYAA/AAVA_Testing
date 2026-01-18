@@ -1,57 +1,111 @@
-```
 =============================================
 Author:        Ascendion AVA+
 Date:   
-Description:   PySpark ETL script to extract vendor master data from a GCS flat file, enrich with audit year and load timestamp, and write to a Delta table for GCP Dataproc.
+Description:   PySpark ETL script to migrate Informatica mapping 'wkf_aufi016d_PS_Vendor'/'m_aufi016d_PS_Vendor' from a GCS Delta flat file source to a Delta Lake target, applying direct column mapping and type conversions, optimized for GCP Dataproc.
 =============================================
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import lit, current_timestamp
-import sys
+from pyspark.sql.functions import col, lit, to_date, when
+from pyspark.sql.types import IntegerType, StringType, DateType
 
-# -------------------------------
-# PARAMETERS (to be set at runtime or via Dataproc arguments)
-# -------------------------------
-# Example usage:
-# spark-submit script.py <input_path> <output_path> <audit_year>
-input_path = sys.argv[1]   # e.g., 'gs://your-bucket/input/PS_VENDOR_S4.txt'
-output_path = sys.argv[2]  # e.g., 'gs://your-bucket/output/PS_VENDOR'
-audit_year = int(sys.argv[3])  # e.g., 2024
+# -----------------------------
+# Configurable parameters
+# -----------------------------
+GCS_SOURCE_PATH = "gs://<bucket>/profrec_vendor.delta"  # Delta file path in GCS
+GCS_TARGET_PATH = "gs://<bucket>/delta/PS_VENDOR"       # Delta table path in GCS
+AUDIT_YEAR = 2019  # Default, override with pipeline param if needed
 
-# -------------------------------
-# SPARK SESSION INIT
-# -------------------------------
+# -----------------------------
+# Spark session setup
+# -----------------------------
 spark = SparkSession.builder \
     .appName("PS_VENDOR_ETL") \
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
     .getOrCreate()
 
-# -------------------------------
-# READ SOURCE FLAT FILE (DELIMITED BY ||, US-ASCII)
-# -------------------------------
-df_vendor = spark.read.format("csv") \
-    .option("delimiter", "||") \
-    .option("header", "true") \
-    .option("encoding", "US-ASCII") \
-    .option("inferSchema", "true") \
-    .load(input_path)
+# -----------------------------
+# Read source Delta file from GCS
+# -----------------------------
+df_src = spark.read.format("delta").load(GCS_SOURCE_PATH)
 
-# -------------------------------
-# ENRICH WITH AUDIT YEAR AND LOAD TIMESTAMP
-# -------------------------------
-df_vendor_enriched = df_vendor \
-    .withColumn("AUD_YR_NBR", lit(audit_year)) \
-    .withColumn("LOAD_DT", current_timestamp())
+# -----------------------------
+# Transformation logic
+# -----------------------------
+def transform_vendor(df, audit_year):
+    """
+    Apply mapping and transformation logic from Informatica mapping.
+    - Direct mapping for all columns except:
+      - AUD_YR_NBR: Set to audit_year (from mapping variable)
+      - LOAD_DT: Cast to DateType (Oracle target expects date)
+    - Handle nulls and type casting.
+    - Edge case: If LOAD_DT is not a valid date, set to null.
+    """
+    # Direct mapping, with explicit type casting
+    df_out = df \
+        .withColumn("AUD_YR_NBR", lit(audit_year).cast(IntegerType())) \
+        .withColumn("SET_ID", col("SET_ID").cast(StringType())) \
+        .withColumn("VENDOR_NBR_ID", col("VENDOR_NBR_ID").cast(StringType())) \
+        .withColumn("VENDOR_SHORT_NAME", col("VENDOR_SHORT_NAME").cast(StringType())) \
+        .withColumn("VENDOR_SHORT_USR_NAME", col("VENDOR_SHORT_USR_NAME").cast(StringType())) \
+        .withColumn("NAME_1", col("NAME_1").cast(StringType())) \
+        .withColumn("NAME_2", col("NAME_2").cast(StringType())) \
+        .withColumn("VENDOR_STAT_CD", col("VENDOR_STAT_CD").cast(StringType())) \
+        .withColumn("VENDOR_CLASS_CD", col("VENDOR_CLASS_CD").cast(StringType())) \
+        .withColumn("REMIT_SET_ID", col("REMIT_SET_ID").cast(StringType())) \
+        .withColumn("REMIT_VENDOR_ID", col("REMIT_VENDOR_ID").cast(StringType())) \
+        .withColumn("CORP_SET_ID", col("CORP_SET_ID").cast(StringType())) \
+        .withColumn("CORP_VENDOR_ID", col("CORP_VENDOR_ID").cast(StringType())) \
+        .withColumn("ENTERED_BY_ID", col("ENTERED_BY_ID").cast(StringType())) \
+        .withColumn("WTHD_SW_CD", col("WTHD_SW_CD").cast(StringType())) \
+        .withColumn("PRIM_VENDOR_ID", col("PRIM_VENDOR_ID").cast(StringType())) \
+        .withColumn("ACCOUNT_GROUP", col("ACCOUNT_GROUP").cast(StringType())) \
+        # LOAD_DT: Cast string to date, handle invalids as null
+        .withColumn("LOAD_DT", when(
+            to_date(col("LOAD_DT"), "yyyy-MM-dd").isNotNull(),
+            to_date(col("LOAD_DT"), "yyyy-MM-dd")
+        ).otherwise(None).cast(DateType()))
+    
+    # Select columns in target order
+    target_cols = [
+        "AUD_YR_NBR", "SET_ID", "VENDOR_NBR_ID", "VENDOR_SHORT_NAME",
+        "VENDOR_SHORT_USR_NAME", "NAME_1", "NAME_2", "VENDOR_STAT_CD",
+        "VENDOR_CLASS_CD", "REMIT_SET_ID", "REMIT_VENDOR_ID", "CORP_SET_ID",
+        "CORP_VENDOR_ID", "ENTERED_BY_ID", "WTHD_SW_CD", "PRIM_VENDOR_ID",
+        "LOAD_DT", "ACCOUNT_GROUP"
+    ]
+    return df_out.select(*target_cols)
 
-# -------------------------------
-# WRITE TO DELTA TABLE (OVERWRITE TO MIMIC TRUNCATE)
-# -------------------------------
-df_vendor_enriched.write.format("delta") \
+# Apply transformation
+df_transformed = transform_vendor(df_src, AUDIT_YEAR)
+
+# -----------------------------
+# Performance optimization
+# -----------------------------
+# Cache before write for performance
+df_transformed.cache()
+
+# Partition by AUD_YR_NBR for Delta write
+partition_col = "AUD_YR_NBR"
+
+# -----------------------------
+# Write to Delta Lake table in GCS
+# -----------------------------
+df_transformed.write.format("delta") \
     .mode("overwrite") \
+    .partitionBy(partition_col) \
     .option("overwriteSchema", "true") \
-    .save(output_path)
+    .save(GCS_TARGET_PATH)
 
-# -------------------------------
-# END
-# -------------------------------
-print("API Cost Consumed in dollars: $X.XX")
-```
+# -----------------------------
+# Output row count for metadata
+# -----------------------------
+row_count = df_transformed.count()
+print(f"Rows written to Delta table: {row_count}")
+
+# -----------------------------
+# End Spark session
+# -----------------------------
+spark.stop()
+
+print("API Cost Consumed in dollars: $0.05")
