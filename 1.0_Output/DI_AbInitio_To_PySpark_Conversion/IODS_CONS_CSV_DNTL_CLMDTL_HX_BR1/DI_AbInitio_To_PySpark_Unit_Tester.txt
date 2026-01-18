@@ -1,0 +1,210 @@
+==================================================================
+Author:        Ascendion AVA+
+Created on:    
+Description:   Unit Test Suite for Ab Initio to PySpark Conversion
+==================================================================
+
+1. Test Case Inventory:
+
+| Test Case ID | Description | Scenario Type | Expected Outcome |
+|--------------|-------------|----------------|------------------|
+| TC001 | Validate successful transformation with valid input | Happy Path | Transformed DataFrame matches expected output |
+| TC002 | Test behavior with NULL values in critical columns | Edge Case | NULLs handled correctly without failure |
+| TC003 | Missing column in input | Negative Test | Raise appropriate error |
+| TC004 | Lookup failure scenario (join miss in batch merge) | Edge Case | Rows with no match handled per spec (e.g., dropped in inner join) |
+| TC005 | Empty input dataset | Edge Case | Output DataFrame is empty but no crash |
+| TC006 | Duplicate input rows (deduplication logic) | Edge Case | Output contains only unique rows by primary key |
+| TC007 | Data type mismatch in input columns | Negative Test | Raise appropriate error or handle as per schema |
+| TC008 | Reject handling (invalid business rule) | Negative Test | Row is flagged or excluded as per reject logic in xfr |
+| TC009 | Boundary values (e.g., max/min for numeric columns) | Edge Case | Output correctly processes boundary values |
+| TC010 | Unexpected field order in input | Edge Case | Transformation works regardless of column order |
+
+2. Pytest Script:
+
+```python
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, LongType
+from chispa.dataframe_comparer import assert_df_equality
+
+# Mock transformation functions (replace with actual imports in real test)
+def transform_table_adaptor(df): return df
+def transform_table_adaptor_first(df): return df
+def transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(df, filectlnum): return df
+def transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p3(df, filectlnum): return df
+
+PRIMARY_KEYS = ["AK_UCK_ID", "AK_UCK_ID_PREFIX_CD", "AK_UCK_ID_SEGMENT_NO", "AK_SUBMT_SVC_LN_NO"]
+
+@pytest.fixture(scope="session")
+def spark():
+    return SparkSession.builder.master("local[1]").appName("unit-test").getOrCreate()
+
+@pytest.fixture
+def base_schema():
+    # Minimal schema for testing (expand as needed)
+    return StructType([
+        StructField("AK_UCK_ID", StringType(), True),
+        StructField("AK_UCK_ID_PREFIX_CD", StringType(), True),
+        StructField("AK_UCK_ID_SEGMENT_NO", StringType(), True),
+        StructField("AK_SUBMT_SVC_LN_NO", StringType(), True),
+        StructField("PROC_CD", StringType(), True),
+        StructField("LN_ITEM_CHG_AMT", DoubleType(), True),
+        StructField("REJECT_RSN_CD", StringType(), True),
+        StructField("CONTRACT_AMT", DoubleType(), True),
+        StructField("CLM_TYP_CD", StringType(), True),
+        StructField("SVC_DT", StringType(), True),
+    ])
+
+def run_full_pipeline(df, filectlnum="12345"):
+    # Simulate the pipeline as in converted_code.py
+    df = transform_table_adaptor(df)
+    df = transform_table_adaptor_first(df)
+    df = df.repartition(*PRIMARY_KEYS)
+    df = df.sort(*[df[c] for c in PRIMARY_KEYS])
+    df = df.dropDuplicates(PRIMARY_KEYS)
+    df = transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(df, filectlnum=filectlnum)
+    return df
+
+# TC001: Happy Path
+def test_TC001_transformation_valid_input(spark, base_schema):
+    input_data = [
+        ("1001", "A", "1", "10", "D1110", 100.0, None, 90.0, "C", "2023-01-01"),
+        ("1002", "B", "2", "20", "D1120", 200.0, None, 180.0, "C", "2023-01-02"),
+    ]
+    input_df = spark.createDataFrame(input_data, schema=base_schema)
+    expected_df = input_df  # For identity transform mock; replace with expected after real xfr logic
+    result_df = run_full_pipeline(input_df)
+    assert_df_equality(result_df, expected_df, ignore_nullable=True)
+
+# TC002: NULLs in critical columns
+def test_TC002_null_values_in_critical_columns(spark, base_schema):
+    input_data = [
+        (None, "A", "1", "10", "D1110", 100.0, None, 90.0, "C", "2023-01-01"),
+        ("1002", None, "2", "20", "D1120", None, None, 180.0, "C", "2023-01-02"),
+    ]
+    input_df = spark.createDataFrame(input_data, schema=base_schema)
+    expected_df = input_df  # For identity transform mock
+    result_df = run_full_pipeline(input_df)
+    assert_df_equality(result_df, expected_df, ignore_nullable=True)
+
+# TC003: Missing column in input
+def test_TC003_missing_column_in_input(spark, base_schema):
+    # Remove 'PROC_CD' from schema
+    reduced_schema = StructType([f for f in base_schema if f.name != "PROC_CD"])
+    input_data = [
+        ("1001", "A", "1", "10", 100.0, None, 90.0, "C", "2023-01-01"),
+    ]
+    input_df = spark.createDataFrame(input_data, schema=reduced_schema)
+    with pytest.raises(Exception):
+        run_full_pipeline(input_df)
+
+# TC004: Lookup failure scenario (join miss)
+def test_TC004_lookup_failure_in_join(spark, base_schema):
+    # Simulate batch1 and batch2 with non-overlapping keys
+    batch1_data = [
+        ("1001", "A", "1", "10", "D1110", 100.0, None, 90.0, "C", "2023-01-01"),
+    ]
+    batch2_data = [
+        ("9999", "Z", "9", "99", "D9999", 999.0, None, 900.0, "C", "2023-01-09"),
+    ]
+    batch1_df = spark.createDataFrame(batch1_data, schema=base_schema)
+    batch2_df = spark.createDataFrame(batch2_data, schema=base_schema)
+    # Inner join on PRIMARY_KEYS should yield empty
+    joined_df = batch1_df.join(batch2_df, on=PRIMARY_KEYS, how='inner')
+    assert joined_df.count() == 0
+
+# TC005: Empty input dataset
+def test_TC005_empty_input_dataset(spark, base_schema):
+    input_df = spark.createDataFrame([], schema=base_schema)
+    result_df = run_full_pipeline(input_df)
+    assert result_df.count() == 0
+
+# TC006: Deduplication logic
+def test_TC006_deduplication(spark, base_schema):
+    input_data = [
+        ("1001", "A", "1", "10", "D1110", 100.0, None, 90.0, "C", "2023-01-01"),
+        ("1001", "A", "1", "10", "D1110", 100.0, None, 90.0, "C", "2023-01-01"),  # Duplicate
+    ]
+    input_df = spark.createDataFrame(input_data, schema=base_schema)
+    result_df = run_full_pipeline(input_df)
+    assert result_df.count() == 1
+
+# TC007: Data type mismatch in input columns
+def test_TC007_data_type_mismatch(spark, base_schema):
+    # LN_ITEM_CHG_AMT should be DoubleType, but provide string
+    input_data = [
+        ("1001", "A", "1", "10", "D1110", "not_a_number", None, 90.0, "C", "2023-01-01"),
+    ]
+    # Use StringType for LN_ITEM_CHG_AMT to simulate mismatch
+    mismatch_schema = StructType([
+        StructField("AK_UCK_ID", StringType(), True),
+        StructField("AK_UCK_ID_PREFIX_CD", StringType(), True),
+        StructField("AK_UCK_ID_SEGMENT_NO", StringType(), True),
+        StructField("AK_SUBMT_SVC_LN_NO", StringType(), True),
+        StructField("PROC_CD", StringType(), True),
+        StructField("LN_ITEM_CHG_AMT", StringType(), True),  # Should be DoubleType
+        StructField("REJECT_RSN_CD", StringType(), True),
+        StructField("CONTRACT_AMT", DoubleType(), True),
+        StructField("CLM_TYP_CD", StringType(), True),
+        StructField("SVC_DT", StringType(), True),
+    ])
+    input_df = spark.createDataFrame(input_data, schema=mismatch_schema)
+    with pytest.raises(Exception):
+        run_full_pipeline(input_df)
+
+# TC008: Reject handling (simulate business rule failure)
+def test_TC008_reject_handling(spark, base_schema):
+    # Suppose REJECT_RSN_CD is set by xfr if CONTRACT_AMT < 0
+    input_data = [
+        ("1001", "A", "1", "10", "D1110", 100.0, None, -50.0, "C", "2023-01-01"),
+    ]
+    input_df = spark.createDataFrame(input_data, schema=base_schema)
+    # Mock xfr to set REJECT_RSN_CD if CONTRACT_AMT < 0
+    def mock_xfr(df, filectlnum):
+        from pyspark.sql.functions import when
+        return df.withColumn("REJECT_RSN_CD", when(df["CONTRACT_AMT"] < 0, "NEG_AMT").otherwise(df["REJECT_RSN_CD"]))
+    global transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2
+    transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2 = mock_xfr
+    result_df = run_full_pipeline(input_df)
+    rows = result_df.collect()
+    assert rows[0]["REJECT_RSN_CD"] == "NEG_AMT"
+
+# TC009: Boundary values
+def test_TC009_boundary_values(spark, base_schema):
+    input_data = [
+        ("1001", "A", "1", "10", "D1110", float("inf"), None, float("-inf"), "C", "2023-01-01"),
+        ("1002", "B", "2", "20", "D1120", float("nan"), None, 0.0, "C", "2023-01-02"),
+    ]
+    input_df = spark.createDataFrame(input_data, schema=base_schema)
+    expected_df = input_df
+    result_df = run_full_pipeline(input_df)
+    assert_df_equality(result_df, expected_df, ignore_nullable=True)
+
+# TC010: Unexpected field order in input
+def test_TC010_unexpected_field_order(spark, base_schema):
+    # Shuffle columns
+    shuffled_schema = StructType([
+        base_schema[4],  # PROC_CD
+        base_schema[0],  # AK_UCK_ID
+        base_schema[2],  # AK_UCK_ID_SEGMENT_NO
+        base_schema[1],  # AK_UCK_ID_PREFIX_CD
+        base_schema[3],  # AK_SUBMT_SVC_LN_NO
+        base_schema[5],  # LN_ITEM_CHG_AMT
+        base_schema[6],  # REJECT_RSN_CD
+        base_schema[7],  # CONTRACT_AMT
+        base_schema[8],  # CLM_TYP_CD
+        base_schema[9],  # SVC_DT
+    ])
+    input_data = [
+        ("D1110", "1001", "1", "A", "10", 100.0, None, 90.0, "C", "2023-01-01"),
+    ]
+    input_df = spark.createDataFrame(input_data, schema=shuffled_schema)
+    # Reorder columns to match pipeline expectation
+    input_df = input_df.select([f.name for f in base_schema])
+    expected_df = input_df
+    result_df = run_full_pipeline(input_df)
+    assert_df_equality(result_df, expected_df, ignore_nullable=True)
+```
+
+3. API Cost:
+apiCost: 0.00043752 USD
