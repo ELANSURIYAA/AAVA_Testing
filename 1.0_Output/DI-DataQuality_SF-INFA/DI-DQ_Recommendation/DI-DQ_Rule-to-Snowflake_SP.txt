@@ -1,0 +1,125 @@
+-- =============================================
+-- Author:        Ascendion AVA+
+-- Created on:    2023-10-10
+-- Description:   Executes DQ validation checks on source table and logs violations
+-- =============================================
+
+CREATE OR REPLACE PROCEDURE sp_run_dq_checks()
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+AS
+$$
+    try {
+        // Create a sequence for Batch ID if it doesn't exist
+        var createSequence = `
+            CREATE SEQUENCE IF NOT EXISTS SEQ_BATCH_ID START WITH 1 INCREMENT BY 1;
+        `;
+        snowflake.createStatement({sqlText: createSequence}).execute();
+
+        // Generate a new Batch ID
+        var batchIdQuery = `
+            SELECT SEQ_BATCH_ID.NEXTVAL AS BATCH_ID;
+        `;
+        var batchIdResult = snowflake.createStatement({sqlText: batchIdQuery}).execute();
+        batchIdResult.next();
+        var batchId = batchIdResult.getColumnValue("BATCH_ID");
+
+        // DQ rules to validate
+        var dqRules = [
+            {column: "FIRSTNAME", ruleType: "NotNullCheck", ruleDescription: "Ensure the first name is provided for every member.", severity: "High"},
+            {column: "LASTNAME", ruleType: "NotNullCheck", ruleDescription: "Ensure the last name is provided for every member.", severity: "High"},
+            {column: "COMPANY", ruleType: "StringLengthCheck", ruleDescription: "Ensure the company name does not exceed 255 characters.", severity: "Medium"},
+            {column: "ADDRESS", ruleType: "StringLengthCheck", ruleDescription: "Ensure the address does not exceed 16777216 characters.", severity: "Low"},
+            {column: "CITY", ruleType: "ValueCheck", ruleDescription: "Ensure the city is one of the approved locations: Los Angeles, New York, or London.", severity: "High"},
+            {column: "COUNTRY", ruleType: "NotNullCheck", ruleDescription: "Ensure the country is provided for every member.", severity: "High"},
+            {column: "STATE", ruleType: "StringLengthCheck", ruleDescription: "Ensure the state name does not exceed 100 characters.", severity: "Medium"},
+            {column: "ZIP", ruleType: "FormatCheck", ruleDescription: "Ensure the ZIP code matches the expected format (e.g., numeric or alphanumeric).", severity: "Medium"},
+            {column: "PHONENUMBER1", ruleType: "NotNullCheck", ruleDescription: "Ensure the primary phone number is provided.", severity: "High"},
+            {column: "PHONENUMBER2", ruleType: "UniquenessCheck", ruleDescription: "Ensure PHONENUMBER2 is distinct from PHONENUMBER1 for each member.", severity: "High"},
+            {column: "EMAIL", ruleType: "FormatCheck", ruleDescription: "Ensure the email matches a valid email format.", severity: "High"},
+            {column: "WEB", ruleType: "FormatCheck", ruleDescription: "Ensure the website URL matches a valid URL format.", severity: "Medium"},
+            {column: "MEMBER_ID", ruleType: "UniquenessCheck", ruleDescription: "Ensure MEMBER_ID is unique for each member.", severity: "High"},
+            {column: "MEMBER_ID", ruleType: "RangeCheck", ruleDescription: "Ensure MEMBER_ID is within the range of 10000000 to 99999999.", severity: "High"},
+            {column: "PHONENUMBER1, EMAIL, WEB", ruleType: "NotNullCheck", ruleDescription: "Ensure at least one valid form of contact information is provided (Phone, Email, or Website).", severity: "High"}
+        ];
+
+        // Loop through each rule and execute validation
+        dqRules.forEach(function(rule) {
+            var validationQuery = "";
+            var insertQuery = "";
+
+            if (rule.ruleType === "NotNullCheck") {
+                validationQuery = `
+                    SELECT '${rule.column}' AS COLUMN_NAME, COUNT(*) AS ISSUE_COUNT
+                    FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
+                    WHERE ${rule.column} IS NULL;
+                `;
+            } else if (rule.ruleType === "StringLengthCheck") {
+                validationQuery = `
+                    SELECT '${rule.column}' AS COLUMN_NAME, COUNT(*) AS ISSUE_COUNT
+                    FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
+                    WHERE LENGTH(${rule.column}) > ${rule.ruleDescription.match(/\d+/)[0]};
+                `;
+            } else if (rule.ruleType === "ValueCheck") {
+                var approvedValues = rule.ruleDescription.match(/: (.+?)\./)[1].split(", ");
+                validationQuery = `
+                    SELECT '${rule.column}' AS COLUMN_NAME, COUNT(*) AS ISSUE_COUNT
+                    FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
+                    WHERE ${rule.column} NOT IN (${approvedValues.map(v => `'${v}'`).join(", ")});
+                `;
+            } else if (rule.ruleType === "FormatCheck") {
+                if (rule.column === "ZIP") {
+                    validationQuery = `
+                        SELECT '${rule.column}' AS COLUMN_NAME, COUNT(*) AS ISSUE_COUNT
+                        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
+                        WHERE ${rule.column} NOT RLIKE '^[0-9A-Za-z]+$';
+                    `;
+                } else if (rule.column === "EMAIL") {
+                    validationQuery = `
+                        SELECT '${rule.column}' AS COLUMN_NAME, COUNT(*) AS ISSUE_COUNT
+                        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
+                        WHERE ${rule.column} NOT RLIKE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$';
+                    `;
+                } else if (rule.column === "WEB") {
+                    validationQuery = `
+                        SELECT '${rule.column}' AS COLUMN_NAME, COUNT(*) AS ISSUE_COUNT
+                        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
+                        WHERE ${rule.column} NOT RLIKE '^(https?://)?(www\\.)?[A-Za-z0-9.-]+\\.[A-Za-z]{2,}(/.*)?$';
+                    `;
+                }
+            } else if (rule.ruleType === "UniquenessCheck") {
+                validationQuery = `
+                    SELECT '${rule.column}' AS COLUMN_NAME, COUNT(*) AS ISSUE_COUNT
+                    FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
+                    GROUP BY ${rule.column}
+                    HAVING COUNT(*) > 1;
+                `;
+            } else if (rule.ruleType === "RangeCheck") {
+                var rangeValues = rule.ruleDescription.match(/\d+/g);
+                validationQuery = `
+                    SELECT '${rule.column}' AS COLUMN_NAME, COUNT(*) AS ISSUE_COUNT
+                    FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
+                    WHERE ${rule.column} < ${rangeValues[0]} OR ${rule.column} > ${rangeValues[1]};
+                `;
+            }
+
+            // Execute validation query
+            var validationResult = snowflake.createStatement({sqlText: validationQuery}).execute();
+            validationResult.next();
+            var issueCount = validationResult.getColumnValue("ISSUE_COUNT");
+
+            // If issues are found, log them into DQ_ISSUE_LOG
+            if (issueCount > 0) {
+                insertQuery = `
+                    INSERT INTO MY_SAMPLE_DB.PUBLIC.DQ_ISSUE_LOG (TABLE_NAME, COLUMN_NAME, RULE_DESCRIPTION, SEVERITY, BATCH_ID)
+                    VALUES ('MEMBERSDATA', '${rule.column}', '${rule.ruleDescription.replace(/'/g, "''")}', '${rule.severity}', ${batchId});
+                `;
+                snowflake.createStatement({sqlText: insertQuery}).execute();
+            }
+        });
+
+        return "Data Quality Validation Completed Successfully.";
+    } catch (err) {
+        return "Error: " + err.message;
+    }
+$$;
