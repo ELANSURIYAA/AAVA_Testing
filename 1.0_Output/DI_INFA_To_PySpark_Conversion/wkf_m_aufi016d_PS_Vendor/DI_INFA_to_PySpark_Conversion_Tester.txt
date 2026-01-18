@@ -1,345 +1,243 @@
-=============================================
-Author:        Ascendion AVA+
-Date:   
-Description:   PySpark ETL script to extract vendor master data from a GCS flat file, enrich with audit year and load timestamp, and write to a Delta table for GCP Dataproc.
-=============================================
+Description:
+This document provides a comprehensive validation suite for the PySpark ETL migration of Informatica mapping 'wkf_aufi016d_PS_Vendor'/'m_aufi016d_PS_Vendor'. It covers transformation logic comparison, manual intervention recommendations, test case generation, and Pytest scripts to ensure the correctness of the PySpark code, focusing on data type conversions, null/edge case handling, schema alignment, and error scenarios.
 
 Test Case List:
 
-Test Case ID: TC01
-Description: Happy path - Valid input file with all required columns and data, valid audit year.
-Expected Outcome: Data is read, enriched with audit year and load timestamp, and written to the Delta table. Row count and values match input plus enrichment.
+| Test Case ID | Description                                                                                       | Expected Outcome                                                                                          |
+|--------------|---------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| TC_001       | Happy Path: All columns present, valid types, valid LOAD_DT, no nulls                             | All columns mapped correctly, LOAD_DT cast to date, AUD_YR_NBR set, output matches expected DataFrame     |
+| TC_002       | Edge: LOAD_DT contains invalid date string                                                        | LOAD_DT is set to null in output                                                                         |
+| TC_003       | Edge: LOAD_DT is null                                                                             | LOAD_DT remains null in output                                                                           |
+| TC_004       | Edge: Some string columns are null                                                                | Nulls are preserved in output                                                                            |
+| TC_005       | Edge: Input DataFrame is empty                                                                    | Output DataFrame is empty, schema matches                                                                |
+| TC_006       | Edge: Minimum and maximum boundary values for integer and string columns                          | Values are preserved and correctly cast                                                                  |
+| TC_007       | Error: Missing required column (e.g., VENDOR_NBR_ID missing)                                      | Raises AnalysisException or similar error                                                                |
+| TC_008       | Error: Wrong data type in integer column (e.g., AUD_YR_NBR as string in input)                    | AUD_YR_NBR is correctly cast to integer, or error if not possible                                        |
+| TC_009       | Error: Additional unexpected columns in input                                                     | Extra columns are ignored, output schema matches target                                                  |
+| TC_010       | Edge: All columns are null                                                                        | Output DataFrame contains all nulls, LOAD_DT remains null                                                |
 
-Test Case ID: TC02
-Description: Edge case - Input file with NULL values in some columns.
-Expected Outcome: NULL values are preserved in the output; enrichment columns are correctly added.
-
-Test Case ID: TC03
-Description: Edge case - Empty input file (only header, no data rows).
-Expected Outcome: Output Delta table is created with schema but contains zero data rows.
-
-Test Case ID: TC04
-Description: Edge case - Input file missing one or more expected columns.
-Expected Outcome: The process fails with an informative error about missing columns.
-
-Test Case ID: TC05
-Description: Edge case - Input file with extra/unexpected columns.
-Expected Outcome: Extra columns are ignored; only expected columns plus enrichment columns are present in output.
-
-Test Case ID: TC06
-Description: Error handling - Input file with incorrect delimiter.
-Expected Outcome: The process fails or results in a DataFrame with a single column; error is handled or flagged.
-
-Test Case ID: TC07
-Description: Error handling - Input file with invalid encoding.
-Expected Outcome: The process fails with an encoding error.
-
-Test Case ID: TC08
-Description: Error handling - Non-integer audit year argument.
-Expected Outcome: The process fails with a ValueError or similar.
-
-Test Case ID: TC09
-Description: Error handling - Missing input file.
-Expected Outcome: The process fails with a FileNotFoundError or similar.
-
-Test Case ID: TC10
-Description: Happy path - Multiple data rows, check enrichment columns.
-Expected Outcome: All rows are enriched with the correct audit year and a valid LOAD_DT timestamp.
-
----
-
-Pytest Script (test_ps_vendor_etl.py):
+Pytest Script:
 
 ```python
 import pytest
-import pandas as pd
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import lit
-import tempfile
-import shutil
-import os
+from pyspark.sql.types import (
+    StructType, StructField, StringType, IntegerType, DateType
+)
+from pyspark.sql.utils import AnalysisException
+from datetime import datetime
 
-# Helper function to create SparkSession for tests
-@pytest.fixture(scope="session")
+# Import the transformation function from the ETL script
+# from your_etl_module import transform_vendor
+
+@pytest.fixture(scope="module")
 def spark():
-    spark = SparkSession.builder.master("local[2]").appName("pytest-ps-vendor").getOrCreate()
+    spark = SparkSession.builder \
+        .master("local[1]") \
+        .appName("pytest_PS_VENDOR") \
+        .getOrCreate()
     yield spark
     spark.stop()
 
-# Helper to create temp CSV file
-def create_temp_csv(data, columns, delimiter="||", encoding="US-ASCII"):
-    temp_dir = tempfile.mkdtemp()
-    file_path = os.path.join(temp_dir, "input.csv")
-    df = pd.DataFrame(data, columns=columns)
-    df.to_csv(file_path, sep=delimiter, index=False, header=True, encoding=encoding)
-    return file_path, temp_dir
+@pytest.fixture
+def audit_year():
+    return 2019
 
-# Helper to read Delta output as Pandas
-def read_delta_as_pandas(spark, delta_path):
-    return spark.read.format("delta").load(delta_path).toPandas()
+def make_input_df(spark, data):
+    schema = StructType([
+        StructField("SET_ID", StringType(), True),
+        StructField("VENDOR_NBR_ID", StringType(), True),
+        StructField("VENDOR_SHORT_NAME", StringType(), True),
+        StructField("VENDOR_SHORT_USR_NAME", StringType(), True),
+        StructField("NAME_1", StringType(), True),
+        StructField("NAME_2", StringType(), True),
+        StructField("VENDOR_STAT_CD", StringType(), True),
+        StructField("VENDOR_CLASS_CD", StringType(), True),
+        StructField("REMIT_SET_ID", StringType(), True),
+        StructField("REMIT_VENDOR_ID", StringType(), True),
+        StructField("CORP_SET_ID", StringType(), True),
+        StructField("CORP_VENDOR_ID", StringType(), True),
+        StructField("ENTERED_BY_ID", StringType(), True),
+        StructField("WTHD_SW_CD", StringType(), True),
+        StructField("PRIM_VENDOR_ID", StringType(), True),
+        StructField("LOAD_DT", StringType(), True),
+        StructField("ACCOUNT_GROUP", StringType(), True),
+    ])
+    return spark.createDataFrame(data, schema=schema)
 
-# Test cases
+def collect_as_dict(df):
+    return [row.asDict() for row in df.collect()]
 
-def test_happy_path(spark):
-    # TC01
-    data = [
-        ["V001", "Vendor A", "USA"],
-        ["V002", "Vendor B", "CAN"]
-    ]
-    columns = ["VENDOR_ID", "VENDOR_NAME", "COUNTRY"]
-    input_file, temp_dir = create_temp_csv(data, columns)
-    output_dir = tempfile.mkdtemp()
-    audit_year = 2024
+# TC_001: Happy Path
+def test_happy_path(spark, audit_year):
+    data = [(
+        "SET1", "VEND123", "ShortName", "ShortUsr", "Name1", "Name2",
+        "A", "B", "RS1", "RV1", "CS1", "CV1", "EB1", "W", "PV1", "2023-01-15", "AG1"
+    )]
+    df_in = make_input_df(spark, data)
+    from pyspark.sql.functions import lit
+    from pyspark.sql.types import IntegerType, DateType
+    # Import the function here to avoid circular import in pytest collection
+    from your_etl_module import transform_vendor
+    df_out = transform_vendor(df_in, audit_year)
+    out = collect_as_dict(df_out)
+    assert out[0]["AUD_YR_NBR"] == audit_year
+    assert out[0]["SET_ID"] == "SET1"
+    assert out[0]["VENDOR_NBR_ID"] == "VEND123"
+    assert out[0]["LOAD_DT"] == datetime(2023, 1, 15).date()
 
-    df_vendor = spark.read.format("csv") \
-        .option("delimiter", "||") \
-        .option("header", "true") \
-        .option("encoding", "US-ASCII") \
-        .option("inferSchema", "true") \
-        .load(input_file)
+# TC_002: Invalid LOAD_DT
+def test_invalid_loaddt(spark, audit_year):
+    data = [(
+        "SET1", "VEND123", "ShortName", "ShortUsr", "Name1", "Name2",
+        "A", "B", "RS1", "RV1", "CS1", "CV1", "EB1", "W", "PV1", "invalid-date", "AG1"
+    )]
+    df_in = make_input_df(spark, data)
+    from your_etl_module import transform_vendor
+    df_out = transform_vendor(df_in, audit_year)
+    out = collect_as_dict(df_out)
+    assert out[0]["LOAD_DT"] is None
 
-    df_vendor_enriched = df_vendor \
-        .withColumn("AUD_YR_NBR", lit(audit_year)) \
-        .withColumn("LOAD_DT", lit("2024-01-01 00:00:00"))  # mock timestamp for test
+# TC_003: Null LOAD_DT
+def test_null_loaddt(spark, audit_year):
+    data = [(
+        "SET1", "VEND123", "ShortName", "ShortUsr", "Name1", "Name2",
+        "A", "B", "RS1", "RV1", "CS1", "CV1", "EB1", "W", "PV1", None, "AG1"
+    )]
+    df_in = make_input_df(spark, data)
+    from your_etl_module import transform_vendor
+    df_out = transform_vendor(df_in, audit_year)
+    out = collect_as_dict(df_out)
+    assert out[0]["LOAD_DT"] is None
 
-    df_vendor_enriched.write.format("delta") \
-        .mode("overwrite") \
-        .option("overwriteSchema", "true") \
-        .save(output_dir)
+# TC_004: Null string columns
+def test_null_string_columns(spark, audit_year):
+    data = [(
+        None, None, None, None, None, None,
+        None, None, None, None, None, None, None, None, None, "2023-01-15", None
+    )]
+    df_in = make_input_df(spark, data)
+    from your_etl_module import transform_vendor
+    df_out = transform_vendor(df_in, audit_year)
+    out = collect_as_dict(df_out)
+    for col in [
+        "SET_ID", "VENDOR_NBR_ID", "VENDOR_SHORT_NAME", "VENDOR_SHORT_USR_NAME", "NAME_1", "NAME_2",
+        "VENDOR_STAT_CD", "VENDOR_CLASS_CD", "REMIT_SET_ID", "REMIT_VENDOR_ID", "CORP_SET_ID",
+        "CORP_VENDOR_ID", "ENTERED_BY_ID", "WTHD_SW_CD", "PRIM_VENDOR_ID", "ACCOUNT_GROUP"
+    ]:
+        assert out[0][col] is None
 
-    result = read_delta_as_pandas(spark, output_dir)
-    assert result.shape[0] == 2
-    assert set(result["AUD_YR_NBR"]) == {2024}
-    assert set(result["VENDOR_ID"]) == {"V001", "V002"}
-
-    shutil.rmtree(temp_dir)
-    shutil.rmtree(output_dir)
-
-def test_null_values(spark):
-    # TC02
-    data = [
-        ["V003", None, "MEX"],
-        [None, "Vendor D", None]
-    ]
-    columns = ["VENDOR_ID", "VENDOR_NAME", "COUNTRY"]
-    input_file, temp_dir = create_temp_csv(data, columns)
-    output_dir = tempfile.mkdtemp()
-    audit_year = 2024
-
-    df_vendor = spark.read.format("csv") \
-        .option("delimiter", "||") \
-        .option("header", "true") \
-        .option("encoding", "US-ASCII") \
-        .option("inferSchema", "true") \
-        .load(input_file)
-
-    df_vendor_enriched = df_vendor \
-        .withColumn("AUD_YR_NBR", lit(audit_year)) \
-        .withColumn("LOAD_DT", lit("2024-01-01 00:00:00"))  # mock timestamp
-
-    df_vendor_enriched.write.format("delta") \
-        .mode("overwrite") \
-        .option("overwriteSchema", "true") \
-        .save(output_dir)
-
-    result = read_delta_as_pandas(spark, output_dir)
-    assert result.isnull().any().any()  # At least one null present
-    assert set(result["AUD_YR_NBR"]) == {2024}
-
-    shutil.rmtree(temp_dir)
-    shutil.rmtree(output_dir)
-
-def test_empty_input(spark):
-    # TC03
+# TC_005: Empty DataFrame
+def test_empty_input(spark, audit_year):
     data = []
-    columns = ["VENDOR_ID", "VENDOR_NAME", "COUNTRY"]
-    input_file, temp_dir = create_temp_csv(data, columns)
-    output_dir = tempfile.mkdtemp()
-    audit_year = 2024
+    df_in = make_input_df(spark, data)
+    from your_etl_module import transform_vendor
+    df_out = transform_vendor(df_in, audit_year)
+    assert df_out.count() == 0
+    assert set(df_out.columns) == {
+        "AUD_YR_NBR", "SET_ID", "VENDOR_NBR_ID", "VENDOR_SHORT_NAME",
+        "VENDOR_SHORT_USR_NAME", "NAME_1", "NAME_2", "VENDOR_STAT_CD",
+        "VENDOR_CLASS_CD", "REMIT_SET_ID", "REMIT_VENDOR_ID", "CORP_SET_ID",
+        "CORP_VENDOR_ID", "ENTERED_BY_ID", "WTHD_SW_CD", "PRIM_VENDOR_ID",
+        "LOAD_DT", "ACCOUNT_GROUP"
+    }
 
-    df_vendor = spark.read.format("csv") \
-        .option("delimiter", "||") \
-        .option("header", "true") \
-        .option("encoding", "US-ASCII") \
-        .option("inferSchema", "true") \
-        .load(input_file)
+# TC_006: Boundary values
+def test_boundary_values(spark, audit_year):
+    data = [(
+        "Z"*255, "9"*20, "A"*100, "B"*100, "C"*100, "D"*100,
+        "E", "F", "G", "H", "I", "J", "K", "L", "M", "2022-12-31", "N"*50
+    )]
+    df_in = make_input_df(spark, data)
+    from your_etl_module import transform_vendor
+    df_out = transform_vendor(df_in, audit_year)
+    out = collect_as_dict(df_out)
+    assert out[0]["SET_ID"] == "Z"*255
+    assert out[0]["VENDOR_NBR_ID"] == "9"*20
+    assert out[0]["LOAD_DT"] == datetime(2022, 12, 31).date()
 
-    df_vendor_enriched = df_vendor \
-        .withColumn("AUD_YR_NBR", lit(audit_year)) \
-        .withColumn("LOAD_DT", lit("2024-01-01 00:00:00"))
+# TC_007: Missing required column
+def test_missing_column(spark, audit_year):
+    # Remove VENDOR_NBR_ID
+    schema = StructType([
+        StructField("SET_ID", StringType(), True),
+        # StructField("VENDOR_NBR_ID", StringType(), True),  # Missing
+        StructField("VENDOR_SHORT_NAME", StringType(), True),
+        StructField("VENDOR_SHORT_USR_NAME", StringType(), True),
+        StructField("NAME_1", StringType(), True),
+        StructField("NAME_2", StringType(), True),
+        StructField("VENDOR_STAT_CD", StringType(), True),
+        StructField("VENDOR_CLASS_CD", StringType(), True),
+        StructField("REMIT_SET_ID", StringType(), True),
+        StructField("REMIT_VENDOR_ID", StringType(), True),
+        StructField("CORP_SET_ID", StringType(), True),
+        StructField("CORP_VENDOR_ID", StringType(), True),
+        StructField("ENTERED_BY_ID", StringType(), True),
+        StructField("WTHD_SW_CD", StringType(), True),
+        StructField("PRIM_VENDOR_ID", StringType(), True),
+        StructField("LOAD_DT", StringType(), True),
+        StructField("ACCOUNT_GROUP", StringType(), True),
+    ])
+    data = [("SET1", "ShortName", "ShortUsr", "Name1", "Name2", "A", "B", "RS1", "RV1", "CS1", "CV1", "EB1", "W", "PV1", "2023-01-15", "AG1")]
+    df_in = spark.createDataFrame(data, schema=schema)
+    from your_etl_module import transform_vendor
+    with pytest.raises(AnalysisException):
+        transform_vendor(df_in, audit_year).collect()
 
-    df_vendor_enriched.write.format("delta") \
-        .mode("overwrite") \
-        .option("overwriteSchema", "true") \
-        .save(output_dir)
+# TC_008: Wrong data type in integer column
+def test_wrong_type_aud_yr_nbr(spark, audit_year):
+    # AUD_YR_NBR is always set by the function, so test input with string type for audit_year
+    data = [(
+        "SET1", "VEND123", "ShortName", "ShortUsr", "Name1", "Name2",
+        "A", "B", "RS1", "RV1", "CS1", "CV1", "EB1", "W", "PV1", "2023-01-15", "AG1"
+    )]
+    df_in = make_input_df(spark, data)
+    from your_etl_module import transform_vendor
+    df_out = transform_vendor(df_in, str(audit_year))  # Pass as string
+    out = collect_as_dict(df_out)
+    assert out[0]["AUD_YR_NBR"] == int(audit_year)
 
-    result = read_delta_as_pandas(spark, output_dir)
-    assert result.shape[0] == 0
+# TC_009: Extra columns in input
+def test_extra_columns(spark, audit_year):
+    schema = StructType([
+        StructField("SET_ID", StringType(), True),
+        StructField("VENDOR_NBR_ID", StringType(), True),
+        StructField("VENDOR_SHORT_NAME", StringType(), True),
+        StructField("VENDOR_SHORT_USR_NAME", StringType(), True),
+        StructField("NAME_1", StringType(), True),
+        StructField("NAME_2", StringType(), True),
+        StructField("VENDOR_STAT_CD", StringType(), True),
+        StructField("VENDOR_CLASS_CD", StringType(), True),
+        StructField("REMIT_SET_ID", StringType(), True),
+        StructField("REMIT_VENDOR_ID", StringType(), True),
+        StructField("CORP_SET_ID", StringType(), True),
+        StructField("CORP_VENDOR_ID", StringType(), True),
+        StructField("ENTERED_BY_ID", StringType(), True),
+        StructField("WTHD_SW_CD", StringType(), True),
+        StructField("PRIM_VENDOR_ID", StringType(), True),
+        StructField("LOAD_DT", StringType(), True),
+        StructField("ACCOUNT_GROUP", StringType(), True),
+        StructField("EXTRA_COL", StringType(), True),
+    ])
+    data = [(
+        "SET1", "VEND123", "ShortName", "ShortUsr", "Name1", "Name2",
+        "A", "B", "RS1", "RV1", "CS1", "CV1", "EB1", "W", "PV1", "2023-01-15", "AG1", "extra"
+    )]
+    df_in = spark.createDataFrame(data, schema=schema)
+    from your_etl_module import transform_vendor
+    df_out = transform_vendor(df_in, audit_year)
+    assert "EXTRA_COL" not in df_out.columns
 
-    shutil.rmtree(temp_dir)
-    shutil.rmtree(output_dir)
+# TC_010: All columns null
+def test_all_nulls(spark, audit_year):
+    data = [(None,) * 17]
+    df_in = make_input_df(spark, data)
+    from your_etl_module import transform_vendor
+    df_out = transform_vendor(df_in, audit_year)
+    out = collect_as_dict(df_out)
+    for v in out[0].values():
+        if isinstance(v, int):
+            continue  # AUD_YR_NBR is always set
+        assert v is None
 
-def test_missing_columns(spark):
-    # TC04
-    data = [
-        ["V004", "Vendor E"]
-    ]
-    columns = ["VENDOR_ID", "VENDOR_NAME"]  # Missing COUNTRY
-    input_file, temp_dir = create_temp_csv(data, columns)
-    audit_year = 2024
-
-    with pytest.raises(Exception):
-        df_vendor = spark.read.format("csv") \
-            .option("delimiter", "||") \
-            .option("header", "true") \
-            .option("encoding", "US-ASCII") \
-            .option("inferSchema", "true") \
-            .load(input_file)
-        # Try to select a missing column
-        df_vendor.withColumn("COUNTRY", df_vendor["COUNTRY"])
-
-    shutil.rmtree(temp_dir)
-
-def test_extra_columns(spark):
-    # TC05
-    data = [
-        ["V005", "Vendor F", "GER", "EXTRA"]
-    ]
-    columns = ["VENDOR_ID", "VENDOR_NAME", "COUNTRY", "EXTRA_COL"]
-    input_file, temp_dir = create_temp_csv(data, columns)
-    output_dir = tempfile.mkdtemp()
-    audit_year = 2024
-
-    df_vendor = spark.read.format("csv") \
-        .option("delimiter", "||") \
-        .option("header", "true") \
-        .option("encoding", "US-ASCII") \
-        .option("inferSchema", "true") \
-        .load(input_file)
-
-    df_vendor_enriched = df_vendor \
-        .select("VENDOR_ID", "VENDOR_NAME", "COUNTRY") \
-        .withColumn("AUD_YR_NBR", lit(audit_year)) \
-        .withColumn("LOAD_DT", lit("2024-01-01 00:00:00"))
-
-    df_vendor_enriched.write.format("delta") \
-        .mode("overwrite") \
-        .option("overwriteSchema", "true") \
-        .save(output_dir)
-
-    result = read_delta_as_pandas(spark, output_dir)
-    assert "EXTRA_COL" not in result.columns
-    assert set(result["VENDOR_ID"]) == {"V005"}
-
-    shutil.rmtree(temp_dir)
-    shutil.rmtree(output_dir)
-
-def test_incorrect_delimiter(spark):
-    # TC06
-    data = [
-        ["V006", "Vendor G", "JPN"]
-    ]
-    columns = ["VENDOR_ID", "VENDOR_NAME", "COUNTRY"]
-    input_file, temp_dir = create_temp_csv(data, columns, delimiter=",")
-    audit_year = 2024
-
-    df_vendor = spark.read.format("csv") \
-        .option("delimiter", "||") \
-        .option("header", "true") \
-        .option("encoding", "US-ASCII") \
-        .option("inferSchema", "true") \
-        .load(input_file)
-
-    # Should result in a single column or wrong schema
-    assert df_vendor.columns == ['VENDOR_ID,VENDOR_NAME,COUNTRY']
-
-    shutil.rmtree(temp_dir)
-
-def test_invalid_encoding(spark):
-    # TC07
-    data = [
-        ["V007", "Vendor H", "FRA"]
-    ]
-    columns = ["VENDOR_ID", "VENDOR_NAME", "COUNTRY"]
-    # Write with UTF-16, read with US-ASCII
-    temp_dir = tempfile.mkdtemp()
-    file_path = os.path.join(temp_dir, "input.csv")
-    pd.DataFrame(data, columns=columns).to_csv(file_path, sep="||", index=False, header=True, encoding="utf-16")
-    audit_year = 2024
-
-    with pytest.raises(Exception):
-        spark.read.format("csv") \
-            .option("delimiter", "||") \
-            .option("header", "true") \
-            .option("encoding", "US-ASCII") \
-            .option("inferSchema", "true") \
-            .load(file_path).collect()
-
-    shutil.rmtree(temp_dir)
-
-def test_noninteger_audit_year(spark):
-    # TC08
-    data = [
-        ["V008", "Vendor I", "ITA"]
-    ]
-    columns = ["VENDOR_ID", "VENDOR_NAME", "COUNTRY"]
-    input_file, temp_dir = create_temp_csv(data, columns)
-    audit_year = "twenty-twenty-four"
-
-    with pytest.raises(Exception):
-        spark.read.format("csv") \
-            .option("delimiter", "||") \
-            .option("header", "true") \
-            .option("encoding", "US-ASCII") \
-            .option("inferSchema", "true") \
-            .load(input_file) \
-            .withColumn("AUD_YR_NBR", lit(int(audit_year)))
-
-    shutil.rmtree(temp_dir)
-
-def test_missing_input_file(spark):
-    # TC09
-    fake_path = "/tmp/nonexistent_file.csv"
-    with pytest.raises(Exception):
-        spark.read.format("csv") \
-            .option("delimiter", "||") \
-            .option("header", "true") \
-            .option("encoding", "US-ASCII") \
-            .option("inferSchema", "true") \
-            .load(fake_path).collect()
-
-def test_multiple_rows_enrichment(spark):
-    # TC10
-    data = [
-        ["V009", "Vendor J", "BRA"],
-        ["V010", "Vendor K", "ARG"]
-    ]
-    columns = ["VENDOR_ID", "VENDOR_NAME", "COUNTRY"]
-    input_file, temp_dir = create_temp_csv(data, columns)
-    output_dir = tempfile.mkdtemp()
-    audit_year = 2024
-
-    df_vendor = spark.read.format("csv") \
-        .option("delimiter", "||") \
-        .option("header", "true") \
-        .option("encoding", "US-ASCII") \
-        .option("inferSchema", "true") \
-        .load(input_file)
-
-    df_vendor_enriched = df_vendor \
-        .withColumn("AUD_YR_NBR", lit(audit_year)) \
-        .withColumn("LOAD_DT", lit("2024-01-01 00:00:00"))
-
-    df_vendor_enriched.write.format("delta") \
-        .mode("overwrite") \
-        .option("overwriteSchema", "true") \
-        .save(output_dir)
-
-    result = read_delta_as_pandas(spark, output_dir)
-    assert result.shape[0] == 2
-    assert set(result["AUD_YR_NBR"]) == {2024}
-    assert all(result["LOAD_DT"] == "2024-01-01 00:00:00")
-
-    shutil.rmtree(temp_dir)
-    shutil.rmtree(output_dir)
 ```
