@@ -1,0 +1,248 @@
+import os
+import sys
+import logging
+import datetime
+import json
+import tempfile
+import shutil
+from typing import List, Dict, Any
+
+# For SAP ABAP RFC connection
+try:
+    from pyrfc import Connection as SAPConnection
+except ImportError:
+    SAPConnection = None  # For environments where pyrfc is not installed
+
+# For distributed storage (S3/HDFS)
+import boto3  # For S3
+from botocore.exceptions import ClientError
+
+# For PySpark
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+from pyspark.sql.functions import col
+
+# For Parquet conversion
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+# ========== CONFIGURATION ==========
+# These should be set via environment variables or secure config files
+SAP_CONN_PARAMS = {
+    'user': os.getenv('SAP_USER'),
+    'passwd': os.getenv('SAP_PASS'),
+    'ashost': os.getenv('SAP_ASHOST'),
+    'sysnr': os.getenv('SAP_SYSNR'),
+    'client': os.getenv('SAP_CLIENT'),
+    'lang': os.getenv('SAP_LANG', 'EN')
+}
+S3_BUCKET = os.getenv('S3_BUCKET')
+S3_PREFIX = os.getenv('S3_PREFIX', 'abap_pyspark_validation/')
+SPARK_APP_NAME = "ABAP_PySpark_Migration_Validation"
+SPARK_MASTER = os.getenv('SPARK_MASTER', 'local[*]')
+PYSPARK_CODE_PATH = os.getenv('PYSPARK_CODE_PATH', 'pyspark_converted_script.py')
+ABAP_FUNCTION_MODULE = os.getenv('ABAP_FUNCTION_MODULE', 'ZBW_LOAD_GL_DATA')  # RFC-enabled wrapper for ABAP logic
+
+# ========== LOGGING SETUP ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("abap_pyspark_validation.log")
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ========== UTILITY FUNCTIONS ==========
+
+def get_timestamp() -> str:
+    return datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+
+def secure_get_env(var: str) -> str:
+    val = os.getenv(var)
+    if not val:
+        logger.error(f"Missing required environment variable: {var}")
+        sys.exit(1)
+    return val
+
+def integrity_check(local_path: str, s3_bucket: str, s3_key: str, s3_client) -> bool:
+    try:
+        s3_obj = s3_client.head_object(Bucket=s3_bucket, Key=s3_key)
+        local_size = os.path.getsize(local_path)
+        s3_size = s3_obj['ContentLength']
+        return local_size == s3_size
+    except Exception as e:
+        logger.error(f"Integrity check failed: {e}")
+        return False
+
+def compare_dataframes(df1: DataFrame, df2: DataFrame, key_columns: List[str]) -> Dict[str, Any]:
+    """
+    Compare two Spark DataFrames and return a reconciliation report.
+    """
+    report = {}
+    count1 = df1.count()
+    count2 = df2.count()
+    report['row_count_abap'] = count1
+    report['row_count_pyspark'] = count2
+    report['row_count_match'] = (count1 == count2)
+
+    # Compare schema
+    schema1 = set((f.name, str(f.dataType)) for f in df1.schema.fields)
+    schema2 = set((f.name, str(f.dataType)) for f in df2.schema.fields)
+    report['schema_match'] = (schema1 == schema2)
+    report['schema_abap'] = list(schema1)
+    report['schema_pyspark'] = list(schema2)
+
+    # Join on key columns and compare
+    join_expr = [df1[k] == df2[k] for k in key_columns]
+    joined = df1.join(df2, on=key_columns, how='outer', indicator=True)
+    mismatched = joined.filter(joined['_merge'] != 'both')
+    mismatch_count = mismatched.count()
+    report['mismatch_count'] = mismatch_count
+    report['match_percentage'] = 100.0 * (count1 - mismatch_count) / max(count1, 1)
+    report['match_status'] = (
+        'MATCH' if mismatch_count == 0 and count1 == count2 and report['schema_match']
+        else 'PARTIAL MATCH' if mismatch_count > 0
+        else 'NO MATCH'
+    )
+    # Sample mismatches
+    report['sample_mismatches'] = mismatched.limit(10).toPandas().to_dict(orient='records') if mismatch_count > 0 else []
+    return report
+
+# ========== STEP 1: EXECUTE ABAP CODE AND EXPORT RESULTS ==========
+
+def execute_abap_and_export(sap_conn_params: dict, output_dir: str) -> str:
+    """
+    Connects to SAP ABAP system, executes the ABAP logic, and exports the result to a Parquet file.
+    Returns the local Parquet file path.
+    """
+    if SAPConnection is None:
+        logger.error("pyrfc is not installed. Cannot connect to SAP.")
+        sys.exit(1)
+
+    logger.info("Connecting to SAP ABAP system...")
+    conn = SAPConnection(**sap_conn_params)
+    logger.info("Executing ABAP function module to extract data...")
+    # The ABAP function module should return the table as a list of dicts
+    result = conn.call(ABAP_FUNCTION_MODULE)
+    abap_table = result.get('LT_BW_DATA', [])
+    if not abap_table:
+        logger.warning("No data returned from ABAP execution.")
+
+    # Convert to DataFrame and export as Parquet
+    logger.info("Converting ABAP output to Parquet...")
+    df = pd.DataFrame(abap_table)
+    parquet_path = os.path.join(
+        output_dir, f"zbw_finance_data_abap_{get_timestamp()}.parquet"
+    )
+    table = pa.Table.from_pandas(df)
+    pq.write_table(table, parquet_path)
+    logger.info(f"ABAP output exported to {parquet_path}")
+    return parquet_path
+
+# ========== STEP 2: TRANSFER TO DISTRIBUTED STORAGE (S3) ==========
+
+def upload_to_s3(local_path: str, s3_bucket: str, s3_prefix: str, s3_client) -> str:
+    s3_key = os.path.join(s3_prefix, os.path.basename(local_path))
+    logger.info(f"Uploading {local_path} to s3://{s3_bucket}/{s3_key} ...")
+    try:
+        s3_client.upload_file(local_path, s3_bucket, s3_key)
+        if integrity_check(local_path, s3_bucket, s3_key, s3_client):
+            logger.info("File uploaded and integrity check passed.")
+        else:
+            logger.error("File uploaded but integrity check failed.")
+            raise Exception("Integrity check failed after upload.")
+    except ClientError as e:
+        logger.error(f"S3 upload failed: {e}")
+        sys.exit(1)
+    return f"s3://{s3_bucket}/{s3_key}"
+
+# ========== STEP 3: RUN PYSPARK CODE AND EXPORT RESULTS ==========
+
+def run_pyspark_and_export(spark: SparkSession, pyspark_code_path: str, output_dir: str) -> str:
+    """
+    Executes the provided PySpark code and exports the resulting table to Parquet.
+    Returns the local Parquet file path.
+    """
+    logger.info("Executing PySpark code...")
+    # The PySpark code should write to a known table, e.g., 'zbw_finance_data'
+    # We'll read that table and export to Parquet
+    exec(open(pyspark_code_path).read(), {'spark': spark})
+    logger.info("Reading PySpark output table...")
+    df = spark.table("zbw_finance_data")
+    parquet_path = os.path.join(
+        output_dir, f"zbw_finance_data_pyspark_{get_timestamp()}.parquet"
+    )
+    df.toPandas().to_parquet(parquet_path, index=False)
+    logger.info(f"PySpark output exported to {parquet_path}")
+    return parquet_path
+
+# ========== STEP 4: LOAD PARQUET FILES INTO SPARK FOR COMPARISON ==========
+
+def load_parquet_to_spark(spark: SparkSession, parquet_path: str, table_name: str) -> DataFrame:
+    logger.info(f"Loading Parquet file {parquet_path} into Spark table {table_name}...")
+    df = spark.read.parquet(parquet_path)
+    df.createOrReplaceTempView(table_name)
+    return df
+
+# ========== STEP 5: MAIN VALIDATION LOGIC ==========
+
+def main():
+    logger.info("=== ABAP to PySpark Migration Validation Script Started ===")
+    temp_dir = tempfile.mkdtemp(prefix="abap_pyspark_validation_")
+    try:
+        # Step 1: Execute ABAP code and export results
+        abap_parquet = execute_abap_and_export(SAP_CONN_PARAMS, temp_dir)
+
+        # Step 2: Upload ABAP output to S3
+        s3_client = boto3.client('s3')
+        abap_s3_uri = upload_to_s3(abap_parquet, S3_BUCKET, S3_PREFIX, s3_client)
+
+        # Step 3: Run PySpark code and export results
+        spark = SparkSession.builder.appName(SPARK_APP_NAME).master(SPARK_MASTER).enableHiveSupport().getOrCreate()
+        pyspark_parquet = run_pyspark_and_export(spark, PYSPARK_CODE_PATH, temp_dir)
+
+        # Step 4: Upload PySpark output to S3
+        pyspark_s3_uri = upload_to_s3(pyspark_parquet, S3_BUCKET, S3_PREFIX, s3_client)
+
+        # Step 5: Load Parquet files into Spark
+        abap_df = load_parquet_to_spark(spark, abap_parquet, "abap_zbw_finance_data")
+        pyspark_df = load_parquet_to_spark(spark, pyspark_parquet, "pyspark_zbw_finance_data")
+
+        # Step 6: Compare DataFrames
+        # Use all columns as key columns for row-level match
+        key_columns = ["bukrs", "fiscyear", "costcenter", "gl_account", "amount", "currency", "posting_date"]
+        report = compare_dataframes(abap_df, pyspark_df, key_columns)
+
+        # Step 7: Generate reconciliation report
+        report_path = os.path.join(temp_dir, f"reconciliation_report_{get_timestamp()}.json")
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        logger.info(f"Reconciliation report generated at {report_path}")
+        logger.info("=== Validation Complete ===")
+        logger.info(json.dumps(report, indent=2))
+
+    except Exception as e:
+        logger.error(f"Validation failed: {e}", exc_info=True)
+        sys.exit(1)
+    finally:
+        # Clean up temp files
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+if __name__ == "__main__":
+    main()
+
+# =========================
+# Script Notes:
+# - All credentials and sensitive info must be set via environment variables or secure vaults.
+# - The ABAP function module must be RFC-enabled and return the output table as a list of dicts.
+# - The PySpark code must write to a Hive table named 'zbw_finance_data'.
+# - The script logs all operations and errors for auditability.
+# - The reconciliation report includes row count, schema, match status, and sample mismatches.
+# - Handles large datasets by using Spark and Parquet for efficient processing.
+# - All file transfers are integrity-checked.
+# - Can be scheduled via cron or orchestration tools.
+# - For HDFS/Data Lake, replace S3 logic with appropriate client code.
+# - For further extensibility, wrap steps in reusable functions/classes as needed.
