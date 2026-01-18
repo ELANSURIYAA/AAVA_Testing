@@ -1,112 +1,151 @@
+------------------------------------------------------------
 Test Case List:
-1. Test Case ID: TC001
-   - Description: Test with a mix of valid lines and lines containing '*ERROR*'.
-   - Expected Outcome: Only valid lines are counted; rows with '*ERROR*' are excluded.
-2. Test Case ID: TC002
-   - Description: Test with all valid lines.
-   - Expected Outcome: All lines are counted.
-3. Test Case ID: TC003
-   - Description: Test with all lines containing '*ERROR*'.
-   - Expected Outcome: The count is zero since all lines are excluded.
-4. Test Case ID: TC004
-   - Description: Test with an empty input.
-   - Expected Outcome: The count is zero as there are no lines to process.
-5. Test Case ID: TC005
-   - Description: Test with a DataFrame missing the 'value' column.
-   - Expected Outcome: An AnalysisException is raised indicating the missing column.
+------------------------------------------------------------
+TC001 - Happy Path Test:
+   - Description: Input a valid CSV row in a text DataFrame with exactly 7 comma-separated values. Verify that the output DataFrame returns one row with correctly mapped columns ("bukrs", "fiscyear", "costcenter", "gl_account", "amount" cast to float, "currency", "posting_date").
+   - Expected Outcome: Final DataFrame contains one row with each field correctly extracted and "amount" as a float.
 
-Pytest Script:
+TC002 - Insufficient Fields Test:
+   - Description: Input a row with fewer than 7 fields. Verify that such rows are filtered out.
+   - Expected Outcome: Final DataFrame is empty.
+
+TC003 - Excess Fields Test:
+   - Description: Input a row with more than 7 fields. Verify that such rows are filtered out.
+   - Expected Outcome: Final DataFrame is empty.
+
+TC004 - Amount Casting Test:
+   - Description: Validate that the "amount" field is properly cast from string to float. Provide a valid numeric string and check its type in the final output.
+   - Expected Outcome: "amount" column value is of float type and correctly converted.
+
+TC005 - Empty File Test:
+   - Description: Provide an empty DataFrame (simulating an empty file) and verify that the process does not fail and returns an empty DataFrame.
+   - Expected Outcome: Final DataFrame is empty.
+
+------------------------------------------------------------
+Pytest Script (pytest_pyspark_tests.py):
 ------------------------------------------------------------
 #!/usr/bin/env python
-# test_gl_data_processing.py
+# -*- coding: utf-8 -*-
+"""
+Pytest script for testing the PySpark conversion code which mimics the functionality of the original ABAP code.
+This script includes:
+ - Setup/teardown of SparkSession.
+ - Unit tests for valid input, insufficient columns, excess columns, amount casting, and empty input.
+ - Comments explaining each test case.
+"""
 
 import pytest
 from pyspark.sql import SparkSession
-from pyspark.sql.utils import AnalysisException
+from pyspark.sql.functions import col, split, size
+from pyspark.sql.types import FloatType
 
-# Fixture to create and tear down the SparkSession for each test module
+# Fixture for SparkSession
 @pytest.fixture(scope="module")
 def spark():
-    spark_session = SparkSession.builder.master("local[*]").appName("PySparkTest").getOrCreate()
+    spark_session = SparkSession.builder \
+        .appName("PySpark Unit Tests") \
+        .master("local[2]") \
+        .getOrCreate()
     yield spark_session
     spark_session.stop()
 
-# Helper function to replicate the PySpark job logic from the given script
-def filter_and_count_valid_entries(df):
-    # Ensure the DataFrame has the expected column 'value'
-    if 'value' not in df.columns:
-        raise AnalysisException("The required column 'value' is missing.")
-    # Filter out rows containing '*ERROR*' and count the remaining rows
-    valid_df = df.filter(~df['value'].contains('*ERROR*'))
-    return valid_df.count()
+def transform_data(raw_df):
+    """
+    Function to simulate the transformation logic from the provided PySpark code.
+    This includes splitting the text, filtering by field count, mapping columns and casting 'amount'.
+    """
+    split_df = raw_df.withColumn("fields", split(col("value"), ","))
+    # Filter rows with exactly 7 fields
+    filtered_df = split_df.filter(size(col("fields")) == 7)
+    # Map fields to columns
+    final_df = filtered_df.select(
+        col("fields").getItem(0).alias("bukrs"),
+        col("fields").getItem(1).alias("fiscyear"),
+        col("fields").getItem(2).alias("costcenter"),
+        col("fields").getItem(3).alias("gl_account"),
+        col("fields").getItem(4).alias("amount"),
+        col("fields").getItem(5).alias("currency"),
+        col("fields").getItem(6).alias("posting_date")
+    )
+    final_df = final_df.withColumn("amount", col("amount").cast(FloatType()))
+    return final_df
 
-# Test cases:
+def test_happy_path(spark):
+    """
+    TC001 - Happy Path
+    Create a DataFrame with one valid CSV row (exactly 7 fields) and verify proper mapping and type casting.
+    """
+    data = [("1000,2021,CC01,4000,123.45,USD,2021-12-31", )]
+    raw_df = spark.createDataFrame(data, ["value"])
+    result_df = transform_data(raw_df)
+    
+    result = result_df.collect()
+    assert len(result) == 1, "Expected one row in the final DataFrame"
+    row = result[0]
+    # Verify each field mapping
+    assert row["bukrs"] == "1000"
+    assert row["fiscyear"] == "2021"
+    assert row["costcenter"] == "CC01"
+    assert row["gl_account"] == "4000"
+    # Verify that amount is cast to float
+    assert isinstance(row["amount"], float)
+    assert row["amount"] == 123.45
+    assert row["currency"] == "USD"
+    assert row["posting_date"] == "2021-12-31"
 
-def test_mixed_lines(spark):
+def test_insufficient_fields(spark):
     """
-    TC001: Test with a mix of valid lines and lines containing '*ERROR*'.
-    Expected Outcome: Only valid lines are counted.
+    TC002 - Insufficient Fields
+    Test with a row that has fewer than 7 comma-separated fields.
+    The expected behavior is to filter out such rows so that the result is an empty DataFrame.
     """
-    data = [
-        ("valid line 1",),
-        ("*ERROR* line",),
-        ("valid line 2",)
-    ]
-    df = spark.createDataFrame(data, ["value"])
-    result = filter_and_count_valid_entries(df)
-    assert result == 2  # Expect 2 valid lines
+    data = [("1000,2021,CC01,4000,123.45,USD", )]  # Only 6 fields
+    raw_df = spark.createDataFrame(data, ["value"])
+    result_df = transform_data(raw_df)
+    
+    result = result_df.collect()
+    assert len(result) == 0, "Expected no rows in the final DataFrame for insufficient fields"
 
-def test_all_valid_lines(spark):
+def test_excess_fields(spark):
     """
-    TC002: Test with all valid lines.
-    Expected Outcome: All lines are counted.
+    TC003 - Excess Fields
+    Test with a row that has more than 7 comma-separated fields.
+    The expected behavior is to filter out such rows.
     """
-    data = [
-        ("valid line 1",),
-        ("valid line 2",),
-        ("valid line 3",)
-    ]
-    df = spark.createDataFrame(data, ["value"])
-    result = filter_and_count_valid_entries(df)
-    assert result == 3  # All 3 lines are valid
+    data = [("1000,2021,CC01,4000,123.45,USD,2021-12-31,ExtraField", )]  # 8 fields
+    raw_df = spark.createDataFrame(data, ["value"])
+    result_df = transform_data(raw_df)
+    
+    result = result_df.collect()
+    assert len(result) == 0, "Expected no rows in the final DataFrame for excess fields"
 
-def test_all_error_lines(spark):
+def test_amount_casting(spark):
     """
-    TC003: Test with all lines containing '*ERROR*'.
-    Expected Outcome: Count is zero since all lines are excluded.
+    TC004 - Amount Casting Test
+    This test ensures that the 'amount' field is correctly cast to a float.
     """
-    data = [
-        ("*ERROR* line 1",),
-        ("*ERROR* line 2",),
-        ("*ERROR* line 3",)
-    ]
-    df = spark.createDataFrame(data, ["value"])
-    result = filter_and_count_valid_entries(df)
-    assert result == 0  # No valid lines
+    data = [("1000,2021,CC01,4000,456.78,USD,2021-12-31", )]
+    raw_df = spark.createDataFrame(data, ["value"])
+    result_df = transform_data(raw_df)
+    
+    result = result_df.collect()
+    assert len(result) == 1, "Expected one row after transformation"
+    row = result[0]
+    assert isinstance(row["amount"], float), "The amount field should be of float type"
+    assert row["amount"] == 456.78, "The converted float value of amount does not match expected value"
 
-def test_empty_input(spark):
+def test_empty_file(spark):
     """
-    TC004: Test with an empty input.
-    Expected Outcome: Count is zero as there are no lines to process.
+    TC005 - Empty File Test
+    Test with an empty DataFrame (simulating an empty file) and ensure that the transformation handles it gracefully.
     """
-    data = []
-    df = spark.createDataFrame(data, ["value"])
-    result = filter_and_count_valid_entries(df)
-    assert result == 0  # No lines present
+    # Create an empty DataFrame with the same schema as the input text file
+    empty_rdd = spark.sparkContext.emptyRDD()
+    raw_df = spark.createDataFrame(empty_rdd, ["value"])
+    result_df = transform_data(raw_df)
+    
+    result = result_df.collect()
+    assert len(result) == 0, "Expected an empty DataFrame for an empty input"
 
-def test_missing_value_column(spark):
-    """
-    TC005: Test with a DataFrame missing the 'value' column.
-    Expected Outcome: An AnalysisException is raised due to the missing column.
-    """
-    data = [
-        ("valid line 1",),
-        ("*ERROR* line",)
-    ]
-    # Creating DataFrame with a different column name
-    df = spark.createDataFrame(data, ["different_column"])
-    with pytest.raises(AnalysisException):
-        filter_and_count_valid_entries(df)
-
-# Cost consumed by the API for this call: 0.002 USD
+# API cost consumed for this call: 1 unit
 ------------------------------------------------------------
