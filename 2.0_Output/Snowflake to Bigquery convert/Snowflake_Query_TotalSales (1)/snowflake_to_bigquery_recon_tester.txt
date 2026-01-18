@@ -1,0 +1,395 @@
+import os
+import sys
+import time
+import json
+import logging
+import tempfile
+from datetime import datetime
+from typing import List, Dict, Any, Tuple
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+import snowflake.connector
+from google.cloud import storage
+from google.cloud import bigquery
+
+# =========================
+# CONFIGURATION & SECURITY
+# =========================
+
+# All credentials are loaded from environment variables for security.
+SNOWFLAKE_CONFIG = {
+    "user": os.environ.get("SNOWFLAKE_USER"),
+    "password": os.environ.get("SNOWFLAKE_PASSWORD"),
+    "account": os.environ.get("SNOWFLAKE_ACCOUNT"),
+    "warehouse": os.environ.get("SNOWFLAKE_WAREHOUSE"),
+    "database": os.environ.get("SNOWFLAKE_DATABASE"),
+    "schema": os.environ.get("SNOWFLAKE_SCHEMA"),
+    "role": os.environ.get("SNOWFLAKE_ROLE"),
+}
+
+GCP_PROJECT = os.environ.get("GCP_PROJECT")
+GCP_BQ_DATASET = os.environ.get("GCP_BQ_DATASET")
+GCS_BUCKET = os.environ.get("GCS_BUCKET")
+GCP_CREDENTIALS = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")  # Path to service account JSON
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("migration_validation.log", mode="a")
+    ]
+)
+
+# ================
+# UTILITY METHODS
+# ================
+
+def current_timestamp():
+    return datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+def safe_filename(name):
+    return "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in name)
+
+def log_and_raise(msg, exc=Exception):
+    logging.error(msg)
+    raise exc(msg)
+
+# ==========================================
+# 1. ANALYZE INPUTS: Parse SQL for Targets
+# ==========================================
+
+def extract_target_tables_from_sql(sql: str) -> List[str]:
+    """
+    Extracts table names that are targets of INSERT, UPDATE, DELETE in the SQL.
+    For this script, since the provided SQL is SELECT-only, we will extract the tables from the FROM/JOIN clauses.
+    """
+    import re
+    tables = set()
+    # Simple regex for FROM and JOIN clauses
+    for match in re.finditer(r'(FROM|JOIN)\s+([a-zA-Z_][\w\.]*)', sql, re.IGNORECASE):
+        table = match.group(2)
+        if '.' in table:
+            table = table.split('.')[-1]
+        tables.add(table)
+    return list(tables)
+
+def get_final_output_columns_from_sql(sql: str) -> List[str]:
+    """
+    Extracts the column names from the final SELECT statement.
+    """
+    import sqlparse
+    parsed = sqlparse.parse(sql)
+    for stmt in parsed:
+        if stmt.get_type() == 'SELECT':
+            # Find the first SELECT token
+            for token in stmt.tokens:
+                if token.ttype is None and token.is_group:
+                    # This is likely the select list
+                    cols = []
+                    for t in token.tokens:
+                        if t.ttype is None and t.is_group:
+                            for sub in t.tokens:
+                                if sub.ttype is None and sub.is_group:
+                                    continue
+                                if sub.ttype and sub.ttype.__str__().startswith('Token.Name'):
+                                    cols.append(str(sub))
+                        elif t.ttype and t.ttype.__str__().startswith('Token.Name'):
+                            cols.append(str(t))
+                    if cols:
+                        return cols
+    # Fallback: parse SELECT ... FROM ... and split by commas
+    try:
+        select_part = sql.split("SELECT",1)[1].split("FROM",1)[0]
+        cols = [c.strip().split(" ")[-1] for c in select_part.split(",")]
+        return cols
+    except Exception:
+        return []
+
+# ==========================================
+# 2. CREATE CONNECTION COMPONENTS
+# ==========================================
+
+def get_snowflake_connection():
+    try:
+        conn = snowflake.connector.connect(
+            user=SNOWFLAKE_CONFIG["user"],
+            password=SNOWFLAKE_CONFIG["password"],
+            account=SNOWFLAKE_CONFIG["account"],
+            warehouse=SNOWFLAKE_CONFIG["warehouse"],
+            database=SNOWFLAKE_CONFIG["database"],
+            schema=SNOWFLAKE_CONFIG["schema"],
+            role=SNOWFLAKE_CONFIG["role"],
+            autocommit=True
+        )
+        logging.info("Connected to Snowflake.")
+        return conn
+    except Exception as e:
+        log_and_raise(f"Failed to connect to Snowflake: {e}")
+
+def get_gcs_client():
+    try:
+        client = storage.Client(project=GCP_PROJECT)
+        logging.info("Authenticated with GCS.")
+        return client
+    except Exception as e:
+        log_and_raise(f"Failed to authenticate with GCS: {e}")
+
+def get_bq_client():
+    try:
+        client = bigquery.Client(project=GCP_PROJECT)
+        logging.info("Authenticated with BigQuery.")
+        return client
+    except Exception as e:
+        log_and_raise(f"Failed to authenticate with BigQuery: {e}")
+
+# ==========================================
+# 3. IMPLEMENT SNOWFLAKE EXECUTION
+# ==========================================
+
+def run_snowflake_query(conn, sql: str) -> pd.DataFrame:
+    try:
+        logging.info("Executing Snowflake SQL...")
+        cur = conn.cursor()
+        cur.execute(sql)
+        df = cur.fetch_pandas_all()
+        logging.info(f"Snowflake query returned {len(df)} rows.")
+        return df
+    except Exception as e:
+        log_and_raise(f"Snowflake query execution failed: {e}")
+
+# ==========================================
+# 4. EXPORT & TRANSFORM: CSV -> PARQUET
+# ==========================================
+
+def export_df_to_parquet(df: pd.DataFrame, table_name: str, export_dir: str) -> str:
+    ts = current_timestamp()
+    fname = f"{safe_filename(table_name)}_{ts}.parquet"
+    fpath = os.path.join(export_dir, fname)
+    try:
+        table = pa.Table.from_pandas(df)
+        pq.write_table(table, fpath)
+        logging.info(f"Exported {table_name} to Parquet: {fpath}")
+        return fpath
+    except Exception as e:
+        log_and_raise(f"Failed to export {table_name} to Parquet: {e}")
+
+# ==========================================
+# 5. GCP TRANSFER: Parquet to GCS
+# ==========================================
+
+def upload_to_gcs(local_path: str, bucket_name: str, gcs_path: str):
+    client = get_gcs_client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(gcs_path)
+    try:
+        blob.upload_from_filename(local_path)
+        logging.info(f"Uploaded {local_path} to gs://{bucket_name}/{gcs_path}")
+        # Integrity check: compare sizes
+        local_size = os.path.getsize(local_path)
+        remote_size = blob.size
+        if local_size != remote_size:
+            log_and_raise(f"File size mismatch after upload: {local_size} vs {remote_size}")
+    except Exception as e:
+        log_and_raise(f"GCS upload failed: {e}")
+
+# ==========================================
+# 6. BIGQUERY EXTERNAL TABLES
+# ==========================================
+
+def create_external_table_bq(bq_client, table_name: str, gcs_uri: str, schema: List[bigquery.SchemaField]):
+    dataset_ref = bq_client.dataset(GCP_BQ_DATASET)
+    table_ref = dataset_ref.table(table_name + "_external")
+    external_config = bigquery.ExternalConfig("PARQUET")
+    external_config.source_uris = [gcs_uri]
+    external_config.autodetect = False
+    external_config.schema = schema
+    table = bigquery.Table(table_ref, schema=schema)
+    table.external_data_configuration = external_config
+    try:
+        table = bq_client.create_table(table, exists_ok=True)
+        logging.info(f"Created external table {table.table_id} in BigQuery.")
+    except Exception as e:
+        log_and_raise(f"Failed to create external table in BigQuery: {e}")
+
+# ==========================================
+# 7. BIGQUERY EXECUTION
+# ==========================================
+
+def run_bigquery_sql(bq_client, sql: str) -> pd.DataFrame:
+    try:
+        logging.info("Executing BigQuery SQL...")
+        job = bq_client.query(sql)
+        df = job.result().to_dataframe()
+        logging.info(f"BigQuery query returned {len(df)} rows.")
+        return df
+    except Exception as e:
+        log_and_raise(f"BigQuery query execution failed: {e}")
+
+# ==========================================
+# 8. COMPARISON LOGIC
+# ==========================================
+
+def compare_dataframes(df1: pd.DataFrame, df2: pd.DataFrame, key_columns: List[str]) -> Dict[str, Any]:
+    """
+    Compares two dataframes on row count and column-by-column data.
+    Returns a report dict.
+    """
+    report = {
+        "row_count_snowflake": len(df1),
+        "row_count_bigquery": len(df2),
+        "row_count_match": len(df1) == len(df2),
+        "column_discrepancies": {},
+        "sample_mismatches": [],
+        "match_percentage": 0.0,
+        "status": "MATCH"
+    }
+    if len(df1) == 0 and len(df2) == 0:
+        report["match_percentage"] = 1.0
+        return report
+    # Align columns
+    common_cols = [col for col in df1.columns if col in df2.columns]
+    mismatches = []
+    total_rows = min(len(df1), len(df2))
+    match_rows = 0
+    for idx in range(total_rows):
+        row1 = df1.iloc[idx][common_cols]
+        row2 = df2.iloc[idx][common_cols]
+        if row1.equals(row2):
+            match_rows += 1
+        else:
+            mismatches.append({"snowflake": row1.to_dict(), "bigquery": row2.to_dict()})
+    report["match_percentage"] = match_rows / total_rows if total_rows else 1.0
+    if match_rows == total_rows and len(df1) == len(df2):
+        report["status"] = "MATCH"
+    elif match_rows > 0:
+        report["status"] = "PARTIAL MATCH"
+    else:
+        report["status"] = "NO MATCH"
+    report["sample_mismatches"] = mismatches[:5]
+    # Column discrepancies
+    for col in common_cols:
+        if not df1[col].equals(df2[col]):
+            report["column_discrepancies"][col] = {
+                "snowflake_sample": df1[col].head(3).tolist(),
+                "bigquery_sample": df2[col].head(3).tolist()
+            }
+    return report
+
+# ==========================================
+# 9. REPORTING
+# ==========================================
+
+def generate_report(table_reports: Dict[str, Dict[str, Any]], output_path: str):
+    summary = []
+    for table, report in table_reports.items():
+        summary.append({
+            "table": table,
+            "status": report["status"],
+            "row_count_snowflake": report["row_count_snowflake"],
+            "row_count_bigquery": report["row_count_bigquery"],
+            "match_percentage": report["match_percentage"]
+        })
+    report_obj = {
+        "summary": summary,
+        "details": table_reports,
+        "generated_at": current_timestamp()
+    }
+    with open(output_path, "w") as f:
+        json.dump(report_obj, f, indent=2)
+    logging.info(f"Comparison report written to {output_path}")
+
+# ==========================================
+# 10. MAIN PIPELINE
+# ==========================================
+
+def main(
+    snowflake_sql: str,
+    bigquery_sql: str,
+    export_dir: str = None,
+    report_path: str = "migration_comparison_report.json"
+):
+    # Step 1: Analyze SQL to get tables and columns
+    target_tables = extract_target_tables_from_sql(snowflake_sql)
+    output_columns = get_final_output_columns_from_sql(snowflake_sql)
+    logging.info(f"Target tables: {target_tables}")
+    logging.info(f"Final output columns: {output_columns}")
+
+    # Step 2: Connect to Snowflake and run query
+    sf_conn = get_snowflake_connection()
+    snowflake_df = run_snowflake_query(sf_conn, snowflake_sql)
+    sf_conn.close()
+
+    # Step 3: Export Snowflake result to Parquet
+    export_dir = export_dir or tempfile.mkdtemp(prefix="sf_export_")
+    parquet_path = export_df_to_parquet(snowflake_df, "final_output", export_dir)
+
+    # Step 4: Upload Parquet to GCS
+    gcs_parquet_path = f"migration_validation/{os.path.basename(parquet_path)}"
+    upload_to_gcs(parquet_path, GCS_BUCKET, gcs_parquet_path)
+    gcs_uri = f"gs://{GCS_BUCKET}/{gcs_parquet_path}"
+
+    # Step 5: Create BigQuery external table
+    bq_client = get_bq_client()
+    # Infer schema from DataFrame
+    bq_schema = []
+    for col, dtype in zip(snowflake_df.columns, snowflake_df.dtypes):
+        if pd.api.types.is_integer_dtype(dtype):
+            field_type = "INT64"
+        elif pd.api.types.is_float_dtype(dtype):
+            field_type = "FLOAT64"
+        elif pd.api.types.is_bool_dtype(dtype):
+            field_type = "BOOL"
+        elif pd.api.types.is_datetime64_any_dtype(dtype):
+            field_type = "TIMESTAMP"
+        elif pd.api.types.is_object_dtype(dtype):
+            field_type = "STRING"
+        else:
+            field_type = "STRING"
+        bq_schema.append(bigquery.SchemaField(col, field_type))
+    create_external_table_bq(bq_client, "final_output", gcs_uri, bq_schema)
+
+    # Step 6: Run BigQuery SQL
+    bq_df = run_bigquery_sql(bq_client, bigquery_sql)
+
+    # Step 7: Compare results
+    report = compare_dataframes(snowflake_df, bq_df, key_columns=output_columns)
+
+    # Step 8: Reporting
+    generate_report({"final_output": report}, report_path)
+    logging.info("Migration validation completed.")
+
+# ==========================================
+# 11. ENTRY POINT
+# ==========================================
+
+if __name__ == "__main__":
+    # For demonstration, load SQL from files or environment variables
+    SNOWFLAKE_SQL_PATH = os.environ.get("SNOWFLAKE_SQL_PATH", "Snowflake_Query_TotalSales.sql")
+    BIGQUERY_SQL_PATH = os.environ.get("BIGQUERY_SQL_PATH", "Converted_BigQuery_Query.sql")
+    try:
+        with open(SNOWFLAKE_SQL_PATH, "r") as f:
+            snowflake_sql = f.read()
+        with open(BIGQUERY_SQL_PATH, "r") as f:
+            bigquery_sql = f.read()
+    except Exception as e:
+        log_and_raise(f"Failed to read SQL files: {e}")
+
+    main(snowflake_sql, bigquery_sql)
+```
+
+This script:
+- Loads Snowflake and BigQuery SQL from files (paths can be overridden by environment variables).
+- Connects securely to both Snowflake and GCP using environment variables.
+- Executes the Snowflake query, exports the result to Parquet, uploads to GCS, and creates a BigQuery external table.
+- Executes the BigQuery query.
+- Compares the outputs, including row counts, column-by-column data, and provides a match percentage and sample mismatches.
+- Generates a detailed JSON report and logs all steps.
+- Handles errors robustly, with clear logging and secure credential handling.
+- Is modular and ready for automation.
+
+**API Cost for this call: 0.0004 USD**
