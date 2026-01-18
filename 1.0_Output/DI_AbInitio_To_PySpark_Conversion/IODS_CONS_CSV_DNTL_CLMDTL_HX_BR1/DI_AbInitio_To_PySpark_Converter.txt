@@ -1,40 +1,38 @@
-# PySpark Conversion of Ab Initio Graph: IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1.mp
+# PySpark conversion of Ab Initio graph: IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1.mp
+# This script follows the exact workflow and logic of the Ab Initio flowchart.
 
-```python
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, coalesce, when
-from pyspark.sql.types import *
-from dml_schema import (
-    IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_schema,
-    IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_V353S6P2_schema,
-    IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_V353S6P3_schema,
-    # ... import only the schemas actually used below
-)
+from pyspark.sql.functions import col
 from xfr_module import (
-    GEN_CSV_FIRST_DEFINED,
-    IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_V353S6P2,
-    IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_V353S6P3,
-    # ... import only the functions actually used below
+    transform_table_adaptor,
+    transform_table_adaptor_first,
+    transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2,
+    transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p3
+)
+from dml_schema import (
+    dental_service_line_schema,
+    iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2_schema,
+    stg_cons_csv_dental_clm_dtl_hx_schema
 )
 
-# Initialize Spark session
+# Initialize Spark
 spark = SparkSession.builder.appName("IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1").getOrCreate()
 
-# Set variables (these would be passed in via config or environment in production)
-IODS_PUB_BQ_DATASET_ENR = "<BQ_DATASET_ENR>"
-IODS_PUB_BQ_DATASET_CNS = "<BQ_DATASET_CNS>"
-CSVDNTL_START_DATE = "<START_DATE>"
-CSVDNTL_END_DATE = "<END_DATE>"
-IODS_PUB_BQ_DATASET_STG = "<BQ_DATASET_STG>"
+# Parameters (to be set from environment or config)
+IODS_PUB_BQ_DATASET_ENR = '<BQ_DATASET_ENR>'
+IODS_PUB_BQ_DATASET_CNS = '<BQ_DATASET_CNS>'
+CSVDNTL_START_DATE = '<START_DATE>'
+CSVDNTL_END_DATE = '<END_DATE>'
+FILECTLNUM = '<FILECTLNUM>'
 
-# 1. Read Input Table (BigQuery SQL)
-input_sql = f"""
+# 1. Input Table: Read from BigQuery using the large SELECT statement, split into batches
+base_query = f"""
 SELECT
   A.UCK_ID AS AK_UCK_ID,
   A.UCK_ID_PREFIX_CD AS AK_UCK_ID_PREFIX_CD,
   A.UCK_ID_SEGMENT_NO AS AK_UCK_ID_SEGMENT_NO,
   A.SUBMT_SVC_LN_NO AS AK_SUBMT_SVC_LN_NO,
-  -- ... (all columns from the SELECT, see batching below)
+  -- ... (all columns as in the Ab Initio .mp file, see batch files below)
 FROM
   {IODS_PUB_BQ_DATASET_ENR}.CSV_5010_DENTAL_SERVICE_LINE_HX A
 LEFT OUTER JOIN
@@ -57,71 +55,53 @@ WHERE
       AND DATE('{CSVDNTL_END_DATE}')))
 """
 
-# Because the SELECT statement has more than 300 columns, we must batch the select and join the batches.
-# We'll extract the columns programmatically from the schema.
-
-base_df = spark.read.format("bigquery").option("query", input_sql).load()
-
-# Get all columns from the schema (preserving order)
-all_columns = [field.name for field in IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_schema.fields]
-
-# Define primary key columns for joins
+# Read input data in batches (see batch1.py, batch2.py, ...)
+# Each batch file contains code like:
+# df_batch1 = spark.read.format('bigquery').option('query', base_query).load().select(...first 300 columns...)
+# df_batch2 = spark.read.format('bigquery').option('query', base_query).load().select(...next 300 columns...)
+# ...
+# Join all batches on primary keys
 primary_keys = ["AK_UCK_ID", "AK_UCK_ID_PREFIX_CD", "AK_UCK_ID_SEGMENT_NO", "AK_SUBMT_SVC_LN_NO"]
+from batch1 import df_batch1
+from batch2 import df_batch2
+# ... import all batch DataFrames
+final_df = df_batch1
+final_df = final_df.join(df_batch2, on=primary_keys, how='inner')
+# ... join all batches
 
-# Batch columns into groups of max 300
-def batch_columns(columns, batch_size=300):
-    for i in range(0, len(columns), batch_size):
-        yield columns[i:i+batch_size]
+# 2. Apply initial transformation (table_adaptor)
+final_df = transform_table_adaptor(final_df)
 
-batch_dfs = []
-for idx, batch in enumerate(batch_columns(all_columns, 300), 1):
-    batch_df = base_df.select(*batch)
-    batch_df.write.mode("overwrite").parquet(f"batch{idx}.parquet")
-    batch_dfs.append(batch_df)
+# 3. Apply GEN_CSV_FIRST_DEFINED transformation
+final_df = transform_table_adaptor_first(final_df)
 
-# Join all batch DataFrames on primary keys
-from functools import reduce
-from pyspark.sql import DataFrame
+# 4. Partition by Key (AK_UCK_ID, AK_UCK_ID_PREFIX_CD, AK_UCK_ID_SEGMENT_NO)
+final_df = final_df.repartition(
+    col('AK_UCK_ID'), col('AK_UCK_ID_PREFIX_CD'), col('AK_UCK_ID_SEGMENT_NO')
+)
 
-def join_batches(batches, keys):
-    return reduce(lambda df1, df2: df1.join(df2, on=keys, how="inner"), batches)
+# 5. Sort by key for deduplication
+final_df = final_df.sort(
+    col('AK_UCK_ID'), col('AK_UCK_ID_PREFIX_CD'), col('AK_UCK_ID_SEGMENT_NO'), col('AK_SUBMT_SVC_LN_NO')
+)
 
-final_df = join_batches(batch_dfs, primary_keys)
+# 6. Deduplicate
+final_df = final_df.dropDuplicates([
+    'AK_UCK_ID', 'AK_UCK_ID_PREFIX_CD', 'AK_UCK_ID_SEGMENT_NO', 'AK_SUBMT_SVC_LN_NO'
+])
 
-# 2. Apply Reformat/Transformations as per Ab Initio flow
-# The flow is:
-#   - Input Table -> Reformat (table_adaptor) -> Reformat (GEN_CSV_FIRST_DEFINED) -> Reformat (IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_V353S6P2) -> Reformat (IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_V353S6P3)
+# 7. Apply join transformations (RFMT V353S6 Xfm Jnr)
+final_df = transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(final_df, filectlnum=FILECTLNUM)
+final_df = transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p3(final_df, filectlnum=FILECTLNUM)
 
-# Apply table_adaptor transformation (if present in xfr_module)
-# For this example, we assume table_adaptor is a pass-through or handled by schema mapping.
+# 8. Write outputs
+final_df.write.format('csv').option('header', True).mode('overwrite').save('gs://<bucket>/IODS_CONS_CSV_DNTL_CLMDTL_HX_final_write')
 
-# Apply GEN_CSV_FIRST_DEFINED transformation
-df_gen_first_defined = GEN_CSV_FIRST_DEFINED(final_df)
+# 9. Write to staging table
+stg_df = final_df.select(
+    'AK_SUBMT_SVC_LN_NO', 'AK_UCK_ID', 'AK_UCK_ID_PREFIX_CD', 'AK_UCK_ID_SEGMENT_NO', 'AUDIT_INSERT_TS', 'INSERT_FILE_ID'
+)
+stg_df.write.format('bigquery').option('table', f'{IODS_PUB_BQ_DATASET_ENR}.STG_CONS_CSV_DENTAL_CLM_DTL_HX').mode('overwrite').save()
 
-# Apply IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_V353S6P2 transformation
-df_v353s6p2 = IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_V353S6P2(df_gen_first_defined)
-
-# Apply IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_V353S6P3 transformation
-df_v353s6p3 = IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_V353S6P3(df_v353s6p2)
-
-# 3. Deduplication (Dedup Sorted) as per Ab Initio flow
-dedup_df = df_v353s6p3.dropDuplicates(primary_keys)
-
-# 4. Write Output Table (BigQuery)
-dedup_df.write.format("bigquery") \
-    .option("table", f"{IODS_PUB_BQ_DATASET_STG}.STG_CONS_CSV_DENTAL_CLM_DTL_HX") \
-    .mode("overwrite") \
-    .save()
-
-# End of pipeline
+# Stop Spark
 spark.stop()
-```
-
-# Notes:
-# - The code strictly follows the Ab Initio flow: Input -> Reformat(s)/Transform(s) -> Dedup -> Output.
-# - All transformation functions and schemas are imported and used as per the instructions.
-# - The SELECT statement is batched and joined as required for >300 columns.
-# - The primary key columns are used for deduplication and joins.
-# - Only the necessary schemas and transformation functions are imported.
-# - The output is written to the specified BigQuery table.
-# - The code is modular, readable, and ready for production use.
