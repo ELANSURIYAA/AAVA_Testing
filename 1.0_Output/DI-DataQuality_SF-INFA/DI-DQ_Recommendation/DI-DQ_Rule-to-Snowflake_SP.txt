@@ -1,190 +1,73 @@
 -- =============================================
 -- Author:        Ascendion AVA+
--- Created on:    <today's date>
+-- Created on:    October 2023
 -- Description:   Executes DQ validation checks on source table and logs violations
 -- =============================================
 
-CREATE OR REPLACE PROCEDURE VALIDATE_MEMBERSDATA()
+-- Create a sequence for batch ID generation
+CREATE OR REPLACE SEQUENCE MY_SAMPLE_DB.PUBLIC.BATCH_ID_SEQ START WITH 1 INCREMENT BY 1;
+
+-- Stored Procedure to run DQ checks
+CREATE OR REPLACE PROCEDURE MY_SAMPLE_DB.PUBLIC.sp_run_dq_checks()
 RETURNS STRING
 LANGUAGE JAVASCRIPT
 AS
 $$
-    var batch_id = snowflake.createStatement({sqlText: "SELECT SEQ_BATCH_ID.NEXTVAL"}).execute().next().getColumnValue(1);
+    // Initialize the Snowflake context
+    var snowflake = require('snowflake-sdk');
+    var connection = snowflake.createConnection({
+        account: '<your_account>',
+        username: '<your_username>',
+        password: '<your_password>',
+        database: 'MY_SAMPLE_DB',
+        schema: 'PUBLIC'
+    });
 
-    // Function to log DQ issues
-    function logIssue(tableName, columnName, ruleDescription, severity, memberId) {
-        var logQuery = `
-            INSERT INTO MY_SAMPLE_DB.PUBLIC.DQ_ISSUE_LOG (TABLE_NAME, COLUMN_NAME, RULE_DESCRIPTION, SEVERITY, BATCH_ID, MEMBER_ID)
-            VALUES ('${tableName}', '${columnName}', '${ruleDescription}', '${severity}', ${batch_id}, ${memberId})
-        `;
-        snowflake.createStatement({sqlText: logQuery}).execute();
-    }
+    // Connect to Snowflake
+    connection.connect(function(err, conn) {
+        if (err) {
+            throw err;
+        }
+    });
 
-    // NotNullCheck for FIRSTNAME
-    var notNullCheckFirstNameQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE FIRSTNAME IS NULL
-    `;
-    var resultSet = snowflake.createStatement({sqlText: notNullCheckFirstNameQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'FIRSTNAME', 'Ensure the first name is provided for every member.', 'High', resultSet.getColumnValue(1));
-    }
+    // Generate a new batch ID
+    var batchIdQuery = "SELECT MY_SAMPLE_DB.PUBLIC.BATCH_ID_SEQ.NEXTVAL AS BATCH_ID";
+    var batchIdResult = connection.execute(batchIdQuery);
+    var batchId = batchIdResult[0].BATCH_ID;
 
-    // NotNullCheck for LASTNAME
-    var notNullCheckLastNameQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE LASTNAME IS NULL
-    `;
-    resultSet = snowflake.createStatement({sqlText: notNullCheckLastNameQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'LASTNAME', 'Ensure the last name is provided for every member.', 'High', resultSet.getColumnValue(1));
-    }
+    // Define DQ rules
+    var dqRules = [
+        { column: 'FIRSTNAME', rule: 'IS NOT NULL', description: 'Ensure the first name is provided for every member.', severity: 'High' },
+        { column: 'LASTNAME', rule: 'IS NOT NULL', description: 'Ensure the last name is provided for every member.', severity: 'High' },
+        { column: 'COMPANY', rule: 'LENGTH(COMPANY) <= 255', description: 'Ensure the company name does not exceed 255 characters.', severity: 'Medium' },
+        { column: 'ADDRESS', rule: 'LENGTH(ADDRESS) <= 16777216', description: 'Ensure the address does not exceed 16777216 characters.', severity: 'Low' },
+        { column: 'CITY', rule: "CITY IN ('Los Angeles', 'New York', 'London')", description: 'Ensure the city is one of the approved locations: Los Angeles, New York, or London.', severity: 'High' },
+        { column: 'COUNTRY', rule: 'IS NOT NULL', description: 'Ensure the country is provided for every member.', severity: 'High' },
+        { column: 'STATE', rule: 'LENGTH(STATE) <= 100', description: 'Ensure the state name does not exceed 100 characters.', severity: 'Medium' },
+        { column: 'ZIP', rule: 'ZIP REGEXP_MATCHES \'^[0-9A-Za-z]+$\'', description: 'Ensure the ZIP code matches the expected format (e.g., numeric or alphanumeric).', severity: 'Medium' },
+        { column: 'PHONENUMBER1', rule: 'IS NOT NULL', description: 'Ensure the primary phone number is provided.', severity: 'High' },
+        { column: 'PHONENUMBER2', rule: 'PHONENUMBER2 != PHONENUMBER1', description: 'Ensure PHONENUMBER2 is distinct from PHONENUMBER1 for each member.', severity: 'High' },
+        { column: 'EMAIL', rule: 'EMAIL REGEXP_MATCHES \'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$\'', description: 'Ensure the email matches a valid email format.', severity: 'High' },
+        { column: 'WEB', rule: 'WEB REGEXP_MATCHES \'^(https?://)?[A-Za-z0-9.-]+\\.[A-Za-z]{2,}(/.*)?$\'', description: 'Ensure the website URL matches a valid URL format.', severity: 'Medium' },
+        { column: 'MEMBER_ID', rule: 'IS UNIQUE', description: 'Ensure MEMBER_ID is unique for each member.', severity: 'High' },
+        { column: 'MEMBER_ID', rule: 'MEMBER_ID BETWEEN 10000000 AND 99999999', description: 'Ensure MEMBER_ID is within the range of 10000000 to 99999999.', severity: 'High' },
+        { column: 'PHONENUMBER1, EMAIL, WEB', rule: 'PHONENUMBER1 IS NOT NULL OR EMAIL IS NOT NULL OR WEB IS NOT NULL', description: 'Ensure at least one valid form of contact information is provided (Phone, Email, or Website).', severity: 'High' }
+    ];
 
-    // StringLengthCheck for COMPANY
-    var stringLengthCheckCompanyQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE LENGTH(COMPANY) > 255
-    `;
-    resultSet = snowflake.createStatement({sqlText: stringLengthCheckCompanyQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'COMPANY', 'Ensure the company name does not exceed 255 characters.', 'Medium', resultSet.getColumnValue(1));
-    }
+    // Iterate through the rules and execute checks
+    dqRules.forEach(function(rule) {
+        var query = "INSERT INTO MY_SAMPLE_DB.PUBLIC.DQ_ISSUE_LOG (TABLE_NAME, COLUMN_NAME, RULE_DESCRIPTION, SEVERITY, LOGGED_AT, BATCH_ID, MEMBER_ID) " +
+                    "SELECT 'MEMBERSDATA', '" + rule.column + "', '" + rule.description + "', '" + rule.severity + "', CURRENT_TIMESTAMP(), " + batchId + ", MEMBER_ID " +
+                    "FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA WHERE NOT (" + rule.rule + ")";
+        connection.execute(query);
+    });
 
-    // StringLengthCheck for ADDRESS
-    var stringLengthCheckAddressQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE LENGTH(ADDRESS) > 16777216
-    `;
-    resultSet = snowflake.createStatement({sqlText: stringLengthCheckAddressQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'ADDRESS', 'Ensure the address does not exceed 16777216 characters.', 'Low', resultSet.getColumnValue(1));
-    }
+    // Disconnect from Snowflake
+    connection.disconnect(function(err) {
+        if (err) {
+            throw err;
+        }
+    });
 
-    // ValueCheck for CITY
-    var valueCheckCityQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE CITY NOT IN ('Los Angeles', 'New York', 'London')
-    `;
-    resultSet = snowflake.createStatement({sqlText: valueCheckCityQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'CITY', 'Ensure the city is one of the approved locations: Los Angeles, New York, or London.', 'High', resultSet.getColumnValue(1));
-    }
-
-    // NotNullCheck for COUNTRY
-    var notNullCheckCountryQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE COUNTRY IS NULL
-    `;
-    resultSet = snowflake.createStatement({sqlText: notNullCheckCountryQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'COUNTRY', 'Ensure the country is provided for every member.', 'High', resultSet.getColumnValue(1));
-    }
-
-    // StringLengthCheck for STATE
-    var stringLengthCheckStateQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE LENGTH(STATE) > 100
-    `;
-    resultSet = snowflake.createStatement({sqlText: stringLengthCheckStateQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'STATE', 'Ensure the state name does not exceed 100 characters.', 'Medium', resultSet.getColumnValue(1));
-    }
-
-    // FormatCheck for ZIP
-    var formatCheckZipQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE ZIP NOT REGEXP '^[0-9A-Za-z]+$'
-    `;
-    resultSet = snowflake.createStatement({sqlText: formatCheckZipQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'ZIP', 'Ensure the ZIP code matches the expected format (e.g., numeric or alphanumeric).', 'Medium', resultSet.getColumnValue(1));
-    }
-
-    // NotNullCheck for PHONENUMBER1
-    var notNullCheckPhoneNumber1Query = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE PHONENUMBER1 IS NULL
-    `;
-    resultSet = snowflake.createStatement({sqlText: notNullCheckPhoneNumber1Query}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'PHONENUMBER1', 'Ensure the primary phone number is provided.', 'High', resultSet.getColumnValue(1));
-    }
-
-    // UniquenessCheck for PHONENUMBER2
-    var uniquenessCheckPhoneNumber2Query = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE PHONENUMBER2 = PHONENUMBER1
-    `;
-    resultSet = snowflake.createStatement({sqlText: uniquenessCheckPhoneNumber2Query}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'PHONENUMBER2', 'Ensure PHONENUMBER2 is distinct from PHONENUMBER1 for each member.', 'High', resultSet.getColumnValue(1));
-    }
-
-    // FormatCheck for EMAIL
-    var formatCheckEmailQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE EMAIL NOT REGEXP '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$'
-    `;
-    resultSet = snowflake.createStatement({sqlText: formatCheckEmailQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'EMAIL', 'Ensure the email matches a valid email format.', 'High', resultSet.getColumnValue(1));
-    }
-
-    // FormatCheck for WEB
-    var formatCheckWebQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE WEB NOT REGEXP '^(https?:\\/\\/)?([\\da-z.-]+)\\.([a-z.]{2,6})([\\/\\w .-]*)*\\/?$'
-    `;
-    resultSet = snowflake.createStatement({sqlText: formatCheckWebQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'WEB', 'Ensure the website URL matches a valid URL format.', 'Medium', resultSet.getColumnValue(1));
-    }
-
-    // UniquenessCheck for MEMBER_ID
-    var uniquenessCheckMemberIdQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        GROUP BY MEMBER_ID
-        HAVING COUNT(*) > 1
-    `;
-    resultSet = snowflake.createStatement({sqlText: uniquenessCheckMemberIdQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'MEMBER_ID', 'Ensure MEMBER_ID is unique for each member.', 'High', resultSet.getColumnValue(1));
-    }
-
-    // RangeCheck for MEMBER_ID
-    var rangeCheckMemberIdQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE MEMBER_ID < 10000000 OR MEMBER_ID > 99999999
-    `;
-    resultSet = snowflake.createStatement({sqlText: rangeCheckMemberIdQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'MEMBER_ID', 'Ensure MEMBER_ID is within the range of 10000000 to 99999999.', 'High', resultSet.getColumnValue(1));
-    }
-
-    // NotNullCheck for PHONENUMBER1, EMAIL, WEB
-    var notNullCheckContactInfoQuery = `
-        SELECT MEMBER_ID
-        FROM MY_SAMPLE_DB.PUBLIC.MEMBERSDATA
-        WHERE PHONENUMBER1 IS NULL AND EMAIL IS NULL AND WEB IS NULL
-    `;
-    resultSet = snowflake.createStatement({sqlText: notNullCheckContactInfoQuery}).execute();
-    while (resultSet.next()) {
-        logIssue('MEMBERSDATA', 'PHONENUMBER1, EMAIL, WEB', 'Ensure at least one valid form of contact information is provided (Phone, Email, or Website).', 'High', resultSet.getColumnValue(1));
-    }
-
-    return `Data Quality Validation completed. Batch ID: ${batch_id}`;
+    return "DQ checks completed successfully.";
 $$;
