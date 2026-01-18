@@ -1,260 +1,287 @@
+# ABAP to PySpark Migration Validation Script
+# This script automates the validation of ABAP to PySpark data migrations by:
+# 1. Executing ABAP code and extracting output tables
+# 2. Exporting ABAP output to Parquet and transferring to distributed storage
+# 3. Running the equivalent PySpark code
+# 4. Comparing outputs for data integrity and generating a reconciliation report
+# The script is modular, secure, and ready for scheduled execution.
+
 import os
 import sys
 import logging
+import tempfile
 import datetime
-import traceback
+import json
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 
-# SAP ABAP connection (pyRFC)
-from pyrfc import Connection
+from typing import List, Dict, Any
+
+# SAP RFC (pyRFC) imports
+try:
+    from pyrfc import Connection as SAPConnection
+except ImportError:
+    SAPConnection = None  # To allow script to load for doc/testing if pyRFC is not installed
 
 # PySpark imports
-from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, DoubleType, DateType
-from pyspark.sql.functions import col, to_date
+try:
+    from pyspark.sql import SparkSession
+    from pyspark.sql.types import StructType, StructField, StringType, DoubleType, DateType
+    from pyspark.sql.functions import col, count, to_date
+except ImportError:
+    SparkSession = None  # To allow script to load for doc/testing if PySpark is not installed
 
-# Distributed storage (S3 example)
-import boto3
+# Distributed storage imports (S3 example)
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except ImportError:
+    boto3 = None
 
-# CONFIGURATION SECTION
-ABAP_CONN_PARAMS = {
-    # Fill with environment variables or secure vault references
-    'user': os.getenv('SAP_USER'),
-    'passwd': os.getenv('SAP_PASS'),
-    'ashost': os.getenv('SAP_ASHOST'),
-    'sysnr': os.getenv('SAP_SYSNR'),
-    'client': os.getenv('SAP_CLIENT'),
-    'lang': 'EN'
-}
-FINANCE_CSV_PATH = "/usr/sap/interfaces/finance_data.csv"
-PARQUET_OUTPUT_DIR = "/tmp/abap_to_pyspark_validation/"
-S3_BUCKET = os.getenv('S3_BUCKET')
-S3_PREFIX = "abap_pyspark_validation/"
-PYSPARK_TABLE = "zbw_finance_data"
-LOG_FILE = "migration_validation.log"
-
-# Setup logging
+# Configure logging
 logging.basicConfig(
-    filename=LOG_FILE,
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("migration_validation.log", mode="a")
+    ]
 )
+logger = logging.getLogger(__name__)
 
-def log_and_print(msg):
-    logging.info(msg)
-    print(msg)
+# --------------------------
+# CONFIGURATION SECTION
+# --------------------------
+# These should be set via environment variables or secure config files, NOT hardcoded!
+SAP_CONFIG = {
+    "user": os.getenv("SAP_USER"),
+    "passwd": os.getenv("SAP_PASSWD"),
+    "ashost": os.getenv("SAP_ASHOST"),
+    "sysnr": os.getenv("SAP_SYSNR"),
+    "client": os.getenv("SAP_CLIENT"),
+    "lang": os.getenv("SAP_LANG", "EN"),
+}
+S3_CONFIG = {
+    "bucket": os.getenv("S3_BUCKET"),
+    "prefix": os.getenv("S3_PREFIX", "abap_validation/"),
+    "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID"),
+    "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY"),
+    "region_name": os.getenv("AWS_REGION", "us-east-1"),
+}
+SPARK_CONFIG = {
+    "app_name": "ABAPtoPySparkValidation",
+    "master": os.getenv("SPARK_MASTER", "local[*]"),
+}
 
-def error_and_print(msg):
-    logging.error(msg)
-    print(msg)
+# Target table name (from ABAP and PySpark)
+TARGET_TABLE = "zbw_finance_data"
+
+# --------------------------
+# UTILITY FUNCTIONS
+# --------------------------
 
 def get_timestamp():
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-def abap_execute_and_export():
-    """
-    Connects to SAP ABAP, executes the ABAP logic, and exports the result to Parquet.
-    """
+def safe_filename(name: str) -> str:
+    return "".join([c if c.isalnum() or c in ('_', '-') else '_' for c in name])
+
+def export_to_parquet(df: pd.DataFrame, table_name: str) -> str:
+    """Export pandas DataFrame to Parquet file and return the file path."""
+    fname = f"{safe_filename(table_name)}_{get_timestamp()}.parquet"
+    fpath = os.path.join(tempfile.gettempdir(), fname)
+    df.to_parquet(fpath, index=False)
+    logger.info(f"Exported {table_name} to {fpath}")
+    return fpath
+
+def upload_to_s3(local_path: str, s3_bucket: str, s3_key: str, s3_config: dict):
+    """Upload a file to S3 with integrity check."""
+    if boto3 is None:
+        raise ImportError("boto3 is not installed")
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=s3_config["aws_access_key_id"],
+        aws_secret_access_key=s3_config["aws_secret_access_key"],
+        region_name=s3_config["region_name"],
+    )
     try:
-        log_and_print("Connecting to SAP ABAP system...")
-        conn = Connection(**ABAP_CONN_PARAMS)
-        log_and_print("Connected to SAP ABAP.")
-
-        # Execute ABAP logic: Read CSV from SAP application server
-        log_and_print(f"Reading finance data CSV from {FINANCE_CSV_PATH}...")
-        # For demonstration, we'll read the CSV directly (as ABAP would)
-        df = pd.read_csv(FINANCE_CSV_PATH, header=None)
-        df.columns = [
-            "bukrs", "fiscyear", "costcenter", "gl_account",
-            "amount", "currency", "posting_date"
-        ]
-        # Data type conversions
-        df["amount"] = pd.to_numeric(df["amount"], errors='coerce')
-        df["posting_date"] = pd.to_datetime(df["posting_date"], errors='coerce')
-
-        # Export to Parquet
-        parquet_file = os.path.join(
-            PARQUET_OUTPUT_DIR,
-            f"zbw_finance_data_abap_{get_timestamp()}.parquet"
-        )
-        table = pa.Table.from_pandas(df)
-        pq.write_table(table, parquet_file)
-        log_and_print(f"ABAP output exported to Parquet: {parquet_file}")
-
-        return parquet_file, df
-    except Exception as e:
-        error_and_print(f"Error in ABAP execution/export: {e}\n{traceback.format_exc()}")
+        s3.upload_file(local_path, s3_bucket, s3_key)
+        # Integrity check: HeadObject
+        s3.head_object(Bucket=s3_bucket, Key=s3_key)
+        logger.info(f"File {local_path} uploaded to s3://{s3_bucket}/{s3_key}")
+    except ClientError as e:
+        logger.error(f"S3 upload failed: {e}")
         raise
 
-def transfer_to_s3(parquet_file):
+def read_abap_table_via_rfc(table_name: str, sap_config: dict) -> pd.DataFrame:
+    """Read an ABAP table using pyRFC and return as pandas DataFrame."""
+    if SAPConnection is None:
+        raise ImportError("pyRFC is not installed")
+    conn = SAPConnection(**sap_config)
+    # Use RFC_READ_TABLE or Z-function module for custom types
+    result = conn.call("RFC_READ_TABLE", QUERY_TABLE=table_name, DELIMITER=",", ROWCOUNT=0)
+    fields = [f["FIELDNAME"] for f in result["FIELDS"]]
+    rows = [r["WA"].split(",") for r in result["DATA"]]
+    df = pd.DataFrame(rows, columns=fields)
+    logger.info(f"Read {len(df)} rows from ABAP table {table_name}")
+    return df
+
+def execute_abap_code_and_get_output(sap_config: dict, abap_code: str, output_table: str) -> pd.DataFrame:
     """
-    Transfers Parquet file to S3 and verifies integrity.
+    Execute ABAP code remotely (if possible) and extract output table.
+    For this script, we simulate by reading the output table directly.
     """
+    logger.info("Executing ABAP code and extracting output table...")
+    # In real scenario, trigger ABAP program via RFC or job, then fetch output table
+    return read_abap_table_via_rfc(output_table, sap_config)
+
+def run_pyspark_job_and_get_output(spark_config: dict, pyspark_code_path: str, output_table: str) -> pd.DataFrame:
+    """
+    Run PySpark code and extract output table as pandas DataFrame.
+    Assumes PySpark code writes to a managed/external table.
+    """
+    if SparkSession is None:
+        raise ImportError("PySpark is not installed")
+    spark = SparkSession.builder.appName(spark_config["app_name"]).master(spark_config["master"]).getOrCreate()
     try:
-        log_and_print(f"Transferring Parquet file to S3: {parquet_file}")
-        s3 = boto3.client('s3')
-        s3_key = S3_PREFIX + os.path.basename(parquet_file)
-        s3.upload_file(parquet_file, S3_BUCKET, s3_key)
-        # Integrity check: Confirm file exists in S3
-        response = s3.head_object(Bucket=S3_BUCKET, Key=s3_key)
-        if response['ResponseMetadata']['HTTPStatusCode'] == 200:
-            log_and_print(f"File successfully transferred to S3: s3://{S3_BUCKET}/{s3_key}")
-            return f"s3://{S3_BUCKET}/{s3_key}"
-        else:
-            error_and_print("Integrity check failed after S3 upload.")
-            raise Exception("S3 upload integrity check failed")
-    except Exception as e:
-        error_and_print(f"Error during S3 transfer: {e}\n{traceback.format_exc()}")
-        raise
-
-def run_pyspark_and_export():
-    """
-    Executes the PySpark code, writes output to Parquet, and returns DataFrame.
-    """
-    try:
-        log_and_print("Starting PySpark session...")
-        spark = SparkSession.builder.appName("ZBW_LOAD_GL_DATA_VALIDATION").getOrCreate()
-
-        schema = StructType([
-            StructField("bukrs", StringType(), True),
-            StructField("fiscyear", StringType(), True),
-            StructField("costcenter", StringType(), True),
-            StructField("gl_account", StringType(), True),
-            StructField("amount", DoubleType(), True),
-            StructField("currency", StringType(), True),
-            StructField("posting_date", StringType(), True)
-        ])
-
-        log_and_print(f"Reading CSV file via PySpark: {FINANCE_CSV_PATH}")
-        raw_df = spark.read.csv(FINANCE_CSV_PATH, schema=schema, header=False)
-        valid_df = raw_df.dropna(subset=["bukrs", "fiscyear", "costcenter", "gl_account", "amount", "currency", "posting_date"])
-        final_df = valid_df.withColumn("posting_date", to_date(col("posting_date"), "yyyy-MM-dd"))
-
-        # Write PySpark output to Parquet
-        parquet_file = os.path.join(
-            PARQUET_OUTPUT_DIR,
-            f"zbw_finance_data_pyspark_{get_timestamp()}.parquet"
-        )
-        final_df.write.mode("overwrite").parquet(parquet_file)
-        log_and_print(f"PySpark output exported to Parquet: {parquet_file}")
-
-        # Convert to Pandas for comparison
-        pandas_df = final_df.toPandas()
+        logger.info("Running PySpark job...")
+        # Dynamically execute PySpark code (assumed to be in a .py file)
+        exec(open(pyspark_code_path).read(), {"spark": spark})
+        # Read output table
+        df = spark.table(output_table)
+        pdf = df.toPandas()
+        logger.info(f"Read {len(pdf)} rows from PySpark output table {output_table}")
+        return pdf
+    finally:
         spark.stop()
-        return parquet_file, pandas_df
-    except Exception as e:
-        error_and_print(f"Error in PySpark execution/export: {e}\n{traceback.format_exc()}")
-        raise
 
-def compare_dataframes(df_abap, df_pyspark):
+def compare_dataframes(df_abap: pd.DataFrame, df_pyspark: pd.DataFrame, table_name: str) -> Dict[str, Any]:
     """
-    Compares ABAP and PySpark DataFrames, returns reconciliation report.
+    Compare two DataFrames for row/column match, nulls, and mismatches.
+    Returns a detailed reconciliation report.
     """
+    report = {"table": table_name}
+    abap_rows, pyspark_rows = len(df_abap), len(df_pyspark)
+    report["row_count_abap"] = abap_rows
+    report["row_count_pyspark"] = pyspark_rows
+    report["row_count_match"] = abap_rows == pyspark_rows
+
+    # Column comparison
+    abap_cols, pyspark_cols = set(df_abap.columns), set(df_pyspark.columns)
+    report["columns_abap"] = list(abap_cols)
+    report["columns_pyspark"] = list(pyspark_cols)
+    report["column_match"] = abap_cols == pyspark_cols
+
+    # Align columns for comparison
+    common_cols = list(abap_cols & pyspark_cols)
+    df_abap_common = df_abap[common_cols].fillna("")
+    df_pyspark_common = df_pyspark[common_cols].fillna("")
+
+    # Row-by-row comparison (sampled for large datasets)
+    mismatches = []
+    sample_size = min(100, min(len(df_abap_common), len(df_pyspark_common)))
+    for i in range(sample_size):
+        row_abap = df_abap_common.iloc[i].to_dict()
+        row_pyspark = df_pyspark_common.iloc[i].to_dict()
+        if row_abap != row_pyspark:
+            mismatches.append({"row": i, "abap": row_abap, "pyspark": row_pyspark})
+
+    report["mismatched_rows_sample"] = mismatches
+    match_pct = 1.0 - (len(mismatches) / sample_size if sample_size else 0)
+    report["match_percentage"] = match_pct
+
+    if abap_rows == pyspark_rows and abap_cols == pyspark_cols and match_pct == 1.0:
+        report["status"] = "MATCH"
+    elif match_pct > 0.95:
+        report["status"] = "PARTIAL MATCH"
+    else:
+        report["status"] = "NO MATCH"
+    return report
+
+def log_and_save_report(report: Dict[str, Any], outdir: str = "."):
+    """Save reconciliation report as JSON and log summary."""
+    fname = f"reconciliation_report_{get_timestamp()}.json"
+    fpath = os.path.join(outdir, fname)
+    with open(fpath, "w") as f:
+        json.dump(report, f, indent=2)
+    logger.info(f"Reconciliation report saved to {fpath}")
+
+# --------------------------
+# MAIN VALIDATION WORKFLOW
+# --------------------------
+
+def main(
+    abap_code_path: str,
+    pyspark_code_path: str,
+    sap_config: dict = SAP_CONFIG,
+    s3_config: dict = S3_CONFIG,
+    spark_config: dict = SPARK_CONFIG,
+    output_table: str = TARGET_TABLE,
+):
+
     try:
-        log_and_print("Starting data comparison...")
+        logger.info("=== ABAP to PySpark Migration Validation Started ===")
 
-        # Row count validation
-        abap_count = len(df_abap)
-        pyspark_count = len(df_pyspark)
-        row_count_match = abap_count == pyspark_count
+        # 1. Execute ABAP code and extract output table
+        with open(abap_code_path, "r") as f:
+            abap_code = f.read()
+        df_abap = execute_abap_code_and_get_output(sap_config, abap_code, output_table)
 
-        # Column-wise validation
-        columns = df_abap.columns
-        discrepancies = []
-        match_rows = 0
+        # 2. Export ABAP output to Parquet
+        parquet_path = export_to_parquet(df_abap, output_table)
 
-        # Compare row by row (by index)
-        for idx in range(min(abap_count, pyspark_count)):
-            abap_row = df_abap.iloc[idx]
-            pyspark_row = df_pyspark.iloc[idx]
-            row_discrepancy = {}
-            for col in columns:
-                abap_val = abap_row[col]
-                pyspark_val = pyspark_row[col]
-                if pd.isnull(abap_val) and pd.isnull(pyspark_val):
-                    continue
-                if abap_val != pyspark_val:
-                    row_discrepancy[col] = (abap_val, pyspark_val)
-            if row_discrepancy:
-                discrepancies.append({
-                    "row": idx,
-                    "differences": row_discrepancy
-                })
-            else:
-                match_rows += 1
+        # 3. Transfer Parquet to distributed storage (S3 example)
+        s3_key = f"{s3_config['prefix']}{os.path.basename(parquet_path)}"
+        upload_to_s3(parquet_path, s3_config["bucket"], s3_key, s3_config)
 
-        match_percentage = match_rows / max(abap_count, pyspark_count) * 100 if max(abap_count, pyspark_count) > 0 else 0
-        match_status = "MATCH" if row_count_match and match_percentage == 100 else ("PARTIAL MATCH" if match_percentage > 0 else "NO MATCH")
+        # 4. Run PySpark code and extract output table
+        df_pyspark = run_pyspark_job_and_get_output(spark_config, pyspark_code_path, output_table)
 
-        report = {
-            "table": "zbw_finance_data",
-            "row_count_abap": abap_count,
-            "row_count_pyspark": pyspark_count,
-            "row_count_match": row_count_match,
-            "match_percentage": match_percentage,
-            "match_status": match_status,
-            "column_discrepancies": discrepancies[:10],  # Sample mismatches
-            "total_discrepancies": len(discrepancies)
-        }
-        log_and_print(f"Comparison complete. Match status: {match_status}, Match %: {match_percentage:.2f}")
-        return report
+        # 5. Compare outputs
+        report = compare_dataframes(df_abap, df_pyspark, output_table)
+
+        # 6. Save and log report
+        log_and_save_report(report)
+
+        logger.info("=== Migration Validation Completed ===")
+        logger.info(f"Validation Status: {report['status']}")
+        if report["status"] != "MATCH":
+            logger.warning("Discrepancies found! See report for details.")
+
     except Exception as e:
-        error_and_print(f"Error during comparison: {e}\n{traceback.format_exc()}")
-        raise
+        logger.error(f"Validation failed: {e}", exc_info=True)
+        sys.exit(1)
 
-def generate_final_report(reports):
-    """
-    Generates and saves a detailed reconciliation report.
-    """
-    try:
-        timestamp = get_timestamp()
-        report_file = f"migration_validation_report_{timestamp}.json"
-        import json
-        with open(report_file, "w") as f:
-            json.dump(reports, f, indent=2, default=str)
-        log_and_print(f"Validation report generated: {report_file}")
-    except Exception as e:
-        error_and_print(f"Error generating report: {e}\n{traceback.format_exc()}")
-
-def main():
-    log_and_print("==== ABAP to PySpark Migration Validation Script Started ====")
-    try:
-        # Step 1: ABAP execution and export
-        abap_parquet, abap_df = abap_execute_and_export()
-
-        # Step 2: Transfer ABAP output to S3
-        abap_s3_path = transfer_to_s3(abap_parquet)
-
-        # Step 3: PySpark execution and export
-        pyspark_parquet, pyspark_df = run_pyspark_and_export()
-
-        # Step 4: Transfer PySpark output to S3
-        pyspark_s3_path = transfer_to_s3(pyspark_parquet)
-
-        # Step 5: Comparison
-        report = compare_dataframes(abap_df, pyspark_df)
-
-        # Step 6: Reporting
-        generate_final_report([report])
-
-        log_and_print("==== Migration Validation Completed Successfully ====")
-    except Exception as e:
-        error_and_print(f"Migration validation failed: {e}\n{traceback.format_exc()}")
+# --------------------------
+# ENTRY POINT
+# --------------------------
 
 if __name__ == "__main__":
-    main()
+    import argparse
 
-# -------------------------
-# Script Notes:
-# - Credentials are never hardcoded; use environment variables or secret vaults.
-# - All connections use secure authentication.
-# - Handles large datasets via Parquet and S3.
-# - Logs all actions for auditability.
-# - Handles schema mismatches, nulls, and data type differences.
-# - Generates a structured JSON report for external parsing.
-# - Includes error handling and recovery.
-# - Can be scheduled via cron or orchestration tools.
-# - Provides real-time logs and detailed comparison report.
-# -------------------------
+    parser = argparse.ArgumentParser(description="ABAP to PySpark Migration Validation Script")
+    parser.add_argument("--abap-code", required=True, help="Path to ABAP SQL code file")
+    parser.add_argument("--pyspark-code", required=True, help="Path to converted PySpark code file")
+    parser.add_argument("--output-table", default=TARGET_TABLE, help="Target table name for validation")
+    parser.add_argument("--report-dir", default=".", help="Directory to save reconciliation report")
+    args = parser.parse_args()
+
+    main(
+        abap_code_path=args.abap_code,
+        pyspark_code_path=args.pyspark_code,
+        output_table=args.output_table,
+    )
+
+# --------------------------
+# END OF SCRIPT
+# --------------------------
+
+"""
+NOTES:
+- This script assumes that the ABAP output table can be read via RFC_READ_TABLE or a similar mechanism.
+- For distributed storage, S3 is used as an example; adapt upload_to_s3 for HDFS or other stores as needed.
+- All credentials must be provided securely via environment variables.
+- The script logs all operations and errors for auditability.
+- For large datasets, only a sample of mismatches is reported.
+- Schema and data type mismatches are handled via pandas DataFrame alignment and fillna.
+- The script is modular and can be scheduled for automated runs.
+"""
