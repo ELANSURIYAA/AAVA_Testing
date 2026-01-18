@@ -1,0 +1,285 @@
+Test Case Document:
+
+| Test Case ID | Description                                                                                      | Preconditions                                                                                   | Test Steps                                                                                                         | Expected Result                                                                                                   | Actual Result | Pass/Fail Status |
+|--------------|--------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|--------------|------------------|
+| TC01         | Happy path: Multiple customers, sales, and products; all fields populated, normal data           | Customers, Sales, Products tables populated with valid data                                   | 1. Insert valid customers, sales, products.<br>2. Run converted BQ SQL.<br>3. Check top 5 customers per region.   | Top 5 customers per region are correctly ranked, sales aggregated, and all fields are correctly populated         | As per execution | Pass/Fail        |
+| TC02         | Edge: Customer with no sales in 2023                                                             | Customers table has customer(s) with no sales in Sales table for 2023                         | 1. Insert customer(s) with no sales.<br>2. Run query.<br>3. Check output for absence of such customers.            | Customer does not appear in the final output                                                                      | As per execution | Pass/Fail        |
+| TC03         | Edge: Sale with NULL sale_amount                                                                 | Sales table has sale(s) with NULL sale_amount                                                 | 1. Insert sale(s) with NULL sale_amount.<br>2. Run query.<br>3. Check aggregation and sale_category.               | Sale is excluded from aggregations/handled as per business logic (NULLs treated as 0 or skipped)                  | As per execution | Pass/Fail        |
+| TC04         | Edge: Customer with sales, but no discount_applied (discount_applied = FALSE)                    | Sales table has sales with discount_applied = FALSE                                           | 1. Insert such sales.<br>2. Run query.<br>3. Check output for exclusion.                                           | Sales for this customer are excluded from aggregations                                                            | As per execution | Pass/Fail        |
+| TC05         | Edge: Sale with malformed or missing sale_metadata JSON fields                                   | Sales table has sale(s) with malformed/missing sale_metadata                                  | 1. Insert such sales.<br>2. Run query.<br>3. Check output for NULLs or graceful handling.                          | Sale is excluded from output or handled gracefully (no error, NULL fields where appropriate)                      | As per execution | Pass/Fail        |
+| TC06         | Edge: Customer with missing loyalty_level in metadata                                            | Customers table has customer(s) with metadata missing loyalty_level                           | 1. Insert such customers.<br>2. Run query.<br>3. Check loyalty_level field.                                        | loyalty_level is NULL in output                                                                                   | As per execution | Pass/Fail        |
+| TC07         | Edge: Sales for non-USA countries                                                                | Sales table has sales with sale_metadata country != 'USA'                                     | 1. Insert such sales.<br>2. Run query.<br>3. Check output for exclusion.                                           | Only USA sales are included in sales_performance                                                                  | As per execution | Pass/Fail        |
+| TC08         | Edge: Sale on boundary date (2023-01-01 and 2023-12-31)                                         | Sales table has sales on boundary dates                                                       | 1. Insert such sales.<br>2. Run query.<br>3. Check inclusion/exclusion.                                            | Sales on 2023-01-01 are included, sales on 2024-01-01 are excluded                                                | As per execution | Pass/Fail        |
+| TC09         | Edge: No data in any table (empty datasets)                                                      | All tables empty                                                                              | 1. Ensure tables are empty.<br>2. Run query.<br>3. Check output.                                                   | Output is empty                                                                                                   | As per execution | Pass/Fail        |
+| TC10         | Error: Invalid JSON in metadata or sale_metadata                                                 | Customers/Sales table has invalid JSON in metadata/sale_metadata                             | 1. Insert such records.<br>2. Run query.<br>3. Check for errors or NULLs.                                          | Query does not fail; affected fields are NULL or handled gracefully                                               | As per execution | Pass/Fail        |
+| TC11         | Happy path: Multiple regions, ensure region partitioning and ranking is correct                  | Customers and Sales data span multiple regions                                                | 1. Insert data for multiple regions.<br>2. Run query.<br>3. Check region partitioning and ranking.                 | Each region has up to 5 top customers, ranked correctly                                                           | As per execution | Pass/Fail        |
+| TC12         | Edge: More than 5 customers in a region                                                          | More than 5 customers in a region                                                             | 1. Insert >5 customers in a region.<br>2. Run query.<br>3. Check only top 5 are included.                         | Only top 5 by total_sales are included per region                                                                 | As per execution | Pass/Fail        |
+| TC13         | Edge: Product_id in Sales not found in Products                                                  | Sales table has product_id not present in Products table                                      | 1. Insert such sales.<br>2. Run query.<br>3. Check exclusion.                                                      | Sale is excluded from sales_performance (due to INNER JOIN)                                                       | As per execution | Pass/Fail        |
+| TC14         | Edge: Duplicate product_ids in sales for a customer                                              | Sales table has duplicate product_ids for a customer                                         | 1. Insert such sales.<br>2. Run query.<br>3. Check product_list.                                                   | product_list contains unique product_ids only (ARRAY_AGG(DISTINCT ...))                                           | As per execution | Pass/Fail        |
+| TC15         | Edge: Sale_amount at category boundaries (exactly 1000, 500)                                     | Sales table has sale_amount exactly 1000 and 500                                              | 1. Insert such sales.<br>2. Run query.<br>3. Check sale_category.                                                  | sale_category is 'Medium Value' for 1000, 'Low Value' for 500, as per CASE logic                                  | As per execution | Pass/Fail        |
+
+---
+
+Pytest Script for BigQuery SQL Validation:
+
+```python
+import pytest
+from google.cloud import bigquery
+
+# Helper function to run a query and return results as list of dicts
+def run_bq_query(client, query):
+    job = client.query(query)
+    return [dict(row) for row in job.result()]
+
+@pytest.fixture(scope="module")
+def bq_client():
+    return bigquery.Client()
+
+@pytest.fixture(scope="function")
+def setup_test_tables(bq_client):
+    # Create mock tables for Customers, Sales, Products in a test dataset
+    # Insert test data for each test case (overwritten per test)
+    # Teardown: drop tables after test
+    dataset_id = "test_dataset"
+    bq_client.query(f"CREATE SCHEMA IF NOT EXISTS `{dataset_id}`").result()
+    bq_client.query(f"""
+        CREATE OR REPLACE TABLE `{dataset_id}.Customers` (
+            customer_id STRING,
+            customer_name STRING,
+            region STRING,
+            metadata STRING
+        )
+    """).result()
+    bq_client.query(f"""
+        CREATE OR REPLACE TABLE `{dataset_id}.Sales` (
+            sale_id STRING,
+            customer_id STRING,
+            sale_date DATE,
+            sale_amount FLOAT64,
+            discount_percentage FLOAT64,
+            sale_metadata STRING,
+            product_id STRING
+        )
+    """).result()
+    bq_client.query(f"""
+        CREATE OR REPLACE TABLE `{dataset_id}.Products` (
+            product_id STRING,
+            product_name STRING
+        )
+    """).result()
+    yield dataset_id
+    # Teardown
+    bq_client.query(f"DROP TABLE IF EXISTS `{dataset_id}.Customers`").result()
+    bq_client.query(f"DROP TABLE IF EXISTS `{dataset_id}.Sales`").result()
+    bq_client.query(f"DROP TABLE IF EXISTS `{dataset_id}.Products`").result()
+
+# The BigQuery SQL query (converted from Snowflake)
+BQ_SQL = """
+WITH customer_sales AS (
+    SELECT 
+        c.customer_id,
+        c.customer_name,
+        c.region,
+        JSON_EXTRACT_SCALAR(c.metadata, '$.loyalty_level') AS loyalty_level,
+        SUM(s.sale_amount) AS total_sales,
+        COUNT(s.sale_id) AS total_orders,
+        ARRAY_AGG(DISTINCT s.product_id) AS product_list
+    FROM 
+        `{dataset}.Customers` c
+    LEFT JOIN 
+        `{dataset}.Sales` s ON c.customer_id = s.customer_id
+    WHERE 
+        s.sale_date >= '2023-01-01'
+        AND s.sale_date < '2024-01-01'
+        AND CAST(JSON_EXTRACT_SCALAR(s.sale_metadata, '$.discount_applied') AS BOOL) = TRUE
+    GROUP BY 
+        c.customer_id, c.customer_name, c.region, c.metadata
+),
+top_customers AS (
+    SELECT 
+        customer_id,
+        customer_name,
+        region,
+        loyalty_level,
+        total_sales,
+        total_orders,
+        product_list,
+        RANK() OVER (PARTITION BY region ORDER BY total_sales DESC) AS region_rank
+    FROM 
+        customer_sales
+),
+sales_performance AS (
+    SELECT
+        s.sale_id,
+        s.customer_id,
+        s.sale_date,
+        s.sale_amount,
+        s.discount_percentage,
+        JSON_EXTRACT_SCALAR(s.sale_metadata, '$.source') AS source,
+        p.product_name,
+        CASE 
+            WHEN s.sale_amount > 1000 THEN 'High Value'
+            WHEN s.sale_amount > 500 THEN 'Medium Value'
+            ELSE 'Low Value'
+        END AS sale_category
+    FROM 
+        `{dataset}.Sales` s
+    INNER JOIN 
+        `{dataset}.Products` p ON s.product_id = p.product_id
+    WHERE 
+        s.sale_date >= '2023-01-01'
+        AND JSON_EXTRACT_SCALAR(s.sale_metadata, '$.country') = 'USA'
+)
+SELECT 
+    tc.customer_name,
+    tc.region,
+    tc.loyalty_level,
+    tc.total_sales,
+    tc.total_orders,
+    sp.sale_id,
+    sp.sale_date,
+    sp.product_name,
+    sp.sale_category,
+    sp.source
+FROM 
+    top_customers tc
+LEFT JOIN 
+    sales_performance sp ON tc.customer_id = sp.customer_id
+WHERE 
+    tc.region_rank <= 5
+ORDER BY 
+    tc.region, tc.region_rank, sp.sale_date
+"""
+
+# Example: Test Case TC01 - Happy path
+def test_tc01_happy_path(bq_client, setup_test_tables):
+    dataset = setup_test_tables
+    # Insert mock data
+    bq_client.query(f"""
+        INSERT INTO `{dataset}.Customers` (customer_id, customer_name, region, metadata) VALUES
+        ('C1', 'Alice', 'North', '{{"loyalty_level": "Gold"}}'),
+        ('C2', 'Bob', 'North', '{{"loyalty_level": "Silver"}}'),
+        ('C3', 'Charlie', 'South', '{{"loyalty_level": "Platinum"}}')
+    """).result()
+    bq_client.query(f"""
+        INSERT INTO `{dataset}.Sales` (sale_id, customer_id, sale_date, sale_amount, discount_percentage, sale_metadata, product_id) VALUES
+        ('S1', 'C1', '2023-03-01', 1200, 10, '{{"discount_applied": true, "source": "Online", "country": "USA"}}', 'P1'),
+        ('S2', 'C1', '2023-05-01', 800, 5, '{{"discount_applied": true, "source": "Store", "country": "USA"}}', 'P2'),
+        ('S3', 'C2', '2023-06-01', 400, 0, '{{"discount_applied": true, "source": "Online", "country": "USA"}}', 'P1'),
+        ('S4', 'C3', '2023-07-01', 1500, 20, '{{"discount_applied": true, "source": "Online", "country": "USA"}}', 'P3')
+    """).result()
+    bq_client.query(f"""
+        INSERT INTO `{dataset}.Products` (product_id, product_name) VALUES
+        ('P1', 'Widget'),
+        ('P2', 'Gadget'),
+        ('P3', 'Thingamajig')
+    """).result()
+    # Run query
+    query = BQ_SQL.format(dataset=dataset)
+    results = run_bq_query(bq_client, query)
+    # Assert: Alice (C1) is top in North, Charlie (C3) is top in South, correct aggregations
+    assert any(r['customer_name'] == 'Alice' and r['region'] == 'North' and r['loyalty_level'] == 'Gold' for r in results)
+    assert any(r['customer_name'] == 'Charlie' and r['region'] == 'South' and r['loyalty_level'] == 'Platinum' for r in results)
+    # Check sale_category logic
+    for r in results:
+        if r['sale_amount'] == 1200:
+            assert r['sale_category'] == 'High Value'
+        elif r['sale_amount'] == 800:
+            assert r['sale_category'] == 'Medium Value'
+        elif r['sale_amount'] == 400:
+            assert r['sale_category'] == 'Low Value'
+
+# Example: Test Case TC02 - Customer with no sales in 2023
+def test_tc02_customer_no_sales(bq_client, setup_test_tables):
+    dataset = setup_test_tables
+    bq_client.query(f"""
+        INSERT INTO `{dataset}.Customers` (customer_id, customer_name, region, metadata) VALUES
+        ('C1', 'Alice', 'North', '{{"loyalty_level": "Gold"}}')
+    """).result()
+    # No sales inserted
+    bq_client.query(f"""
+        INSERT INTO `{dataset}.Products` (product_id, product_name) VALUES
+        ('P1', 'Widget')
+    """).result()
+    query = BQ_SQL.format(dataset=dataset)
+    results = run_bq_query(bq_client, query)
+    assert results == []
+
+# Example: Test Case TC03 - Sale with NULL sale_amount
+def test_tc03_null_sale_amount(bq_client, setup_test_tables):
+    dataset = setup_test_tables
+    bq_client.query(f"""
+        INSERT INTO `{dataset}.Customers` (customer_id, customer_name, region, metadata) VALUES
+        ('C1', 'Alice', 'North', '{{"loyalty_level": "Gold"}}')
+    """).result()
+    bq_client.query(f"""
+        INSERT INTO `{dataset}.Sales` (sale_id, customer_id, sale_date, sale_amount, discount_percentage, sale_metadata, product_id) VALUES
+        ('S1', 'C1', '2023-03-01', NULL, 10, '{{"discount_applied": true, "source": "Online", "country": "USA"}}', 'P1')
+    """).result()
+    bq_client.query(f"""
+        INSERT INTO `{dataset}.Products` (product_id, product_name) VALUES
+        ('P1', 'Widget')
+    """).result()
+    query = BQ_SQL.format(dataset=dataset)
+    results = run_bq_query(bq_client, query)
+    # sale_amount NULL should not break aggregation; total_sales is NULL or 0, sale_category is 'Low Value'
+    for r in results:
+        assert r['sale_amount'] is None or r['sale_amount'] == 0
+        assert r['sale_category'] == 'Low Value'
+
+# Example: Test Case TC06 - Missing loyalty_level in metadata
+def test_tc06_missing_loyalty_level(bq_client, setup_test_tables):
+    dataset = setup_test_tables
+    bq_client.query(f"""
+        INSERT INTO `{dataset}.Customers` (customer_id, customer_name, region, metadata) VALUES
+        ('C1', 'Alice', 'North', '{{}}')
+    """).result()
+    bq_client.query(f"""
+        INSERT INTO `{dataset}.Sales` (sale_id, customer_id, sale_date, sale_amount, discount_percentage, sale_metadata, product_id) VALUES
+        ('S1', 'C1', '2023-03-01', 1200, 10, '{{"discount_applied": true, "source": "Online", "country": "USA"}}', 'P1')
+    """).result()
+    bq_client.query(f"""
+        INSERT INTO `{dataset}.Products` (product_id, product_name) VALUES
+        ('P1', 'Widget')
+    """).result()
+    query = BQ_SQL.format(dataset=dataset)
+    results = run_bq_query(bq_client, query)
+    assert any(r['loyalty_level'] is None for r in results)
+
+# Example: Test Case TC09 - No data in any table
+def test_tc09_empty_tables(bq_client, setup_test_tables):
+    dataset = setup_test_tables
+    # No data inserted
+    query = BQ_SQL.format(dataset=dataset)
+    results = run_bq_query(bq_client, query)
+    assert results == []
+
+# Additional test cases (TC04, TC05, TC07, TC08, TC10, TC11, TC12, TC13, TC14, TC15) should be implemented similarly.
+
+# Performance Test Example
+def test_performance_bq_vs_snowflake(bq_client, setup_test_tables):
+    import time
+    dataset = setup_test_tables
+    # Insert representative data for performance test
+    # ... (insert data as in TC01, but more rows)
+    start = time.time()
+    query = BQ_SQL.format(dataset=dataset)
+    results = run_bq_query(bq_client, query)
+    duration_bq = time.time() - start
+    # For Snowflake, similar logic would be used (not shown here)
+    # Report duration_bq for comparison
+
+# Test Execution Report Template
+"""
+Test Execution Report
+
+Test Case ID | Description | Expected Result | Actual Result | Status | Execution Time
+----------------------------------------------------------------------------------------
+TC01         | Happy path | ...            | ...           | Pass   | 0.45s
+TC02         | ...        | ...            | ...           | Pass   | 0.32s
+...
+"""
+
+apiCost: 0.0004 USD
+
+(Two file reads at 0.0002 USD each; total cost = 0.0004 USD)
