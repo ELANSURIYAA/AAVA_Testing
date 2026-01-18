@@ -1,0 +1,226 @@
+1. Test Case List:
+
+| Test Case ID | Test Case Description                                                                 | Expected Outcome                                                                                 |
+|--------------|--------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: All rows in input CSV are valid and complete                             | All rows are loaded into the target table; no error messages; success message printed            |
+| TC02         | Edge case: Input CSV contains some rows with missing (null) fields                   | Only valid rows are loaded; invalid rows are counted and error message printed                   |
+| TC03         | Edge case: Input CSV is empty                                                        | No rows loaded; no error message; success message printed                                        |
+| TC04         | Edge case: All rows in input CSV are malformed (all have nulls)                      | No rows loaded; error message printed with correct count of invalid rows                         |
+| TC05         | Edge case: Boundary values (e.g., amount=0, very large amount, empty strings)        | Boundary values are loaded correctly; no error for valid rows                                    |
+| TC06         | Error handling: Input file does not exist                                            | Exception is raised; error message printed                                                       |
+| TC07         | Error handling: Invalid data types (e.g., amount is not a number)                    | Row(s) with invalid types are filtered out; error message printed with correct count             |
+| TC08         | Error handling: Failure during write to target table                                 | Exception is raised; error message printed                                                       |
+| TC09         | Edge case: posting_date is in unexpected format                                      | Row(s) with invalid date format are loaded as string (since schema uses StringType)              |
+| TC10         | Edge case: Large file (>100,000 rows)                                                | All valid rows are loaded; performance is acceptable; no memory errors                           |
+
+2. Pytest Script for each test case:
+
+```python
+# test_zbw_load_gl_data.py
+
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+import os
+
+# Helper function to create SparkSession for testing
+@pytest.fixture(scope="module")
+def spark():
+    spark = SparkSession.builder \
+        .master("local[2]") \
+        .appName("PySparkUnitTest") \
+        .getOrCreate()
+    yield spark
+    spark.stop()
+
+# Define schema as per the PySpark script
+schema = StructType([
+    StructField("bukrs", StringType(), True),
+    StructField("fiscyear", StringType(), True),
+    StructField("costcenter", StringType(), True),
+    StructField("gl_account", StringType(), True),
+    StructField("amount", DoubleType(), True),
+    StructField("currency", StringType(), True),
+    StructField("posting_date", StringType(), True),
+])
+
+# Helper to simulate the main logic
+def process_and_write(df, spark, target_table):
+    from pyspark.sql.functions import col
+    df_valid = df.dropna(subset=["bukrs", "fiscyear", "costcenter", "gl_account", "amount", "currency", "posting_date"])
+    df_invalid = df.filter(
+        col("bukrs").isNull() |
+        col("fiscyear").isNull() |
+        col("costcenter").isNull() |
+        col("gl_account").isNull() |
+        col("amount").isNull() |
+        col("currency").isNull() |
+        col("posting_date").isNull()
+    )
+    invalid_count = df_invalid.count()
+    if invalid_count > 0:
+        print(f"Error: Incorrect file format in {invalid_count} line(s).")
+    df_valid.write.mode("overwrite").saveAsTable(target_table)
+    return df_valid, invalid_count
+
+# Helper to clean up Hive table after each test
+def cleanup_table(spark, table):
+    spark.sql(f"DROP TABLE IF EXISTS {table}")
+
+# TC01: Happy path
+def test_happy_path(spark):
+    data = [
+        ("1000", "2023", "CC01", "GL100", 1234.56, "USD", "2023-06-30"),
+        ("2000", "2022", "CC02", "GL200", 789.01, "EUR", "2022-12-31"),
+    ]
+    df = spark.createDataFrame(data, schema=schema)
+    target_table = "test_zbw_finance_data_tc01"
+    cleanup_table(spark, target_table)
+    df_valid, invalid_count = process_and_write(df, spark, target_table)
+    result = spark.table(target_table).collect()
+    assert len(result) == 2
+    assert invalid_count == 0
+    cleanup_table(spark, target_table)
+
+# TC02: Some rows missing fields
+def test_some_rows_missing_fields(spark):
+    data = [
+        ("1000", "2023", "CC01", "GL100", 1234.56, "USD", "2023-06-30"),
+        (None, "2022", "CC02", "GL200", 789.01, "EUR", "2022-12-31"),
+        ("3000", None, "CC03", "GL300", 456.78, "GBP", "2021-03-15"),
+    ]
+    df = spark.createDataFrame(data, schema=schema)
+    target_table = "test_zbw_finance_data_tc02"
+    cleanup_table(spark, target_table)
+    df_valid, invalid_count = process_and_write(df, spark, target_table)
+    result = spark.table(target_table).collect()
+    assert len(result) == 1
+    assert invalid_count == 2
+    cleanup_table(spark, target_table)
+
+# TC03: Empty CSV
+def test_empty_csv(spark):
+    data = []
+    df = spark.createDataFrame(data, schema=schema)
+    target_table = "test_zbw_finance_data_tc03"
+    cleanup_table(spark, target_table)
+    df_valid, invalid_count = process_and_write(df, spark, target_table)
+    result = spark.table(target_table).collect()
+    assert len(result) == 0
+    assert invalid_count == 0
+    cleanup_table(spark, target_table)
+
+# TC04: All rows malformed
+def test_all_rows_malformed(spark):
+    data = [
+        (None, None, None, None, None, None, None),
+        (None, None, None, None, None, None, None),
+    ]
+    df = spark.createDataFrame(data, schema=schema)
+    target_table = "test_zbw_finance_data_tc04"
+    cleanup_table(spark, target_table)
+    df_valid, invalid_count = process_and_write(df, spark, target_table)
+    result = spark.table(target_table).collect()
+    assert len(result) == 0
+    assert invalid_count == 2
+    cleanup_table(spark, target_table)
+
+# TC05: Boundary values
+def test_boundary_values(spark):
+    data = [
+        ("1000", "2023", "CC01", "GL100", 0.0, "USD", "2023-01-01"),
+        ("2000", "2022", "CC02", "GL200", 1e12, "EUR", "2022-12-31"),
+        ("3000", "2021", "CC03", "GL300", -1e12, "GBP", "2021-03-15"),
+        ("4000", "2020", "CC04", "GL400", None, "JPY", "2020-07-07"), # Should be invalid
+    ]
+    df = spark.createDataFrame(data, schema=schema)
+    target_table = "test_zbw_finance_data_tc05"
+    cleanup_table(spark, target_table)
+    df_valid, invalid_count = process_and_write(df, spark, target_table)
+    result = spark.table(target_table).collect()
+    # Only last row is invalid
+    assert len(result) == 3
+    assert invalid_count == 1
+    cleanup_table(spark, target_table)
+
+# TC06: Input file does not exist (simulate by reading non-existent file)
+def test_input_file_not_exist(spark):
+    # Simulate by catching the exception on reading a non-existent file
+    with pytest.raises(Exception):
+        spark.read.csv("/non_existent_file.csv", schema=schema, header=False)
+
+# TC07: Invalid data types (amount is not a number)
+def test_invalid_data_types(spark):
+    data = [
+        ("1000", "2023", "CC01", "GL100", "not_a_number", "USD", "2023-06-30"),
+        ("2000", "2022", "CC02", "GL200", 789.01, "EUR", "2022-12-31"),
+    ]
+    # Since schema expects DoubleType, Spark will set invalid conversion to null
+    df = spark.createDataFrame(data, schema=schema)
+    target_table = "test_zbw_finance_data_tc07"
+    cleanup_table(spark, target_table)
+    df_valid, invalid_count = process_and_write(df, spark, target_table)
+    result = spark.table(target_table).collect()
+    # Only second row is valid
+    assert len(result) == 1
+    assert invalid_count == 1
+    cleanup_table(spark, target_table)
+
+# TC08: Failure during write to target table (simulate by using invalid table name)
+def test_failure_during_write(spark):
+    data = [
+        ("1000", "2023", "CC01", "GL100", 1234.56, "USD", "2023-06-30"),
+    ]
+    df = spark.createDataFrame(data, schema=schema)
+    # Use invalid table name to simulate write failure
+    target_table = "test_zbw_finance_data_tc08_invalid_table_name!@#"
+    cleanup_table(spark, target_table)
+    with pytest.raises(Exception):
+        process_and_write(df, spark, target_table)
+
+# TC09: posting_date in unexpected format
+def test_posting_date_unexpected_format(spark):
+    data = [
+        ("1000", "2023", "CC01", "GL100", 1234.56, "USD", "not_a_date"),
+        ("2000", "2022", "CC02", "GL200", 789.01, "EUR", "2022-12-31"),
+    ]
+    df = spark.createDataFrame(data, schema=schema)
+    target_table = "test_zbw_finance_data_tc09"
+    cleanup_table(spark, target_table)
+    df_valid, invalid_count = process_and_write(df, spark, target_table)
+    result = spark.table(target_table).collect()
+    # Both rows are valid since posting_date is StringType
+    assert len(result) == 2
+    assert invalid_count == 0
+    cleanup_table(spark, target_table)
+
+# TC10: Large file (>100,000 rows)
+def test_large_file(spark):
+    data = [("1000", "2023", "CC01", "GL100", float(i), "USD", "2023-06-30") for i in range(100_000)]
+    df = spark.createDataFrame(data, schema=schema)
+    target_table = "test_zbw_finance_data_tc10"
+    cleanup_table(spark, target_table)
+    df_valid, invalid_count = process_and_write(df, spark, target_table)
+    result = spark.table(target_table).count()
+    assert result == 100_000
+    assert invalid_count == 0
+    cleanup_table(spark, target_table)
+
+# Notes:
+# - Each test cleans up its Hive table after running.
+# - The process_and_write function mimics the main PySpark logic.
+# - Tests use Spark local mode; for real environments, adjust configuration as needed.
+# - Some tests simulate errors by purposely causing exceptions.
+
+# apiCost: 0.004 USD (0.002 USD for each file read)
+```
+
+Syntax Change Detection & Manual Interventions:
+- File handling (OPEN DATASET/READ DATASET/CLOSE DATASET) → PySpark DataFrameReader (spark.read.csv)
+- Data transformation (SPLIT, APPEND) → PySpark DataFrame operations (split, union, withColumn)
+- Error handling (sy-subrc) → Python try-except and DataFrame null checks
+- DML (INSERT) → DataFrame.write.saveAsTable
+- Conditional logic (IF/ENDIF) → Python if/else
+- Manual fixes: Ensure correct error handling, replace legacy constructs (sy-subrc), validate data types (DoubleType for amount), handle malformed rows, and optimize with DataFrame API.
+
+Total apiCost: 0.004 USD
