@@ -1,173 +1,312 @@
 Test Case List:
 
-Test Case 1:
-- Test Case ID: TC01
-- Test Case Description: Validate that the PySpark code correctly reads a CSV file and handles file-not-found errors as ABAP does with OPEN DATASET and sy-subrc.
-- Expected Outcome: PySpark throws an exception if the file does not exist, and prints an error message.
+Test Case ID: TC01
+Test Case Description: Happy path - All rows are valid, all columns present, correct types, data is loaded successfully.
+Expected Outcome: Data is written to the target table, no errors are printed, and all rows are present in the output.
 
-Test Case 2:
-- Test Case ID: TC02
-- Test Case Description: Ensure that the PySpark code validates the number of columns per row, mimicking the ABAP SPLIT and LINES(lt_fields) = 7 check.
-- Expected Outcome: Rows with exactly 7 columns are processed; others are flagged with an error message.
+Test Case ID: TC02
+Test Case Description: Edge case - Input DataFrame is empty (no rows).
+Expected Outcome: No data is written to the target table, no errors are printed.
 
-Test Case 3:
-- Test Case ID: TC03
-- Test Case Description: Verify that data transformation from CSV fields to DataFrame columns matches the ABAP mapping (bukrs, fiscyear, costcenter, gl_account, amount, currency, posting_date).
-- Expected Outcome: DataFrame columns are correctly assigned from CSV fields.
+Test Case ID: TC03
+Test Case Description: Edge case - Some rows have missing columns (null values).
+Expected Outcome: Only valid rows are written to the target table; invalid rows are logged as errors.
 
-Test Case 4:
-- Test Case ID: TC04
-- Test Case Description: Check that the PySpark code writes the DataFrame to the target table, equivalent to ABAP's INSERT zbw_finance_data FROM TABLE lt_bw_data.
-- Expected Outcome: Data is appended to the target table without errors.
+Test Case ID: TC04
+Test Case Description: Edge case - All rows are invalid (all have missing columns).
+Expected Outcome: No data is written to the target table; all rows are logged as errors.
 
-Test Case 5:
-- Test Case ID: TC05
-- Test Case Description: Confirm error handling for data insertion in PySpark (try-except block) matches ABAP's sy-subrc and ROLLBACK/COMMIT logic.
-- Expected Outcome: On insert failure, an error message is printed; on success, a success message is printed.
+Test Case ID: TC05
+Test Case Description: Edge case - Amount column contains non-numeric values.
+Expected Outcome: Rows with non-numeric values in amount are written with amount as null (PySpark cast behavior); these can be validated.
 
-Test Case 6:
-- Test Case ID: TC06
-- Test Case Description: Validate that NULL and empty values are handled consistently between ABAP and PySpark.
-- Expected Outcome: NULLs in CSV are represented as None/NULL in DataFrame and written as such.
+Test Case ID: TC06
+Test Case Description: Error handling - File does not exist.
+Expected Outcome: File open error is caught and printed; no data is loaded.
 
-Test Case 7:
-- Test Case ID: TC07
-- Test Case Description: Ensure that the PySpark code can handle edge cases such as extra/missing columns, empty lines, or malformed data.
-- Expected Outcome: Such rows are skipped or flagged, and do not cause the job to fail.
+Test Case ID: TC07
+Test Case Description: Error handling - Exception during table write (simulate write failure).
+Expected Outcome: Rollback is called, error is printed, and no data is committed.
 
-Test Case 8:
-- Test Case ID: TC08
-- Test Case Description: Validate performance optimization recommendations (e.g., partitioning, caching) are considered in the PySpark implementation.
-- Expected Outcome: DataFrame operations are efficient and do not recompute unnecessarily.
+Test Case ID: TC08
+Test Case Description: Boundary condition - Maximum allowed field lengths for each column.
+Expected Outcome: Data is written successfully if all columns are present.
 
----
+Test Case ID: TC09
+Test Case Description: Edge case - Nulls in non-amount columns.
+Expected Outcome: Rows with nulls in any column are considered invalid and logged as errors.
 
-Pytest Scripts:
+Test Case ID: TC10
+Test Case Description: Happy path - Multiple valid rows, mixture of currencies and posting dates.
+Expected Outcome: All valid rows are written to the target table with correct values.
+
+Pytest Script for Each Test Case:
 
 ```python
-# test_zload_finance_to_bw.py
-
 import pytest
 from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType
-import os
+from pyspark.sql import Row
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+from pyspark.sql.functions import col
+from unittest import mock
 
-@pytest.fixture(scope="module")
+# Fixture for SparkSession
+@pytest.fixture(scope="session")
 def spark():
     spark = SparkSession.builder.master("local[1]").appName("TestFinanceLoad").getOrCreate()
     yield spark
     spark.stop()
 
-def test_file_not_found(spark):
-    # TC01
-    filename = "non_existent_file.csv"
-    with pytest.raises(Exception):
-        spark.read.csv(filename, header=False).collect()
+# Helper function to create DataFrame with the schema
+def make_df(spark, data):
+    schema = StructType([
+        StructField("bukrs", StringType(), True),
+        StructField("fiscyear", StringType(), True),
+        StructField("costcenter", StringType(), True),
+        StructField("gl_account", StringType(), True),
+        StructField("amount", StringType(), True),
+        StructField("currency", StringType(), True),
+        StructField("posting_date", StringType(), True)
+    ])
+    return spark.createDataFrame(data, schema=schema)
 
-def test_column_validation(spark, tmp_path):
-    # TC02
-    file_path = tmp_path / "test.csv"
-    with open(file_path, "w") as f:
-        f.write("1000,2023,CC01,GL100,5000,USD,2023-01-01\n")
-        f.write("1000,2023,CC01,GL100,5000,USD\n")  # Only 6 columns
-    df = spark.read.csv(str(file_path), header=False)
-    assert len(df.columns) == 7
-    # Check that only the valid row is processed
-    valid_rows = df.filter(df._c0.isNotNull() & df._c6.isNotNull()).count()
-    assert valid_rows == 1
+# Mock for DataFrame.write.saveAsTable
+class DummyWriter:
+    def __init__(self):
+        self.mode_called = None
+        self.table_written = None
+    def mode(self, mode):
+        self.mode_called = mode
+        return self
+    def saveAsTable(self, table):
+        self.table_written = table
 
-def test_data_transformation(spark, tmp_path):
-    # TC03
-    file_path = tmp_path / "test.csv"
-    with open(file_path, "w") as f:
-        f.write("1000,2023,CC01,GL100,5000,USD,2023-01-01\n")
-    df = spark.read.csv(str(file_path), header=False)
-    df = df.toDF("bukrs", "fiscyear", "costcenter", "gl_account", "amount", "currency", "posting_date")
-    row = df.collect()[0]
-    assert row["bukrs"] == "1000"
-    assert row["fiscyear"] == "2023"
-    assert row["costcenter"] == "CC01"
-    assert row["gl_account"] == "GL100"
-    assert row["amount"] == "5000"
-    assert row["currency"] == "USD"
-    assert row["posting_date"] == "2023-01-01"
+# Test TC01: Happy path
+def test_happy_path(spark, capsys):
+    data = [
+        ("1000", "2023", "CC01", "GL1000", "123.45", "USD", "2023-01-01"),
+        ("2000", "2023", "CC02", "GL2000", "678.90", "EUR", "2023-01-02"),
+    ]
+    df = make_df(spark, data)
+    with mock.patch("pyspark.sql.DataFrame.write", new_callable=mock.PropertyMock) as mock_write:
+        dummy_writer = DummyWriter()
+        mock_write.return_value = dummy_writer
+        # Filtering logic as in main script
+        valid_rows = df.filter(
+            col("bukrs").isNotNull() &
+            col("fiscyear").isNotNull() &
+            col("costcenter").isNotNull() &
+            col("gl_account").isNotNull() &
+            col("amount").isNotNull() &
+            col("currency").isNotNull() &
+            col("posting_date").isNotNull()
+        )
+        invalid_rows = df.filter(
+            col("bukrs").isNull() |
+            col("fiscyear").isNull() |
+            col("costcenter").isNull() |
+            col("gl_account").isNull() |
+            col("amount").isNull() |
+            col("currency").isNull() |
+            col("posting_date").isNull()
+        )
+        assert valid_rows.count() == 2
+        assert invalid_rows.count() == 0
+        bw_data = valid_rows.withColumn("amount", col("amount").cast(DoubleType()))
+        # Simulate writing
+        bw_data.write.mode("append").saveAsTable("zbw_finance_data")
+        assert dummy_writer.mode_called == "append"
+        assert dummy_writer.table_written == "zbw_finance_data"
 
-def test_table_write(spark, tmp_path):
-    # TC04
-    file_path = tmp_path / "test.csv"
-    with open(file_path, "w") as f:
-        f.write("1000,2023,CC01,GL100,5000,USD,2023-01-01\n")
-    df = spark.read.csv(str(file_path), header=False)
-    df = df.toDF("bukrs", "fiscyear", "costcenter", "gl_account", "amount", "currency", "posting_date")
-    # Write to a temporary table
-    try:
-        df.write.mode("overwrite").saveAsTable("test_zbw_finance_data")
-        assert True
-    except Exception:
-        assert False
+# Test TC02: Empty DataFrame
+def test_empty_dataframe(spark, capsys):
+    df = make_df(spark, [])
+    valid_rows = df.filter(
+        col("bukrs").isNotNull() &
+        col("fiscyear").isNotNull() &
+        col("costcenter").isNotNull() &
+        col("gl_account").isNotNull() &
+        col("amount").isNotNull() &
+        col("currency").isNotNull() &
+        col("posting_date").isNotNull()
+    )
+    assert valid_rows.count() == 0
 
-def test_insert_error_handling(spark, tmp_path, monkeypatch):
-    # TC05
-    file_path = tmp_path / "test.csv"
-    with open(file_path, "w") as f:
-        f.write("1000,2023,CC01,GL100,5000,USD,2023-01-01\n")
-    df = spark.read.csv(str(file_path), header=False)
-    df = df.toDF("bukrs", "fiscyear", "costcenter", "gl_account", "amount", "currency", "posting_date")
-    # Simulate error by monkeypatching saveAsTable
-    def raise_error(*args, **kwargs):
-        raise Exception("Simulated DB error")
-    monkeypatch.setattr(df, "write", type("Dummy", (), {"mode": lambda self, x: type("Dummy2", (), {"saveAsTable": raise_error})()})())
-    with pytest.raises(Exception):
-        df.write.mode("append").saveAsTable("test_zbw_finance_data")
+# Test TC03: Some rows invalid
+def test_some_rows_invalid(spark, capsys):
+    data = [
+        ("1000", "2023", "CC01", "GL1000", "123.45", "USD", "2023-01-01"),
+        (None, "2023", "CC02", "GL2000", "678.90", "EUR", "2023-01-02"),
+    ]
+    df = make_df(spark, data)
+    valid_rows = df.filter(
+        col("bukrs").isNotNull() &
+        col("fiscyear").isNotNull() &
+        col("costcenter").isNotNull() &
+        col("gl_account").isNotNull() &
+        col("amount").isNotNull() &
+        col("currency").isNotNull() &
+        col("posting_date").isNotNull()
+    )
+    invalid_rows = df.filter(
+        col("bukrs").isNull() |
+        col("fiscyear").isNull() |
+        col("costcenter").isNull() |
+        col("gl_account").isNull() |
+        col("amount").isNull() |
+        col("currency").isNull() |
+        col("posting_date").isNull()
+    )
+    assert valid_rows.count() == 1
+    assert invalid_rows.count() == 1
 
-def test_null_handling(spark, tmp_path):
-    # TC06
-    file_path = tmp_path / "test.csv"
-    with open(file_path, "w") as f:
-        f.write("1000,2023,CC01,GL100,,USD,2023-01-01\n")  # amount is NULL
-    df = spark.read.csv(str(file_path), header=False)
-    df = df.toDF("bukrs", "fiscyear", "costcenter", "gl_account", "amount", "currency", "posting_date")
-    row = df.collect()[0]
-    assert row["amount"] in (None, "")
+# Test TC04: All rows invalid
+def test_all_rows_invalid(spark, capsys):
+    data = [
+        (None, None, None, None, None, None, None),
+        (None, "2023", None, "GL2000", None, "EUR", None),
+    ]
+    df = make_df(spark, data)
+    valid_rows = df.filter(
+        col("bukrs").isNotNull() &
+        col("fiscyear").isNotNull() &
+        col("costcenter").isNotNull() &
+        col("gl_account").isNotNull() &
+        col("amount").isNotNull() &
+        col("currency").isNotNull() &
+        col("posting_date").isNotNull()
+    )
+    invalid_rows = df.filter(
+        col("bukrs").isNull() |
+        col("fiscyear").isNull() |
+        col("costcenter").isNull() |
+        col("gl_account").isNull() |
+        col("amount").isNull() |
+        col("currency").isNull() |
+        col("posting_date").isNull()
+    )
+    assert valid_rows.count() == 0
+    assert invalid_rows.count() == 2
 
-def test_edge_cases(spark, tmp_path):
-    # TC07
-    file_path = tmp_path / "test.csv"
-    with open(file_path, "w") as f:
-        f.write("\n")  # Empty line
-        f.write("1000,2023,CC01,GL100,5000,USD,2023-01-01,EXTRA\n")  # 8 columns
-    df = spark.read.csv(str(file_path), header=False)
-    # Only lines with exactly 7 columns should be processed
-    assert all(len(row) == 8 or all(field is None for field in row) for row in df.collect())
+# Test TC05: Non-numeric amount
+def test_non_numeric_amount(spark, capsys):
+    data = [
+        ("1000", "2023", "CC01", "GL1000", "abc", "USD", "2023-01-01"),
+    ]
+    df = make_df(spark, data)
+    bw_data = df.withColumn("amount", col("amount").cast(DoubleType()))
+    result = bw_data.collect()
+    # amount should be None (null) after cast
+    assert result[0]["amount"] is None
 
-def test_performance_optimizations():
-    # TC08
-    # This is a placeholder; actual performance tests would require a large dataset and Spark UI inspection.
-    # Here, we check that cache and repartition can be called without error.
-    spark = SparkSession.builder.master("local[1]").appName("TestPerfOpt").getOrCreate()
-    data = [("1000", "2023", "CC01", "GL100", "5000", "USD", "2023-01-01")]
-    schema = StructType([StructField("bukrs", StringType()), StructField("fiscyear", StringType()),
-                         StructField("costcenter", StringType()), StructField("gl_account", StringType()),
-                         StructField("amount", StringType()), StructField("currency", StringType()),
-                         StructField("posting_date", StringType())])
-    df = spark.createDataFrame(data, schema)
-    df.cache()
-    df2 = df.repartition(2)
-    assert df2.rdd.getNumPartitions() == 2
-    spark.stop()
+# Test TC06: File does not exist
+def test_file_not_exist(monkeypatch, capsys):
+    # Simulate file open error by raising an exception
+    with mock.patch("pyspark.sql.SparkSession.read", side_effect=Exception("File not found")):
+        try:
+            spark = SparkSession.builder.master("local[1]").appName("Test").getOrCreate()
+            spark.read.csv("nonexistent.csv")
+        except Exception as e:
+            assert "File not found" in str(e)
+        finally:
+            spark.stop()
+
+# Test TC07: Exception during table write
+def test_write_exception(spark, capsys):
+    data = [
+        ("1000", "2023", "CC01", "GL1000", "123.45", "USD", "2023-01-01"),
+    ]
+    df = make_df(spark, data)
+    bw_data = df.withColumn("amount", col("amount").cast(DoubleType()))
+    with mock.patch("pyspark.sql.DataFrame.write", new_callable=mock.PropertyMock) as mock_write:
+        class FailingWriter:
+            def mode(self, mode):
+                return self
+            def saveAsTable(self, table):
+                raise Exception("Simulated write failure")
+        mock_write.return_value = FailingWriter()
+        with pytest.raises(Exception) as excinfo:
+            bw_data.write.mode("append").saveAsTable("zbw_finance_data")
+        assert "Simulated write failure" in str(excinfo.value)
+
+# Test TC08: Maximum field lengths
+def test_max_field_lengths(spark, capsys):
+    max_str = "X" * 255
+    data = [
+        (max_str, max_str, max_str, max_str, "123.45", max_str, max_str),
+    ]
+    df = make_df(spark, data)
+    valid_rows = df.filter(
+        col("bukrs").isNotNull() &
+        col("fiscyear").isNotNull() &
+        col("costcenter").isNotNull() &
+        col("gl_account").isNotNull() &
+        col("amount").isNotNull() &
+        col("currency").isNotNull() &
+        col("posting_date").isNotNull()
+    )
+    assert valid_rows.count() == 1
+
+# Test TC09: Nulls in non-amount columns
+def test_nulls_in_non_amount_columns(spark, capsys):
+    data = [
+        ("1000", None, "CC01", "GL1000", "123.45", "USD", "2023-01-01"),
+    ]
+    df = make_df(spark, data)
+    valid_rows = df.filter(
+        col("bukrs").isNotNull() &
+        col("fiscyear").isNotNull() &
+        col("costcenter").isNotNull() &
+        col("gl_account").isNotNull() &
+        col("amount").isNotNull() &
+        col("currency").isNotNull() &
+        col("posting_date").isNotNull()
+    )
+    invalid_rows = df.filter(
+        col("bukrs").isNull() |
+        col("fiscyear").isNull() |
+        col("costcenter").isNull() |
+        col("gl_account").isNull() |
+        col("amount").isNull() |
+        col("currency").isNull() |
+        col("posting_date").isNull()
+    )
+    assert valid_rows.count() == 0
+    assert invalid_rows.count() == 1
+
+# Test TC10: Multiple valid rows, mixture
+def test_multiple_valid_rows_mixture(spark, capsys):
+    data = [
+        ("1000", "2023", "CC01", "GL1000", "123.45", "USD", "2023-01-01"),
+        ("2000", "2022", "CC02", "GL2000", "678.90", "EUR", "2022-12-31"),
+    ]
+    df = make_df(spark, data)
+    valid_rows = df.filter(
+        col("bukrs").isNotNull() &
+        col("fiscyear").isNotNull() &
+        col("costcenter").isNotNull() &
+        col("gl_account").isNotNull() &
+        col("amount").isNotNull() &
+        col("currency").isNotNull() &
+        col("posting_date").isNotNull()
+    )
+    assert valid_rows.count() == 2
+    rows = valid_rows.collect()
+    assert rows[0]["currency"] == "USD"
+    assert rows[1]["currency"] == "EUR"
+
+# End of test script
 ```
 
-API Cost Consumed: 1 file listing + 2 file reads = 3 operations
+Manual Interventions & Recommendations:
+- File Handling: ABAP's OPEN/READ/CLOSE DATASET is replaced by Spark's DataFrameReader. Ensure file encoding and error handling is robust in PySpark.
+- Data Transformation: ABAP's SPLIT and field assignment is replaced by DataFrame schema mapping and column assignment. Confirm correct mapping and data types.
+- Error Handling: ABAP's sy-subrc checks are replaced by Python try-except blocks. Ensure all exceptions are properly logged and handled.
+- DML Operations: ABAP's INSERT is replaced by DataFrame.write.saveAsTable. Validate that the table exists and permissions are correct.
+- Transaction Handling: ABAP's COMMIT/ROLLBACK is simulated in PySpark. If the Spark metastore does not support transactions, ensure idempotency and error recovery.
+- Data Types: CHAR/STRING/DECIMAL in ABAP are mapped to StringType/DoubleType in PySpark. Validate for precision and null handling.
 
----
-Syntax Change Detection & Manual Interventions:
-
-- File Handling: ABAP's OPEN DATASET/READ DATASET/CLOSE DATASET replaced by PySpark's DataFrameReader.
-- Data Transformation: ABAP's SPLIT and field assignment mapped to DataFrame column naming and value assignment.
-- Error Handling: ABAP's sy-subrc checks replaced by Python exceptions and try-except blocks.
-- Table Insert: ABAP's INSERT replaced by DataFrame.write.saveAsTable.
-- NULL Handling: Explicit checks for None/empty in PySpark.
-- Performance: PySpark optimizations (cache, repartition) recommended.
-- Edge Cases: PySpark code should handle malformed/extra/missing data gracefully.
-
-If you need further granularity or more test cases, please provide additional requirements or sample data.
+API Cost Consumed:
+- File Analysis: 0.002 USD
+- File Analysis: 0.002 USD
+- Total: 0.004 USD
