@@ -1,116 +1,158 @@
-------------------------------------------------------------
 Test Case List:
-----------------------------
-1. Test Case ID: TC01  
-   - Test Case Description: Verify that the DataFrame transformation sets the 'status' column to 'HIGH' when 'betrag' is greater than 1000.  
-   - Expected Outcome: For a sample DataFrame with a 'betrag' value above 1000, the resulting 'status' column must be 'HIGH'.
+- Test Case ID: TC1_HappyPath  
+  Test Case Description: Validate that valid input data with proper 'amount' and 'tax_rate' values correctly transforms the DataFrame by filtering out missing amounts, computing tax (as amount * tax_rate / 100), computing net_amount (amount minus tax), and aggregating net_amount per account.  
+  Expected Outcome: The resulting DataFrame should have correct tax and net_amount values per record and aggregated sums (e.g., for account ACC100, a proper sum of net_amount values is expected).
 
-2. Test Case ID: TC02  
-   - Test Case Description: Verify that the DataFrame transformation sets the 'status' column to 'LOW' when 'betrag' is less than or equal to 1000.  
-   - Expected Outcome: For a sample DataFrame with a 'betrag' value less than or equal to 1000, the resulting 'status' column must be 'LOW'.
+- Test Case ID: TC2_EmptyDataFrame  
+  Test Case Description: Validate that the transformation handles an empty DataFrame without errors.  
+  Expected Outcome: The transformation should run without error, returning an empty DataFrame for both the transformation and aggregation steps.
 
-3. Test Case ID: TC03  
-   - Test Case Description: Handle edge case with an empty DataFrame.  
-   - Expected Outcome: The transformation should complete without errors, returning an empty DataFrame that still has the 'status' column defined.
+- Test Case ID: TC3_NullTaxRate  
+  Test Case Description: Validate that when tax_rate is null for a record, the computed tax is 0 and the net_amount equals the original amount.  
+  Expected Outcome: Rows with null tax_rate should show tax = 0 and net_amount equal to the original amount; rows with valid tax_rate should show proper computed values.
 
-4. Test Case ID: TC04  
-   - Test Case Description: Test transformation on a DataFrame containing null values in the 'betrag' column.  
-   - Expected Outcome: For rows where 'betrag' is null, the 'status' column should be set to 'LOW' (since comparisons with null yield false for the condition).
+- Test Case ID: TC4_MissingColumn  
+  Test Case Description: Validate that when the DataFrame is missing a critical column (e.g., 'amount'), an error (e.g., AnalysisException) is raised.  
+  Expected Outcome: The transformation operation trying to access the missing column should raise an AnalysisException.
 
-5. Test Case ID: TC05  
-   - Test Case Description: Verify error handling when the DataFrame does not include the required 'betrag' column.  
-   - Expected Outcome: The transformation function should raise an exception indicating that the 'betrag' column is missing.
+- Test Case ID: TC5_InvalidDataType  
+  Test Case Description: Validate that if the 'amount' column contains invalid data types (e.g., a string instead of a number), an error is raised during transformation.  
+  Expected Outcome: The conversion process should fail with an exception due to the invalid data type.
 
-------------------------------------------------------------
+- Test Case ID: TC6_ExtractSpecificAccount  
+  Test Case Description: Validate that the specific account extraction (using account 'ACC123') correctly returns exactly one record when present, and no record otherwise.  
+  Expected Outcome: Only one record corresponding to account 'ACC123' is returned when it exists in the input DataFrame.
+
 Pytest Script:
-------------------------------------------------------------
 #!/usr/bin/env python
-"""
-Pytest script for testing the PySpark GL Data Processing module.
-
-API Cost Consumed: 0.005 USD
-"""
+"""Pytest script for testing the GL Data Load Conversion PySpark code."""
 
 import pytest
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql import functions as F
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when, lit
+from pyspark.sql.utils import AnalysisException
 
-# Helper transformation function (extracted from the original main function)
-def transform_gl_data(df: DataFrame) -> DataFrame:
-    """
-    Transform the input DataFrame by adding the 'status' column.
-    'status' is 'HIGH' if 'betrag' > 1000, otherwise 'LOW'.
-    """
-    if 'betrag' not in df.columns:
-        raise ValueError("Input DataFrame must contain a 'betrag' column.")
-    return df.withColumn(
-        "status",
-        F.when(F.col("betrag") > 1000, F.lit("HIGH")).otherwise(F.lit("LOW"))
-    )
-
-# Fixture to initialize and teardown SparkSession for each test.
-@pytest.fixture(scope="function")
+# Fixture for SparkSession setup and teardown
+@pytest.fixture(scope="session")
 def spark():
     spark_session = SparkSession.builder \
-        .master("local[2]") \
-        .appName("GL_Data_Load_and_Transformation_Test") \
+        .appName("GL Data Load Conversion Test") \
+        .master("local[*]") \
         .getOrCreate()
     yield spark_session
     spark_session.stop()
 
-# Test Case TC01: Verify that betrag > 1000 returns status HIGH.
-def test_status_high(spark):
-    # Create sample test DataFrame with betrag > 1000
-    data = [(2000,)]
-    df = spark.createDataFrame(data, ["betrag"])
+# Helper function to simulate the transformation (steps 1 to 3)
+def transform_gl_data(df):
+    # Step 1: Filter out records with missing amounts (mimics ABAP 'IF amount IS NOT INITIAL')
+    df_gl = df.filter(col("amount").isNotNull())
+    # Step 2: Calculate tax for each record (mimicking ABAP looping for tax computation)
+    df_gl = df_gl.withColumn("tax", 
+                              when(col("tax_rate").isNotNull(), col("amount") * col("tax_rate") / 100).otherwise(lit(0)))
+    # Step 3: Compute net amount (amount minus tax), similar to an IF-ELSE in ABAP
+    df_gl = df_gl.withColumn("net_amount", 
+                              when(col("amount").isNotNull(), col("amount") - col("tax")).otherwise(lit(0)))
+    return df_gl
+
+# Aggregation helper: Aggregates net_amount per account_id
+def aggregate_gl_data(df):
+    df_summary = df.groupBy("account_id").agg({"net_amount": "sum"}) \
+        .withColumnRenamed("sum(net_amount)", "total_net_amount")
+    return df_summary
+
+# Helper for account extraction: Extracts a specific account's data, similar to ABAP's SELECT SINGLE
+def extract_specific_account(df, account_of_interest="ACC123"):
+    return df.filter(col("account_id") == account_of_interest).limit(1)
+
+# Test Case TC1_HappyPath: Valid data transformation
+def test_happy_path(spark):
+    """Test that the transformation and aggregation are correct for a valid input DataFrame."""
+    data = [
+        {"account_id": "ACC100", "amount": 100.0, "tax_rate": 10.0},
+        {"account_id": "ACC100", "amount": 200.0, "tax_rate": 10.0},
+        {"account_id": "ACC200", "amount": 300.0, "tax_rate": 5.0}
+    ]
+    df = spark.createDataFrame(data)
     df_transformed = transform_gl_data(df)
     
-    # Collect the results for assertion
-    result = df_transformed.collect()[0]["status"]
-    assert result == "HIGH", f"Expected 'HIGH' for betrag > 1000, got {result}"
+    # Validate tax and net_amount computations:
+    for row in df_transformed.filter(col("account_id") == "ACC100").collect():
+        if row["amount"] == 100.0:
+            assert row["tax"] == 10.0
+            assert row["net_amount"] == 90.0
+        elif row["amount"] == 200.0:
+            assert row["tax"] == 20.0
+            assert row["net_amount"] == 180.0
+            
+    # Aggregate the data and validate sums:
+    df_summary = aggregate_gl_data(df_transformed)
+    summary = {row.account_id: row.total_net_amount for row in df_summary.collect()}
+    # Expected totals: ACC100: 90 + 180 = 270, ACC200: 300 - 15 = 285
+    assert summary.get("ACC100") == 270.0
+    assert summary.get("ACC200") == 285.0
 
-# Test Case TC02: Verify that betrag <= 1000 returns status LOW.
-def test_status_low(spark):
-    # Create sample test DataFrame with betrag <= 1000
-    data = [(500,), (1000,)]
-    df = spark.createDataFrame(data, ["betrag"])
-    df_transformed = transform_gl_data(df)
-    
-    # Check each row for correct status
-    results = [row["status"] for row in df_transformed.collect()]
-    for status in results:
-        assert status == "LOW", f"Expected 'LOW' for betrag <= 1000, got {status}"
-
-# Test Case TC03: Test transformation on an empty DataFrame.
+# Test Case TC2_EmptyDataFrame: Empty DataFrame scenario
 def test_empty_dataframe(spark):
-    # Create an empty DataFrame with 'betrag' column as schema.
-    df = spark.createDataFrame([], "betrag DOUBLE")
+    """Test handling of an empty DataFrame without errors."""
+    schema = "account_id string, amount double, tax_rate double"
+    df_empty = spark.createDataFrame([], schema)
+    df_transformed = transform_gl_data(df_empty)
+    assert df_transformed.count() == 0
+    df_summary = aggregate_gl_data(df_transformed)
+    assert df_summary.count() == 0
+
+# Test Case TC3_NullTaxRate: Data with null tax_rate values
+def test_null_tax_rate(spark):
+    """Test that records with null tax_rate have tax = 0 and net_amount equals amount."""
+    data = [
+        {"account_id": "ACC300", "amount": 150.0, "tax_rate": None},
+        {"account_id": "ACC300", "amount": 250.0, "tax_rate": 8.0}
+    ]
+    df = spark.createDataFrame(data)
     df_transformed = transform_gl_data(df)
-    
-    # Expect an empty DataFrame after transformation, but with the 'status' column defined in the schema.
-    assert df_transformed.rdd.isEmpty(), "Expected an empty DataFrame after transformation"
-    assert "status" in df_transformed.columns, "Expected 'status' column in the DataFrame"
+    for row in df_transformed.collect():
+        if row["tax_rate"] is None:
+            assert row["tax"] == 0
+            assert row["net_amount"] == row["amount"]
+        else:
+            expected_tax = row["amount"] * row["tax_rate"] / 100
+            assert row["tax"] == expected_tax
+            assert row["net_amount"] == row["amount"] - expected_tax
 
-# Test Case TC04: Verify transformation when 'betrag' contains null values.
-def test_null_values(spark):
-    # Create a DataFrame with null values in 'betrag'
-    data = [(None,)]
-    df = spark.createDataFrame(data, ["betrag"])
+# Test Case TC4_MissingColumn: DataFrame missing critical column 'amount'
+def test_missing_column(spark):
+    """Test that an error is raised when a required column (e.g., 'amount') is missing."""
+    data = [
+        {"account_id": "ACC400", "tax_rate": 12.0}
+    ]
+    df = spark.createDataFrame(data)
+    with pytest.raises(AnalysisException):
+        # Filtering on a missing column should raise an AnalysisException.
+        df.filter(col("amount").isNotNull()).collect()
+
+# Test Case TC5_InvalidDataType: DataFrame with invalid data types for 'amount'
+def test_invalid_data_type(spark):
+    """Test that invalid data types for the 'amount' column result in an error."""
+    data = [
+        {"account_id": "ACC500", "amount": "one hundred", "tax_rate": 10.0}
+    ]
+    df = spark.createDataFrame(data)
+    with pytest.raises(Exception):
+        # The transformation should raise an error due to invalid data type in 'amount'
+        transform_gl_data(df).collect()
+
+# Test Case TC6_ExtractSpecificAccount: Extract specific account 'ACC123'
+def test_extract_specific_account(spark):
+    """Test that extracting a specific account returns the correct record (account 'ACC123')."""
+    data = [
+        {"account_id": "ACC123", "amount": 500.0, "tax_rate": 10.0},
+        {"account_id": "ACC999", "amount": 600.0, "tax_rate": 15.0}
+    ]
+    df = spark.createDataFrame(data)
     df_transformed = transform_gl_data(df)
-    
-    # For null betrag, the when condition should default to 'LOW'
-    result = df_transformed.collect()[0]["status"]
-    assert result == "LOW", "Expected 'LOW' when betrag is null"
+    df_specific = extract_specific_account(df_transformed, account_of_interest="ACC123")
+    result = df_specific.collect()
+    assert len(result) == 1
+    assert result[0]["account_id"] == "ACC123"
 
-# Test Case TC05: Verify proper error raised when 'betrag' column is missing.
-def test_missing_betrag_column(spark):
-    # Create a DataFrame missing the 'betrag' column.
-    data = [(1000,)]
-    df = spark.createDataFrame(data, ["amount"])
-    
-    with pytest.raises(ValueError) as exc_info:
-        transform_gl_data(df)
-    assert "Input DataFrame must contain a 'betrag' column." in str(exc_info.value)
-
-------------------------------------------------------------
-End of Final Answer.
+# Cost consumed by the API for this call: 0.01 API credits
