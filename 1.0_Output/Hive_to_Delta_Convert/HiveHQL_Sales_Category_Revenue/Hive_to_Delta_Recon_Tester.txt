@@ -1,3 +1,191 @@
-Thought: I now have the content of the original Hive SQL script and the converted Delta Lake SQL script. I will analyze both scripts to identify their structure, target tables, and any differences in syntax or functionality. This analysis will guide the development of the Python script.
+```python
+import os
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from pyhive import hive
+from pyspark.sql import SparkSession
+from datetime import datetime
+import subprocess
 
-Action: Analyze the differences between the Hive and Delta scripts to identify key changes.
+# Environment variables for credentials
+HIVE_HOST = os.getenv('HIVE_HOST')
+HIVE_PORT = os.getenv('HIVE_PORT')
+HIVE_USERNAME = os.getenv('HIVE_USERNAME')
+HIVE_PASSWORD = os.getenv('HIVE_PASSWORD')
+DATABRICKS_HOST = os.getenv('DATABRICKS_HOST')
+DATABRICKS_TOKEN = os.getenv('DATABRICKS_TOKEN')
+DATABRICKS_STORAGE = os.getenv('DATABRICKS_STORAGE')
+
+# Step 1: Hive Connection and Execution
+def execute_hive_query(hive_query):
+    conn = hive.Connection(host=HIVE_HOST, port=int(HIVE_PORT), username=HIVE_USERNAME, password=HIVE_PASSWORD)
+    cursor = conn.cursor()
+    cursor.execute(hive_query)
+    rows = cursor.fetchall()
+    columns = [desc[0] for desc in cursor.description]
+    conn.close()
+    return pd.DataFrame(rows, columns=columns)
+
+# Step 2: Export Hive Data to Parquet
+def export_to_parquet(df, table_name):
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    file_name = f"{table_name}_{timestamp}.parquet"
+    table = pa.Table.from_pandas(df)
+    pq.write_table(table, file_name)
+    return file_name
+
+# Step 3: Transfer Parquet Files to Databricks
+def upload_to_databricks(file_path):
+    dbfs_path = f"dbfs:/{DATABRICKS_STORAGE}/{os.path.basename(file_path)}"
+    subprocess.run(["databricks", "fs", "cp", file_path, dbfs_path])
+    return dbfs_path
+
+# Step 4: Create External Tables in Delta Lake
+def create_external_table(spark, dbfs_path, table_name, schema):
+    spark.sql(f"""
+        CREATE TABLE IF NOT EXISTS {table_name}
+        USING PARQUET
+        LOCATION '{dbfs_path}'
+    """)
+    return table_name
+
+# Step 5: Execute Delta Lake SQL
+def execute_delta_query(spark, delta_query):
+    return spark.sql(delta_query)
+
+# Step 6: Compare Hive and Delta Results
+def compare_results(hive_df, delta_df):
+    if hive_df.shape != delta_df.shape:
+        return "NO MATCH", f"Row count mismatch: Hive({hive_df.shape[0]}), Delta({delta_df.shape[0]})"
+    mismatches = []
+    for col in hive_df.columns:
+        if not hive_df[col].equals(delta_df[col]):
+            mismatches.append(col)
+    if mismatches:
+        return "PARTIAL MATCH", f"Column mismatches: {', '.join(mismatches)}"
+    return "MATCH", "All data matches"
+
+# Main Function
+def main():
+    # Hive SQL and Delta SQL
+    hive_sql = """
+    WITH FilteredSales AS (
+        SELECT 
+            s.order_id,
+            s.product_id,
+            p.category_id,
+            r.region_id,
+            s.order_date,
+            CAST(s.quantity * s.price AS DECIMAL(10,2)) AS revenue
+        FROM sales s
+        JOIN products p ON s.product_id = p.product_id
+        JOIN regions r ON s.region_id = r.region_id
+        WHERE s.order_date >= ADD_MONTHS(CAST(CURRENT_TIMESTAMP AS DATE), -12)
+    ),
+    CategoryRevenue AS (
+        SELECT 
+            f.region_id,
+            f.category_id,
+            SUM(f.revenue) AS total_revenue,
+            AVG(f.revenue) AS avg_order_value
+        FROM FilteredSales f
+        GROUP BY f.region_id, f.category_id
+    ),
+    RankedCategories AS (
+        SELECT 
+            cr.region_id,
+            cr.category_id,
+            cr.total_revenue,
+            cr.avg_order_value,
+            RANK() OVER (PARTITION BY cr.region_id ORDER BY cr.total_revenue DESC) AS category_rank
+        FROM CategoryRevenue cr
+    )
+    SELECT 
+        rc.region_id,
+        rc.category_id,
+        rc.total_revenue,
+        rc.avg_order_value,
+        rc.category_rank
+    FROM RankedCategories rc
+    WHERE rc.category_rank <= 3
+    ORDER BY rc.region_id, rc.category_rank
+    """
+    delta_sql = """
+    -- Delta SQL Script Equivalent
+
+    -- Step 1: Filter sales data for the last 12 months
+    WITH FilteredSales AS (
+        SELECT 
+            s.order_id,
+            s.product_id,
+            p.category_id,
+            r.region_id,
+            s.order_date,
+            CAST(s.quantity * s.price AS DECIMAL(10,2)) AS revenue
+        FROM sales s
+        INNER JOIN products p ON s.product_id = p.product_id
+        INNER JOIN regions r ON s.region_id = r.region_id
+        WHERE s.order_date >= DATE_ADD(CURRENT_DATE(), -365)
+    ),
+
+    -- Step 2: Calculate total revenue and average order value for each category within each region
+    CategoryRevenue AS (
+        SELECT 
+            f.region_id,
+            f.category_id,
+            SUM(f.revenue) AS total_revenue,
+            AVG(f.revenue) AS avg_order_value
+        FROM FilteredSales f
+        GROUP BY f.region_id, f.category_id
+    ),
+
+    -- Step 3: Rank categories within each region based on total revenue
+    RankedCategories AS (
+        SELECT 
+            cr.region_id,
+            cr.category_id,
+            cr.total_revenue,
+            cr.avg_order_value,
+            RANK() OVER (PARTITION BY cr.region_id ORDER BY cr.total_revenue DESC) AS category_rank
+        FROM CategoryRevenue cr
+    )
+
+    -- Step 4: Select top 3 categories for each region and order the results
+    SELECT 
+        rc.region_id,
+        rc.category_id,
+        rc.total_revenue,
+        rc.avg_order_value,
+        rc.category_rank
+    FROM RankedCategories rc
+    WHERE rc.category_rank <= 3
+    ORDER BY rc.region_id, rc.category_rank;
+    """
+
+    # Execute Hive Query
+    hive_df = execute_hive_query(hive_sql)
+    hive_parquet = export_to_parquet(hive_df, "hive_sales_category_revenue")
+
+    # Upload to Databricks
+    dbfs_path = upload_to_databricks(hive_parquet)
+
+    # Spark Session for Delta
+    spark = SparkSession.builder \
+        .appName("HiveToDeltaValidation") \
+        .getOrCreate()
+
+    # Create External Table
+    external_table = create_external_table(spark, dbfs_path, "external_hive_sales_category_revenue", hive_df.dtypes)
+
+    # Execute Delta Query
+    delta_df = execute_delta_query(spark, delta_sql)
+
+    # Compare Results
+    match_status, details = compare_results(hive_df, delta_df)
+    print(f"Comparison Result: {match_status}")
+    print(f"Details: {details}")
+
+if __name__ == "__main__":
+    main()
+```
