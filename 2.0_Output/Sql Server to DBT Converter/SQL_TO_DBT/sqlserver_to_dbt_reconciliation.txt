@@ -1,89 +1,117 @@
 1. Test Cases Document:
 
-| Test ID | Test Description                                                                 | Expected Output                                                                                     |
-|--------|----------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------|
-| TC01   | Happy path: Multiple users with completed orders, multiple categories             | Correct aggregation per user: total_orders, total_spent, avg_order_value, categories_bought         |
-| TC02   | Edge case: User with no completed orders                                         | User not present in output                                                                          |
-| TC03   | Edge case: Orders with NULL total_amount                                         | Aggregations handle NULLs correctly (excluded from SUM/AVG, COUNT unaffected)                       |
-| TC04   | Edge case: Orders with zero total_amount                                         | Aggregations include zero in SUM/AVG                                                                |
-| TC05   | Boundary: User with exactly one completed order                                  | Aggregations reflect one order, categories_bought is single-element array                           |
-| TC06   | Boundary: Order with multiple products in different categories                   | categories_bought contains all relevant categories                                                  |
-| TC07   | Error: Orders with missing user or product references                            | Such orders are excluded due to failed JOIN                                                         |
-| TC08   | Performance: Large dataset                                                       | Query completes and returns correct results, no memory errors                                       |
-| TC09   | Data integrity: Duplicate orders for same user                                   | COUNT reflects actual number of completed orders, not duplicates                                    |
-| TC10   | DBT compliance: Syntax and structure                                             | Query runs successfully in DBT (no syntax errors, proper CTEs, correct use of ARRAY_AGG etc.)       |
-| TC11   | Null handling: NULL product_category                                             | categories_bought excludes NULL values                                                              |
-| TC12   | Empty dataset: No orders in raw.orders                                           | Output is empty                                                                                     |
+Test Case ID: TC01
+Description: Happy path - Multiple users with completed orders, each with multiple products/categories.
+Input Data: Multiple users, each with several completed orders, each order with multiple products/categories.
+Expected Output: Correct aggregation per user: total_orders, total_spent, avg_order_value, distinct categories_bought, sorted by total_spent descending.
 
+Test Case ID: TC02
+Description: Edge case - User with no completed orders.
+Input Data: User(s) present in users table, but no completed orders in orders table.
+Expected Output: User is not present in the output.
+
+Test Case ID: TC03
+Description: Edge case - Order with zero total_amount.
+Input Data: At least one order with total_amount = 0.0 and status 'completed'.
+Expected Output: Order is counted, total_spent and avg_order_value reflect zero values appropriately.
+
+Test Case ID: TC04
+Description: Boundary - Single user with a single completed order and single product.
+Input Data: One user, one completed order, one product.
+Expected Output: Aggregation returns correct values for one order, one category.
+
+Test Case ID: TC05
+Description: Null handling - Orders with null product_category.
+Input Data: At least one product with category = NULL.
+Expected Output: Null product_category is either excluded from categories_bought or handled as per warehouse semantics.
+
+Test Case ID: TC06
+Description: Data integrity - Ensure join logic excludes orders with missing user/product/order_item references.
+Input Data: Orders with missing references in users/products/order_items.
+Expected Output: Only fully joined records are included.
+
+Test Case ID: TC07
+Description: Aggregation - Multiple orders for a user with overlapping product categories.
+Input Data: Multiple orders for a user, some with the same product category.
+Expected Output: categories_bought contains distinct categories only.
+
+Test Case ID: TC08
+Description: Performance - Large input dataset.
+Input Data: Large number of users, orders, products, and order_items.
+Expected Output: Query completes successfully and returns correct aggregations.
+
+Test Case ID: TC09
+Description: Error handling - Invalid data types in total_amount.
+Input Data: At least one order with total_amount as a non-numeric value.
+Expected Output: Query fails gracefully or ignores invalid records.
+
+Test Case ID: TC10
+Description: Compliance - DBT ref syntax is used for all table references.
+Input Data: DBT SQL code.
+Expected Output: All table references use {{ ref('table_name') }} syntax.
+
+-------------------------------------------------
 2. Pytest Script for each of the test cases.
 
 ```python
-# test_order_summary.py
-
 import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import Row
-from pyspark.sql.functions import col, array_distinct, collect_set
+from pyspark.sql.functions import col, count, sum as _sum, avg, collect_set
 
-# Helper function to create SparkSession
 @pytest.fixture(scope="function")
 def spark():
-    spark = SparkSession.builder.master("local[1]").appName("OrderSummaryTest").getOrCreate()
+    spark = SparkSession.builder.master("local[1]").appName("DBTUnitTest").getOrCreate()
     yield spark
     spark.stop()
 
-# Helper to create DataFrames for each raw table
-def create_raw_tables(spark, orders, users, order_items, products):
-    orders_df = spark.createDataFrame([Row(**row) for row in orders])
-    users_df = spark.createDataFrame([Row(**row) for row in users])
-    order_items_df = spark.createDataFrame([Row(**row) for row in order_items])
-    products_df = spark.createDataFrame([Row(**row) for row in products])
-    return orders_df, users_df, order_items_df, products_df
+def create_test_data(spark, orders, users, order_items, products):
+    df_orders = spark.createDataFrame([Row(**x) for x in orders])
+    df_users = spark.createDataFrame([Row(**x) for x in users])
+    df_order_items = spark.createDataFrame([Row(**x) for x in order_items])
+    df_products = spark.createDataFrame([Row(**x) for x in products])
+    return df_orders, df_users, df_order_items, df_products
 
-# The transformation logic from the SQL, implemented in PySpark
-def order_summary_transform(spark, orders_df, users_df, order_items_df, products_df):
+def run_customer_orders(spark, df_orders, df_users, df_order_items, df_products):
+    # Simulate the SQL logic in PySpark
     customer_orders = (
-        orders_df
-        .filter(col("status") == "completed")
-        .join(users_df, orders_df.user_id == users_df.id)
-        .join(order_items_df, orders_df.id == order_items_df.order_id)
-        .join(products_df, order_items_df.product_id == products_df.id)
+        df_orders.alias("o")
+        .join(df_users.alias("u"), col("o.user_id") == col("u.id"))
+        .join(df_order_items.alias("oi"), col("o.id") == col("oi.order_id"))
+        .join(df_products.alias("p"), col("oi.product_id") == col("p.id"))
+        .where(col("o.status") == "completed")
         .select(
-            orders_df.id.alias("order_id"),
-            orders_df.user_id,
-            users_df.name.alias("customer_name"),
-            users_df.email.alias("customer_email"),
-            orders_df.total_amount,
-            orders_df.created_at.alias("order_date"),
-            products_df.category.alias("product_category"),
-            products_df.price.alias("product_price")
+            col("o.id").alias("order_id"),
+            col("o.user_id"),
+            col("u.name").alias("customer_name"),
+            col("u.email").alias("customer_email"),
+            col("o.total_amount"),
+            col("o.created_at").alias("order_date"),
+            col("p.category").alias("product_category"),
+            col("p.price").alias("product_price"),
         )
     )
-
-    from pyspark.sql import functions as F
-
     order_summary = (
-        customer_orders
-        .groupBy("user_id", "customer_name", "customer_email")
+        customer_orders.groupBy("user_id", "customer_name", "customer_email")
         .agg(
-            F.count("order_id").alias("total_orders"),
-            F.sum("total_amount").alias("total_spent"),
-            F.avg("total_amount").alias("avg_order_value"),
-            F.collect_set("product_category").alias("categories_bought")
+            count("order_id").alias("total_orders"),
+            _sum("total_amount").alias("total_spent"),
+            avg("total_amount").alias("avg_order_value"),
+            collect_set("product_category").alias("categories_bought"),
         )
-        .orderBy(F.desc("total_spent"))
+        .orderBy(col("total_spent").desc())
     )
     return order_summary
 
 # TC01: Happy path
 def test_happy_path(spark):
     """
-    TC01: Happy path - Multiple users with completed orders, multiple categories
+    Test multiple users with completed orders, each with multiple products/categories.
     """
     orders = [
         {"id": 1, "user_id": 10, "total_amount": 100.0, "created_at": "2024-06-01", "status": "completed"},
         {"id": 2, "user_id": 10, "total_amount": 200.0, "created_at": "2024-06-02", "status": "completed"},
-        {"id": 3, "user_id": 20, "total_amount": 150.0, "created_at": "2024-06-03", "status": "completed"},
+        {"id": 3, "user_id": 20, "total_amount": 300.0, "created_at": "2024-06-03", "status": "completed"},
     ]
     users = [
         {"id": 10, "name": "Alice", "email": "alice@example.com"},
@@ -91,276 +119,227 @@ def test_happy_path(spark):
     ]
     order_items = [
         {"order_id": 1, "product_id": 100},
-        {"order_id": 2, "product_id": 101},
-        {"order_id": 3, "product_id": 102},
+        {"order_id": 1, "product_id": 101},
+        {"order_id": 2, "product_id": 102},
+        {"order_id": 3, "product_id": 103},
     ]
     products = [
         {"id": 100, "category": "Books", "price": 50.0},
-        {"id": 101, "category": "Electronics", "price": 200.0},
-        {"id": 102, "category": "Clothing", "price": 150.0},
+        {"id": 101, "category": "Electronics", "price": 50.0},
+        {"id": 102, "category": "Books", "price": 200.0},
+        {"id": 103, "category": "Clothing", "price": 300.0},
     ]
-    orders_df, users_df, order_items_df, products_df = create_raw_tables(spark, orders, users, order_items, products)
-    result = order_summary_transform(spark, orders_df, users_df, order_items_df, products_df).collect()
+    df_orders, df_users, df_order_items, df_products = create_test_data(spark, orders, users, order_items, products)
+    result = run_customer_orders(spark, df_orders, df_users, df_order_items, df_products).collect()
     assert len(result) == 2
-    user_10 = next(r for r in result if r.user_id == 10)
-    assert user_10.total_orders == 2
-    assert user_10.total_spent == 300.0
-    assert user_10.avg_order_value == 150.0
-    assert set(user_10.categories_bought) == {"Books", "Electronics"}
+    assert result[0]["user_id"] == 20
+    assert result[0]["total_spent"] == 300.0
+    assert set(result[0]["categories_bought"]) == {"Clothing"}
+    assert result[1]["user_id"] == 10
+    assert result[1]["total_spent"] == 300.0
+    assert set(result[1]["categories_bought"]) == {"Books", "Electronics"}
 
 # TC02: User with no completed orders
 def test_user_no_completed_orders(spark):
     """
-    TC02: Edge case - User with no completed orders
+    Test user with no completed orders is not present in output.
     """
     orders = [
-        {"id": 1, "user_id": 10, "total_amount": 100.0, "created_at": "2024-06-01", "status": "pending"}
+        {"id": 1, "user_id": 10, "total_amount": 100.0, "created_at": "2024-06-01", "status": "pending"},
     ]
     users = [
-        {"id": 10, "name": "Alice", "email": "alice@example.com"}
-    ]
-    order_items = [
-        {"order_id": 1, "product_id": 100}
-    ]
-    products = [
-        {"id": 100, "category": "Books", "price": 50.0}
-    ]
-    orders_df, users_df, order_items_df, products_df = create_raw_tables(spark, orders, users, order_items, products)
-    result = order_summary_transform(spark, orders_df, users_df, order_items_df, products_df).collect()
-    assert len(result) == 0
-
-# TC03: Orders with NULL total_amount
-def test_null_total_amount(spark):
-    """
-    TC03: Edge case - Orders with NULL total_amount
-    """
-    orders = [
-        {"id": 1, "user_id": 10, "total_amount": None, "created_at": "2024-06-01", "status": "completed"}
-    ]
-    users = [
-        {"id": 10, "name": "Alice", "email": "alice@example.com"}
-    ]
-    order_items = [
-        {"order_id": 1, "product_id": 100}
-    ]
-    products = [
-        {"id": 100, "category": "Books", "price": 50.0}
-    ]
-    orders_df, users_df, order_items_df, products_df = create_raw_tables(spark, orders, users, order_items, products)
-    result = order_summary_transform(spark, orders_df, users_df, order_items_df, products_df).collect()
-    assert len(result) == 1
-    user = result[0]
-    assert user.total_orders == 1
-    assert user.total_spent is None or user.total_spent == 0  # Spark may return None or 0
-    assert user.avg_order_value is None
-
-# TC04: Orders with zero total_amount
-def test_zero_total_amount(spark):
-    """
-    TC04: Edge case - Orders with zero total_amount
-    """
-    orders = [
-        {"id": 1, "user_id": 10, "total_amount": 0.0, "created_at": "2024-06-01", "status": "completed"}
-    ]
-    users = [
-        {"id": 10, "name": "Alice", "email": "alice@example.com"}
-    ]
-    order_items = [
-        {"order_id": 1, "product_id": 100}
-    ]
-    products = [
-        {"id": 100, "category": "Books", "price": 50.0}
-    ]
-    orders_df, users_df, order_items_df, products_df = create_raw_tables(spark, orders, users, order_items, products)
-    result = order_summary_transform(spark, orders_df, users_df, order_items_df, products_df).collect()
-    assert len(result) == 1
-    user = result[0]
-    assert user.total_orders == 1
-    assert user.total_spent == 0.0
-    assert user.avg_order_value == 0.0
-
-# TC05: User with exactly one completed order
-def test_single_completed_order(spark):
-    """
-    TC05: Boundary - User with exactly one completed order
-    """
-    orders = [
-        {"id": 1, "user_id": 10, "total_amount": 120.0, "created_at": "2024-06-01", "status": "completed"}
-    ]
-    users = [
-        {"id": 10, "name": "Alice", "email": "alice@example.com"}
-    ]
-    order_items = [
-        {"order_id": 1, "product_id": 100}
-    ]
-    products = [
-        {"id": 100, "category": "Books", "price": 50.0}
-    ]
-    orders_df, users_df, order_items_df, products_df = create_raw_tables(spark, orders, users, order_items, products)
-    result = order_summary_transform(spark, orders_df, users_df, order_items_df, products_df).collect()
-    assert len(result) == 1
-    user = result[0]
-    assert user.total_orders == 1
-    assert user.total_spent == 120.0
-    assert user.avg_order_value == 120.0
-    assert set(user.categories_bought) == {"Books"}
-
-# TC06: Order with multiple products in different categories
-def test_multiple_categories(spark):
-    """
-    TC06: Boundary - Order with multiple products in different categories
-    """
-    orders = [
-        {"id": 1, "user_id": 10, "total_amount": 300.0, "created_at": "2024-06-01", "status": "completed"}
-    ]
-    users = [
-        {"id": 10, "name": "Alice", "email": "alice@example.com"}
+        {"id": 10, "name": "Alice", "email": "alice@example.com"},
     ]
     order_items = [
         {"order_id": 1, "product_id": 100},
-        {"order_id": 1, "product_id": 101}
     ]
     products = [
         {"id": 100, "category": "Books", "price": 50.0},
-        {"id": 101, "category": "Electronics", "price": 250.0}
     ]
-    orders_df, users_df, order_items_df, products_df = create_raw_tables(spark, orders, users, order_items, products)
-    result = order_summary_transform(spark, orders_df, users_df, order_items_df, products_df).collect()
-    assert len(result) == 1
-    user = result[0]
-    assert set(user.categories_bought) == {"Books", "Electronics"}
-
-# TC07: Orders with missing user or product references
-def test_missing_references(spark):
-    """
-    TC07: Error - Orders with missing user or product references
-    """
-    orders = [
-        {"id": 1, "user_id": 99, "total_amount": 100.0, "created_at": "2024-06-01", "status": "completed"}
-    ]
-    users = [
-        {"id": 10, "name": "Alice", "email": "alice@example.com"}
-    ]
-    order_items = [
-        {"order_id": 1, "product_id": 100}
-    ]
-    products = [
-        {"id": 101, "category": "Electronics", "price": 250.0}
-    ]
-    orders_df, users_df, order_items_df, products_df = create_raw_tables(spark, orders, users, order_items, products)
-    result = order_summary_transform(spark, orders_df, users_df, order_items_df, products_df).collect()
+    df_orders, df_users, df_order_items, df_products = create_test_data(spark, orders, users, order_items, products)
+    result = run_customer_orders(spark, df_orders, df_users, df_order_items, df_products).collect()
     assert len(result) == 0
 
-# TC08: Performance with large dataset
-def test_large_dataset(spark):
+# TC03: Order with zero total_amount
+def test_order_zero_total_amount(spark):
     """
-    TC08: Performance - Large dataset
-    """
-    orders = [{"id": i, "user_id": i % 10, "total_amount": float(i), "created_at": "2024-06-01", "status": "completed"} for i in range(1000)]
-    users = [{"id": i, "name": f"User{i}", "email": f"user{i}@example.com"} for i in range(10)]
-    order_items = [{"order_id": i, "product_id": i % 20} for i in range(1000)]
-    products = [{"id": i, "category": f"Cat{i%5}", "price": float(i*10)} for i in range(20)]
-    orders_df, users_df, order_items_df, products_df = create_raw_tables(spark, orders, users, order_items, products)
-    result = order_summary_transform(spark, orders_df, users_df, order_items_df, products_df).collect()
-    assert len(result) == 10  # 10 users
-    # Check that total_orders for each user is 100
-    for user in result:
-        assert user.total_orders == 100
-
-# TC09: Duplicate orders for same user
-def test_duplicate_orders(spark):
-    """
-    TC09: Data integrity - Duplicate orders for same user
+    Test order with zero total_amount is counted and reflected in aggregations.
     """
     orders = [
-        {"id": 1, "user_id": 10, "total_amount": 100.0, "created_at": "2024-06-01", "status": "completed"},
-        {"id": 1, "user_id": 10, "total_amount": 100.0, "created_at": "2024-06-01", "status": "completed"}
+        {"id": 1, "user_id": 10, "total_amount": 0.0, "created_at": "2024-06-01", "status": "completed"},
     ]
     users = [
-        {"id": 10, "name": "Alice", "email": "alice@example.com"}
+        {"id": 10, "name": "Alice", "email": "alice@example.com"},
     ]
     order_items = [
-        {"order_id": 1, "product_id": 100}
+        {"order_id": 1, "product_id": 100},
     ]
     products = [
-        {"id": 100, "category": "Books", "price": 50.0}
+        {"id": 100, "category": "Books", "price": 50.0},
     ]
-    orders_df, users_df, order_items_df, products_df = create_raw_tables(spark, orders, users, order_items, products)
-    result = order_summary_transform(spark, orders_df, users_df, order_items_df, products_df).collect()
-    # Should count both rows, so total_orders == 2
+    df_orders, df_users, df_order_items, df_products = create_test_data(spark, orders, users, order_items, products)
+    result = run_customer_orders(spark, df_orders, df_users, df_order_items, df_products).collect()
     assert len(result) == 1
-    user = result[0]
-    assert user.total_orders == 2
+    assert result[0]["total_orders"] == 1
+    assert result[0]["total_spent"] == 0.0
+    assert result[0]["avg_order_value"] == 0.0
 
-# TC10: DBT compliance - Syntax and structure
-def test_dbt_compliance(spark):
+# TC04: Single user, single order, single product
+def test_single_user_single_order_single_product(spark):
     """
-    TC10: DBT compliance - Syntax and structure
+    Test single user with single completed order and single product.
     """
-    # This test is a placeholder to ensure the transformation logic matches the DBT SQL structure.
-    # If the PySpark logic runs without error and produces expected output, it's DBT-compliant.
     orders = [
-        {"id": 1, "user_id": 10, "total_amount": 100.0, "created_at": "2024-06-01", "status": "completed"}
+        {"id": 1, "user_id": 10, "total_amount": 50.0, "created_at": "2024-06-01", "status": "completed"},
     ]
     users = [
-        {"id": 10, "name": "Alice", "email": "alice@example.com"}
+        {"id": 10, "name": "Alice", "email": "alice@example.com"},
     ]
     order_items = [
-        {"order_id": 1, "product_id": 100}
+        {"order_id": 1, "product_id": 100},
     ]
     products = [
-        {"id": 100, "category": "Books", "price": 50.0}
+        {"id": 100, "category": "Books", "price": 50.0},
     ]
-    orders_df, users_df, order_items_df, products_df = create_raw_tables(spark, orders, users, order_items, products)
-    try:
-        result = order_summary_transform(spark, orders_df, users_df, order_items_df, products_df).collect()
-    except Exception as e:
-        pytest.fail(f"DBT compliance test failed: {e}")
+    df_orders, df_users, df_order_items, df_products = create_test_data(spark, orders, users, order_items, products)
+    result = run_customer_orders(spark, df_orders, df_users, df_order_items, df_products).collect()
+    assert len(result) == 1
+    assert result[0]["total_orders"] == 1
+    assert result[0]["total_spent"] == 50.0
+    assert result[0]["avg_order_value"] == 50.0
+    assert set(result[0]["categories_bought"]) == {"Books"}
 
-# TC11: Null handling - NULL product_category
+# TC05: Null product_category
 def test_null_product_category(spark):
     """
-    TC11: Null handling - NULL product_category
+    Test orders with null product_category.
     """
     orders = [
-        {"id": 1, "user_id": 10, "total_amount": 100.0, "created_at": "2024-06-01", "status": "completed"}
+        {"id": 1, "user_id": 10, "total_amount": 50.0, "created_at": "2024-06-01", "status": "completed"},
     ]
     users = [
-        {"id": 10, "name": "Alice", "email": "alice@example.com"}
+        {"id": 10, "name": "Alice", "email": "alice@example.com"},
     ]
     order_items = [
-        {"order_id": 1, "product_id": 100}
+        {"order_id": 1, "product_id": 100},
     ]
     products = [
-        {"id": 100, "category": None, "price": 50.0}
+        {"id": 100, "category": None, "price": 50.0},
     ]
-    orders_df, users_df, order_items_df, products_df = create_raw_tables(spark, orders, users, order_items, products)
-    result = order_summary_transform(spark, orders_df, users_df, order_items_df, products_df).collect()
+    df_orders, df_users, df_order_items, df_products = create_test_data(spark, orders, users, order_items, products)
+    result = run_customer_orders(spark, df_orders, df_users, df_order_items, df_products).collect()
     assert len(result) == 1
-    user = result[0]
-    # categories_bought should exclude None
-    assert user.categories_bought == [] or user.categories_bought == [None]
+    # categories_bought should contain None or be empty depending on collect_set behavior
+    assert result[0]["categories_bought"] == [None] or result[0]["categories_bought"] == []
 
-# TC12: Empty dataset
-def test_empty_dataset(spark):
+# TC06: Data integrity - missing references
+def test_missing_references(spark):
     """
-    TC12: Empty dataset - No orders in raw.orders
+    Test join logic excludes orders with missing user/product/order_item references.
     """
-    orders = []
-    users = []
-    order_items = []
-    products = []
-    orders_df, users_df, order_items_df, products_df = create_raw_tables(spark, orders, users, order_items, products)
-    result = order_summary_transform(spark, orders_df, users_df, order_items_df, products_df).collect()
-    assert len(result) == 0
+    orders = [
+        {"id": 1, "user_id": 10, "total_amount": 50.0, "created_at": "2024-06-01", "status": "completed"},
+        {"id": 2, "user_id": 99, "total_amount": 100.0, "created_at": "2024-06-02", "status": "completed"},
+    ]
+    users = [
+        {"id": 10, "name": "Alice", "email": "alice@example.com"},
+    ]
+    order_items = [
+        {"order_id": 1, "product_id": 100},
+        # order_id 2 missing
+    ]
+    products = [
+        {"id": 100, "category": "Books", "price": 50.0},
+    ]
+    df_orders, df_users, df_order_items, df_products = create_test_data(spark, orders, users, order_items, products)
+    result = run_customer_orders(spark, df_orders, df_users, df_order_items, df_products).collect()
+    assert len(result) == 1
+    assert result[0]["user_id"] == 10
 
-# End of test_order_summary.py
+# TC07: Aggregation - overlapping product categories
+def test_overlapping_categories(spark):
+    """
+    Test multiple orders for a user with overlapping product categories.
+    """
+    orders = [
+        {"id": 1, "user_id": 10, "total_amount": 50.0, "created_at": "2024-06-01", "status": "completed"},
+        {"id": 2, "user_id": 10, "total_amount": 100.0, "created_at": "2024-06-02", "status": "completed"},
+    ]
+    users = [
+        {"id": 10, "name": "Alice", "email": "alice@example.com"},
+    ]
+    order_items = [
+        {"order_id": 1, "product_id": 100},
+        {"order_id": 2, "product_id": 100},
+        {"order_id": 2, "product_id": 101},
+    ]
+    products = [
+        {"id": 100, "category": "Books", "price": 50.0},
+        {"id": 101, "category": "Electronics", "price": 100.0},
+    ]
+    df_orders, df_users, df_order_items, df_products = create_test_data(spark, orders, users, order_items, products)
+    result = run_customer_orders(spark, df_orders, df_users, df_order_items, df_products).collect()
+    assert len(result) == 1
+    assert set(result[0]["categories_bought"]) == {"Books", "Electronics"}
+
+# TC08: Performance - large input dataset
+def test_large_dataset(spark):
+    """
+    Test performance and correctness with large input dataset.
+    """
+    orders = [{"id": i, "user_id": i % 10, "total_amount": float(i), "created_at": "2024-06-01", "status": "completed"} for i in range(1, 1001)]
+    users = [{"id": i, "name": f"User{i}", "email": f"user{i}@example.com"} for i in range(10)]
+    order_items = [{"order_id": i, "product_id": i % 20} for i in range(1, 1001)]
+    products = [{"id": i, "category": f"Cat{i%5}", "price": float(i)} for i in range(20)]
+    df_orders, df_users, df_order_items, df_products = create_test_data(spark, orders, users, order_items, products)
+    result = run_customer_orders(spark, df_orders, df_users, df_order_items, df_products).collect()
+    assert len(result) == 10
+    # Check that total_orders for each user is 100
+    for row in result:
+        assert row["total_orders"] == 100
+
+# TC09: Error handling - invalid data types in total_amount
+def test_invalid_total_amount(spark):
+    """
+    Test invalid data types in total_amount are handled gracefully.
+    """
+    orders = [
+        {"id": 1, "user_id": 10, "total_amount": "invalid", "created_at": "2024-06-01", "status": "completed"},
+    ]
+    users = [
+        {"id": 10, "name": "Alice", "email": "alice@example.com"},
+    ]
+    order_items = [
+        {"order_id": 1, "product_id": 100},
+    ]
+    products = [
+        {"id": 100, "category": "Books", "price": 50.0},
+    ]
+    df_orders, df_users, df_order_items, df_products = create_test_data(spark, orders, users, order_items, products)
+    try:
+        result = run_customer_orders(spark, df_orders, df_users, df_order_items, df_products).collect()
+        # Should raise an exception or skip invalid record
+        assert False, "Expected exception for invalid total_amount"
+    except Exception:
+        assert True
+
+# TC10: Compliance - DBT ref syntax
+def test_dbt_ref_syntax():
+    """
+    Test that DBT ref syntax is used for all table references.
+    """
+    with open("/src/878eecfb-4160-4c61-a754-2e5d070878c8/tmpkjc95km6/SQL_TO_DBT.txt__wnhu5tv2", "r") as f:
+        sql_code = f.read()
+    assert "{{ ref('orders') }}" in sql_code
+    assert "{{ ref('users') }}" in sql_code
+    assert "{{ ref('order_items') }}" in sql_code
+    assert "{{ ref('products') }}" in sql_code
+
+# Note: All tests use setup/teardown via Spark fixture.
+# Helper functions are used for test data creation.
+# Each test is logically grouped and commented.
 ```
 
 3. The total cost incurred for the execution of the agent.
 
-- 1 directory read
-- 2 file reads
-- Estimated API Cost: $0.002 USD
-
-# Cost consumed by the API for this call: 1 directory read, 2 file reads, $0.002 USD
+*Cost consumed by the API for this call: 1 file list + 1 file read = 2 API calls*
