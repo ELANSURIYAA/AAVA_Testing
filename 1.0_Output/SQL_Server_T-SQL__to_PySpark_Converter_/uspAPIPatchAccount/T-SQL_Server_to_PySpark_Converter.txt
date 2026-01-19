@@ -1,0 +1,758 @@
+
+
+Here's the PySpark implementation of the uspAPIPatchAccount procedure:
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from datetime import datetime, timedelta
+
+def generate_patch_account_json(spark, loop_instance, account_df=None, national_accts_df=None, 
+                               account_id_df=None, id_override_df=None):
+    """
+    Generate JSON messages for API PATCH operations for accounts.
+    
+    Args:
+        spark: SparkSession
+        loop_instance: Integer representing the batch number
+        account_df: DataFrame containing account data (optional, will be loaded if not provided)
+        national_accts_df: DataFrame containing national accounts data (optional)
+        account_id_df: DataFrame containing account ID mappings (optional)
+        id_override_df: DataFrame containing ID overrides (optional)
+        
+    Returns:
+        DataFrame containing AccountID, ContactNumber, SubmissionFlag, LoopInstance, and JSON_Message
+    """
+    # Get current date minus 1 day
+    current_date = datetime.now() - timedelta(days=1)
+    
+    # Load data if not provided
+    if account_df is None:
+        account_df = spark.table("RCT.Account")
+    
+    if national_accts_df is None:
+        # Create NationalAccts DataFrame
+        national_accts_df = spark.sql("""
+            SELECT DISTINCT AccountNumber 
+            FROM EDSMART.Semantic.PolicyDescriptors
+            WHERE NationalAccountFlag = 1
+            AND ExpirationDate > current_timestamp() - INTERVAL 1 DAY
+        """)
+    
+    if account_id_df is None:
+        account_id_df = spark.table("RCT.AccountID")
+    
+    if id_override_df is None:
+        id_override_df = spark.table("RCT.IdOverride").filter(col("ObjectType") == "Account")
+    
+    # Create InForceListCode DataFrame
+    inforce_list_code_data = [
+        ("2443", "inforce"),
+        ("2341", "propsect"),
+        ("2325", "inactive")
+    ]
+    inforce_list_code_schema = StructType([
+        StructField("ItemID", StringType(), True),
+        StructField("ItemCode", StringType(), True)
+    ])
+    inforce_list_code_df = spark.createDataFrame(inforce_list_code_data, inforce_list_code_schema)
+    
+    # Create BrandCode DataFrame
+    brand_code_data = [
+        ("2533", "Accident Fund"),
+        ("2536", "Third Coast Underwriters"),
+        ("2534", "AF Specialty"),
+        ("2535", "United Heartland"),
+        ("2537", "CompWest")
+    ]
+    brand_code_schema = StructType([
+        StructField("ItemID", StringType(), True),
+        StructField("ItemCode", StringType(), True)
+    ])
+    brand_code_df = spark.createDataFrame(brand_code_data, brand_code_schema)
+    
+    # Filter account data
+    filtered_account_df = account_df.filter(
+        (col("PostPatch") == "Patch") & 
+        col("Validated").isNull() & 
+        col("DateSent").isNull() & 
+        (col("SubmissionFlag") == 0)
+    )
+    
+    # Join with NationalAccts
+    account_with_national = filtered_account_df.join(
+        national_accts_df,
+        filtered_account_df["ContactNumber"] == national_accts_df["AccountNumber"],
+        "left"
+    )
+    
+    # Join with InForceListCode
+    account_with_inforce = account_with_national.join(
+        inforce_list_code_df,
+        account_with_national["AccountStatus"] == inforce_list_code_df["ItemCode"],
+        "left"
+    ).withColumnRenamed("ItemID", "InForceItemID")
+    
+    # Join with BrandCode
+    account_with_brand = account_with_inforce.join(
+        brand_code_df,
+        account_with_inforce["Brand"] == brand_code_df["ItemCode"],
+        "left"
+    ).withColumnRenamed("ItemID", "BrandItemID")
+    
+    # Join with AccountID
+    account_with_id = account_with_brand.join(
+        account_id_df,
+        account_with_brand["ContactNumber"] == account_id_df["ContactNumber"],
+        "left"
+    ).withColumnRenamed("AccountID", "MappedAccountID")
+    
+    # Join with IdOverride
+    account_with_override = account_with_id.join(
+        id_override_df,
+        account_with_id["ExternalUniqueId"] == id_override_df["ExternalUniqueID"],
+        "left"
+    )
+    
+    # Calculate AccountID
+    account_with_override = account_with_override.withColumn(
+        "AccountID", 
+        coalesce(col("MappedAccountID"), col("RCT_ID"))
+    )
+    
+    # Calculate LoopInstance
+    window_spec = Window.orderBy("ContactNumber")
+    account_with_override = account_with_override.withColumn(
+        "RowNum", 
+        row_number().over(window_spec)
+    ).withColumn(
+        "LoopInstance", 
+        (col("RowNum") - 1) / 250
+    ).withColumn(
+        "LoopInstance", 
+        floor(col("LoopInstance"))
+    )
+    
+    # Calculate UnderwriterId - NULL for national accounts
+    account_with_override = account_with_override.withColumn(
+        "UnderwriterId",
+        when(col("AccountNumber").isNotNull(), None).otherwise(col("UnderwriterId"))
+    )
+    
+    # Calculate ExternalUniqueId for field 167
+    account_with_override = account_with_override.withColumn(
+        "ExternalUniqueIdFormatted",
+        when(length(col("ExternalUniqueId")) > 15, 
+             regexp_replace(col("ContactNumber"), "AF", ""))
+        .otherwise(regexp_replace(col("ExternalUniqueId"), "AF", ""))
+    )
+    
+    # Calculate NewBusinessPolicyFlag for field 120
+    account_with_override = account_with_override.withColumn(
+        "NewBusinessPolicyFlagFormatted",
+        when(col("NewBusinessPolicyFlag") == 1, "2444").otherwise("2445")
+    )
+    
+    # Filter by LoopInstance
+    final_df = account_with_override.filter(col("LoopInstance") == loop_instance)
+    
+    # Generate JSON message
+    final_df = final_df.withColumn(
+        "JSON_Message",
+        concat(
+            lit("["),
+            # UnderwriterId
+            when(col("UnderwriterId").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/UnderwriterId",\n  "value": "'),
+                     col("UnderwriterId"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # MailingAddress.ProvinceID
+            when(col("MailingAddressProvinceId").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/MailingAddress/ProvinceID",\n  "value": "'),
+                     col("MailingAddressProvinceId"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # MailingAddress.AddressLine
+            when(col("MailingAddressAddressLine").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/MailingAddress/AddressLine",\n  "value": "'),
+                     col("MailingAddressAddressLine"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # MailingAddress.City
+            when(col("MailingAddressCity").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/MailingAddress/City",\n  "value": "'),
+                     col("MailingAddressCity"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # MailingAddress.PostalCode
+            when(col("MailingAddressPostalCode").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/MailingAddress/PostalCode",\n  "value": "'),
+                     col("MailingAddressPostalCode"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # MailingAddress.Longitude
+            when(col("MailingAddressLongitude").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/MailingAddress/Longitude",\n  "value": "'),
+                     col("MailingAddressLongitude").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # MailingAddress.Latitude
+            when(col("MailingAddressLatitude").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/MailingAddress/Latitude",\n  "value": "'),
+                     col("MailingAddressLatitude").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # MailingAddress.County
+            when(col("MailingAddressCounty").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/MailingAddress/County",\n  "value": "'),
+                     col("MailingAddressCounty"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Name
+            when(col("Name").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/Name",\n  "value": "'),
+                     col("Name"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Phone
+            when(col("BusinessPhone").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/Phone",\n  "value": "'),
+                     col("BusinessPhone"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Fax
+            when(col("FaxPhone").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/Fax",\n  "value": "'),
+                     col("FaxPhone"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Email - only if it contains @
+            when(col("EmailAddress").isNotNull() & col("EmailAddress").contains("@"),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/Email",\n  "value": "'),
+                     col("EmailAddress"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Notes
+            when(col("Notes").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/Notes",\n  "value": "'),
+                     col("Notes"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # ContactNumber
+            when(col("ContactNumber").isNotNull(),
+                 concat(
+                     lit('\n{\n  "op": "replace",\n  "path": "/ContactNumber",\n  "value": "'),
+                     col("ContactNumber"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Fields
+            lit('\n{\n      "op": "replace",\n      "path": "/ExtensionFields",\n      "value": [\n'),
+            
+            # Extension Field 11 (InForceItemID)
+            when(col("InForceItemID").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":11,\n  "value": "'),
+                     col("InForceItemID"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 37 (BDCName)
+            when(col("BDCName").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":37,\n  "value": "'),
+                     col("BDCName"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 40 (UnderwriterEmail)
+            when(col("UnderwriterEmail").isNotNull() & col("UnderwriterEmail").contains("@"),
+                 concat(
+                     lit('{\n\n  "Id":40,\n  "value": "'),
+                     col("UnderwriterEmail"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 67 (OnBaseLink)
+            when(col("OnBaseLink").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":67,\n  "value": "'),
+                     col("OnBaseLink"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 69 (Policy1)
+            when(col("Policy1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":69,\n  "value": "'),
+                     col("Policy1"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 72 (LineOfBusiness1)
+            when(col("LineOfBusiness1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":72,\n  "value": "'),
+                     col("LineOfBusiness1"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 73 (Premium1)
+            when(col("Premium1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":73,\n  "value": "'),
+                     col("Premium1").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 74 (PolicyEffectiveDate1)
+            when(col("PolicyEffectiveDate1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":74,\n  "value": "'),
+                     col("PolicyEffectiveDate1"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 75 (PolicyExpirationDATE1)
+            when(col("PolicyExpirationDATE1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":75,\n  "value": "'),
+                     col("PolicyExpirationDATE1"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 76 (PricingType1)
+            when(col("PricingType1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":76,\n  "value": "'),
+                     col("PricingType1"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 77 (GoverningClassCode1)
+            when(col("GoverningClassCode1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":77,\n  "value": "'),
+                     col("GoverningClassCode1"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 78 (NAICSCode1)
+            when(col("NAICSCode1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":78,\n  "value": "'),
+                     col("NAICSCode1"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 79 (Industry1)
+            when(col("Industry1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":79,\n  "value": "'),
+                     col("Industry1"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 80 (HazardGroup1)
+            when(col("HazardGroup1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":80,\n  "value": "'),
+                     col("HazardGroup1"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 81 (PMScore1)
+            when(col("PMScore1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":81,\n  "value": "'),
+                     col("PMScore1").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 82 (ExperienceModificationFactor1)
+            when(col("ExperienceModificationFactor1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":82,\n  "value": "'),
+                     coalesce(col("ExperienceModificationFactor1"), lit(0.0)).cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 83 (Payroll1)
+            when(col("Payroll1").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":83,\n  "value": "'),
+                     col("Payroll1").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 85 (Policy2)
+            when(col("Policy2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":85,\n  "value": "'),
+                     col("Policy2"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 88 (LineOfBusiness2)
+            when(col("LineOfBusiness2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":88,\n  "value": "'),
+                     col("LineOfBusiness2"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 89 (Premium2)
+            when(col("Premium2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":89,\n  "value": "'),
+                     col("Premium2").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 90 (PolicyEffectiveDate2)
+            when(col("PolicyEffectiveDate2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":90,\n  "value": "'),
+                     col("PolicyEffectiveDate2"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 91 (PolicyExpirationDATE2)
+            when(col("PolicyExpirationDATE2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":91,\n  "value": "'),
+                     col("PolicyExpirationDATE2"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 92 (PricingType2)
+            when(col("PricingType2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":92,\n  "value": "'),
+                     col("PricingType2"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 93 (GoverningClassCode2)
+            when(col("GoverningClassCode2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":93,\n  "value": "'),
+                     col("GoverningClassCode2"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 94 (NAICSCode2)
+            when(col("NAICSCode2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":94,\n  "value": "'),
+                     col("NAICSCode2"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 95 (Industry2)
+            when(col("Industry2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":95,\n  "value": "'),
+                     col("Industry2"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 96 (HazardGroup2)
+            when(col("HazardGroup2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":96,\n  "value": "'),
+                     col("HazardGroup2"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 97 (PMScore2)
+            when(col("PMScore2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":97,\n  "value": "'),
+                     col("PMScore2").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 98 (ExperienceModificationFactor2)
+            when(col("ExperienceModificationFactor2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":98,\n  "value": "'),
+                     col("ExperienceModificationFactor2").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 99 (Payroll2)
+            when(col("Payroll2").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":99,\n  "value": "'),
+                     col("Payroll2").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 101 (Policy3)
+            when(col("Policy3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":101,\n  "value": "'),
+                     col("Policy3"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 104 (LineOfBusiness3)
+            when(col("LineOfBusiness3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":104,\n  "value": "'),
+                     col("LineOfBusiness3"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 105 (Premium3)
+            when(col("Premium3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":105,\n  "value": "'),
+                     col("Premium3").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 106 (PolicyEffectiveDate3)
+            when(col("PolicyEffectiveDate3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":106,\n  "value": "'),
+                     col("PolicyEffectiveDate3"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 107 (PolicyExpirationDATE3)
+            when(col("PolicyExpirationDATE3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":107,\n  "value": "'),
+                     col("PolicyExpirationDATE3"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 108 (PricingType3)
+            when(col("PricingType3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":108,\n  "value": "'),
+                     col("PricingType3"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 109 (GoverningClassCode3)
+            when(col("GoverningClassCode3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":109,\n  "value": "'),
+                     col("GoverningClassCode3"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 110 (NAICSCode3)
+            when(col("NAICSCode3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":110,\n  "value": "'),
+                     col("NAICSCode3"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 111 (Industry3)
+            when(col("Industry3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":111,\n  "value": "'),
+                     col("Industry3"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 112 (HazardGroup3)
+            when(col("HazardGroup3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":112,\n  "value": "'),
+                     col("HazardGroup3"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 113 (PMScore3)
+            when(col("PMScore3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":113,\n  "value": "'),
+                     col("PMScore3").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 114 (ExperienceModificationFactor3)
+            when(col("ExperienceModificationFactor3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":114,\n  "value": "'),
+                     col("ExperienceModificationFactor3").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 115 (Payroll3)
+            when(col("Payroll3").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":115,\n  "value": "'),
+                     col("Payroll3").cast("string"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 116 (BrandItemID)
+            when(col("BrandItemID").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":116,\n  "value": "'),
+                     col("BrandItemID"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 117 (OperatingCompany)
+            when(col("OperatingCompany").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":117,\n  "value": "'),
+                     col("OperatingCompany"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 118 (PreviousAccountID)
+            when(col("PreviousAccountID").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":118,\n  "value": "'),
+                     col("PreviousAccountID"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 119 (PolicyRegion)
+            when(col("PolicyRegion").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":119,\n  "value": "'),
+                     col("PolicyRegion"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 120 (NewBusinessPolicyFlagFormatted)
+            when(col("NewBusinessPolicyFlagFormatted").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":120,\n  "value": "'),
+                     col("NewBusinessPolicyFlagFormatted"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 121 (AgencyID)
+            when(col("AgencyID").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":121,\n  "value": "'),
+                     col("AgencyID"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 122 (PrimaryContactName)
+            when(col("PrimaryContactName").isNotNull(),
+                 concat(
+                     lit('{\n\n  "Id":122,\n  "value": "'),
+                     col("PrimaryContactName"),
+                     lit('"\n},')
+                 )
+            ).otherwise(lit("")),
+            
+            # Extension Field 123 (PrimaryContactPhone)
+            concat(
+                lit('{\n\n  "Id":123,\n  "value": "'),
+                coalesce(col("PrimaryContactPhone"), lit("Unknown")),
+                lit('"\n},')
+            ),
+            
+            # Extension Field 124 (PrimaryContactEmail)
+            when(col("PrimaryContactEmail").isNotNull() & col("PrimaryContactEmail").contains("@"),
+                 concat(
+                     lit('{\n\n  "Id":124,\n  "value": "'),
+                     col("PrimaryContactEmail"),
+                     lit('"\n},')
+                 )
+            ).otherwise
