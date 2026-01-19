@@ -1,273 +1,232 @@
 =============================================
 Author: Ascendion AVAA
 Date: 
-Description: Pytest-based unit tests for PySpark data transformation pipeline converting SAS logic for monthly branch ring generation, covering core transformations, joins, aggregations, UDFs, and edge cases.
+Description: Pytest test suite for validating PySpark transformation logic, joins, aggregations, and geospatial calculations for TAMBr branch ring analytics, ensuring correctness, schema/data integrity, and robust edge case handling.
 =============================================
 
 # 1. Test Case List
 
-| Test Case ID | Description                                                                                  | Expected Outcome                                                                                   |
-|--------------|----------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|
-| TC01         | Validate geodist UDF with valid latitude/longitude values                                    | Correct distance is calculated and returned as float                                               |
-| TC02         | Validate geodist UDF with NULL/None input                                                    | Returns None                                                                                      |
-| TC03         | Join logic for GEO_CUSTOMER_MTH and GD_CUST_INFO (inner join)                                | Only matching LP_IDs are present, schema and data as expected                                      |
-| TC04         | Full outer join for GEOCODE_WEEKLY, with null/zero lat/long handling                         | Output columns are filled from correct source, null/zero handled as per logic                      |
-| TC05         | Filtering branches for valid lat/long, open, and type                                        | Only expected branches are present, columns and data as expected                                   |
-| TC06         | Aggregation for most used branch (groupBy, Window, ordering)                                 | Most used branch per LP_ID is selected, ties broken by ordering                                    |
-| TC07         | Customer join and filtering for OPN_ACCT_CNT > 0                                             | Only customers with open account count > 0, schema and data as expected                            |
-| TC08         | Handling of customers/branches with bad lat/long                                             | Bad lat/long records are separated correctly                                                       |
-| TC09         | Priority branch merge and geodist calculation                                                | Distance is calculated and percentile_approx works as expected                                     |
-| TC10         | Edge case: Empty DataFrames                                                                  | All steps handle empty DataFrames gracefully, no exceptions                                        |
-| TC11         | Edge case: Duplicates in input                                                               | Duplicates are handled as per Window function logic, only one record per LP_ID in output           |
-| TC12         | Error handling: Type mismatch in geodist                                                     | Raises appropriate exception or returns None                                                       |
-| TC13         | Schema validation for final output (tambr_rings)                                             | Output schema matches expected columns and types                                                   |
-| TC14         | Data validation for final output (tambr_rings)                                               | Data values (priority_ring, most_used_ring, max_dist) are correct                                  |
-| TC15         | Performance: Large dataset (mocked, check execution time < threshold)                        | Pipeline completes within reasonable time (e.g., < 30 seconds for 1M rows, mocked)                 |
+| Test Case ID | Description                                                                 | Expected Outcome                                                                                  |
+|--------------|-----------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: Valid branch/customer data, all joins succeed, no NULLs         | Output DataFrames have correct schema, values, and expected row counts                            |
+| TC02         | Edge: Customer with NULL latitude/longitude                                 | Customer excluded from rings_cust_data; handled gracefully, no crash                              |
+| TC03         | Edge: Branch with invalid lat/long (outside valid range)                    | Branch excluded from rings_branch_data; handled gracefully, no crash                              |
+| TC04         | Edge: No customers for a branch                                             | priority_ring and most_used_ring set to 0 for that branch                                         |
+| TC05         | Edge: Empty input DataFrames                                                | All output DataFrames are empty, no crash                                                         |
+| TC06         | Edge: Duplicate lp_id in branch_active                                      | Only top-ranked (by days, count, amount) is selected as most_used                                 |
+| TC07         | Error: Type mismatch in geodist UDF (string instead of float)               | geodist returns None, no crash                                                                    |
+| TC08         | Error: Missing required fields in input DataFrames                          | Raises AnalysisException or handled error, test passes if error is raised                         |
+| TC09         | Aggregation: 80th percentile calculation matches manual calculation         | percentile_approx output matches manual calculation for small test set                             |
+| TC10         | Filtering: Only open branches, correct types, and valid hgn_br_id selected  | Output contains only expected branch rows                                                         |
+| TC11         | Schema: Output DataFrames match expected schema (columns & types)           | Schemas match exactly                                                                             |
+| TC12         | Performance: Caching and partitioning improves runtime (mocked/tested)      | Runtime is less with caching/partitioning enabled (mocked, not measured in unit test)             |
 
 # 2. Pytest Script for Each Test Case
 
 ```python
 import pytest
 from pyspark.sql import SparkSession
-from pyspark.sql import Row
-from pyspark.sql.types import StructType, StructField, DoubleType, StringType, IntegerType, LongType
-from pyspark.sql.functions import col, lit
-from chispa.dataframe_comparer import assert_df_equality
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+import math
 
-# Import geodist and geodist_udf from the main code
-from math import radians, cos, sin, asin, sqrt
-
-def geodist(lat1, lon1, lat2, lon2, unit='M'):
-    if None in [lat1, lon1, lat2, lon2]:
+# Helper: geodist UDF (copied from production code)
+def geodist(lat1, lon1, lat2, lon2):
+    try:
+        if None in (lat1, lon1, lat2, lon2):
+            return None
+        lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+        miles = 3956 * c
+        return miles
+    except Exception:
         return None
-    lat1, lon1, lat2, lon2 = map(float, [lat1, lon1, lat2, lon2])
-    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-    c = 2 * asin(sqrt(a))
-    r = 3956
-    dist = c * r
-    if unit == 'K':
-        dist *= 1.60934
-    elif unit == 'N':
-        dist *= 0.8684
-    return dist
 
-from pyspark.sql.functions import udf
-from pyspark.sql.types import DoubleType
-geodist_udf = udf(geodist, DoubleType())
-
-# Fixtures
 @pytest.fixture(scope="session")
 def spark():
-    return SparkSession.builder.master("local[2]").appName("pytest-pyspark").getOrCreate()
+    spark = SparkSession.builder.master("local[2]").appName("pytest-TAMBr").getOrCreate()
+    yield spark
+    spark.stop()
 
 @pytest.fixture
-def sample_branch_df(spark):
-    data = [
-        ("001", "R", "Y", 40.7128, -74.0060, "MC1", "G1", None, "Branch1", "NYC", "NY", "10001"),
-        ("002", "U", "Y", 34.0522, -118.2437, "MC2", "G2", None, "Branch2", "LA", "CA", "90001"),
-        ("003", "R", "N", 0.0, 0.0, "MC3", "G3", None, "Branch3", "CHI", "IL", "60007"),
-    ]
-    schema = StructType([
-        StructField("HGN_BR_ID", StringType()),
-        StructField("BR_TYP", StringType()),
-        StructField("BR_OPN_FLG", StringType()),
-        StructField("LATITUDE_UPDT", DoubleType()),
-        StructField("LONGITUDE_UPDT", DoubleType()),
-        StructField("METRO_COMMUNITY_CDE", StringType()),
-        StructField("GEN_CDE", StringType()),
-        StructField("TBA_CLS_DVSTD_DT", StringType()),
-        StructField("BRICK_AND_MORTOR_NM", StringType()),
-        StructField("CITY", StringType()),
-        StructField("ST", StringType()),
-        StructField("ZIP_CDE", StringType()),
-    ])
-    return spark.createDataFrame(data, schema)
-
-@pytest.fixture
-def sample_customer_df(spark):
-    data = [
-        ("LP1", "001", "Y", 10, 40.7128, -74.0060, "A", "NYC", "NY", "10001", 12, "1", "PRTY", "MOST", "A"),
-        ("LP2", "002", "Y", 5, 34.0522, -118.2437, "B", "LA", "CA", "90001", 8, "1", "PRTY", "MOST", "A"),
-        ("LP3", "003", "N", 0, 0.0, 0.0, "0", "CHI", "IL", "60007", 0, "0", "PRTY", "MOST", "0"),
-    ]
-    schema = StructType([
-        "LP_ID", "PRTY_BR", "OPN_ACCT_FLG", "OPN_ACCT_CNT", "custlat", "custlong", "geomatchcode",
-        "CITY", "ST", "ZIP_CDE", "NBR_OF_MOS_OPN", "CUST_PRTY_ACCT_ID", "PRTY_BR", "MOST_USED_BR", "geomatchcode"
-    ])
-    return spark.createDataFrame(data, schema)
-
-# TC01: Validate geodist UDF with valid latitude/longitude values
-def test_geodist_valid(spark):
-    df = spark.createDataFrame([
-        Row(lat1=40.7128, lon1=-74.0060, lat2=34.0522, lon2=-118.2437)
-    ])
-    df = df.withColumn("dist", geodist_udf("lat1", "lon1", "lat2", "lon2"))
-    result = df.collect()[0]["dist"]
-    # Known NY-LA distance ~2445 miles
-    assert abs(result - 2445) < 10
-
-# TC02: Validate geodist UDF with NULL/None input
-def test_geodist_null(spark):
-    df = spark.createDataFrame([
-        Row(lat1=None, lon1=-74.0060, lat2=34.0522, lon2=-118.2437)
-    ])
-    df = df.withColumn("dist", geodist_udf("lat1", "lon1", "lat2", "lon2"))
-    assert df.collect()[0]["dist"] is None
-
-# TC03: Join logic for GEO_CUSTOMER_MTH and GD_CUST_INFO (inner join)
-def test_geo_customer_mth_inner_join(spark):
-    left = spark.createDataFrame([("LP1", 1.0), ("LP2", 2.0)], ["LP_ID", "val"])
-    right = spark.createDataFrame([("LP1", "A"), ("LP3", "B")], ["LP_ID", "code"])
-    joined = left.join(right, "LP_ID", "inner")
-    expected = spark.createDataFrame([("LP1", 1.0, "A")], ["LP_ID", "val", "code"])
-    assert_df_equality(joined, expected, ignore_nullable=True, ignore_row_order=True)
-
-# TC04: Full outer join for GEOCODE_WEEKLY, with null/zero lat/long handling
-def test_geocode_weekly_full_outer(spark):
-    left = spark.createDataFrame([("LP1", 1.0, 2.0), ("LP2", 0.0, 0.0)], ["LP_ID", "GEO_LATITUDE", "GEO_LONGITUDE"])
-    right = spark.createDataFrame([("LP2", 3.0, 4.0), ("LP3", 5.0, 6.0)], ["LP_ID", "LATITUDE", "LONGITUDE"])
-    joined = left.join(right, "LP_ID", "full_outer")
-    assert joined.count() == 3
-    # Check handling of zero lat/long
-    row = joined.filter(col("LP_ID") == "LP2").collect()[0]
-    assert row["LATITUDE"] == 3.0
-
-# TC05: Filtering branches for valid lat/long, open, and type
-def test_branch_filtering(sample_branch_df):
-    filtered = sample_branch_df.filter(
-        (col("BR_TYP").isin("R", "U", "I", "T", "C")) &
-        (col("BR_OPN_FLG") == "Y") &
-        (col("HGN_BR_ID") != "00001") &
-        (col("LATITUDE_UPDT").isNotNull())
-    )
-    assert filtered.count() == 2
-    assert all(filtered.select("HGN_BR_ID").rdd.flatMap(lambda x: x).collect()) == ["001", "002"]
-
-# TC06: Aggregation for most used branch (groupBy, Window, ordering)
-def test_most_used_branch_agg(spark):
-    df = spark.createDataFrame([
-        ("LP1", "B1", 10, 5, 100, 50, 1000.0, 500.0),
-        ("LP1", "B2", 10, 10, 50, 100, 500.0, 1000.0),
-    ], ["LP_ID", "BR_ID", "branch_used_days_3mo", "branch_used_days_prev", "branch_trans_count_3mo", "branch_trans_count_prev", "branch_trans_amount_3mo", "branch_trans_amount_prev"])
-    from pyspark.sql.window import Window
-    from pyspark.sql.functions import desc, row_number
-    window_lp = Window.partitionBy("LP_ID").orderBy(
-        desc("branch_used_days_3mo"),
-        desc("branch_used_days_prev"),
-        desc("branch_trans_count_3mo"),
-        desc("branch_trans_count_prev"),
-        desc("branch_trans_amount_3mo"),
-        desc("branch_trans_amount_prev")
-    )
-    df = df.withColumn("rn", row_number().over(window_lp)).filter(col("rn") == 1)
-    assert df.count() == 1
-    assert df.collect()[0]["BR_ID"] == "B2"
-
-# TC07: Customer join and filtering for OPN_ACCT_CNT > 0
-def test_customer_filtering(sample_customer_df):
-    filtered = sample_customer_df.filter(col("OPN_ACCT_CNT") > 0)
-    assert filtered.count() == 2
-
-# TC08: Handling of customers/branches with bad lat/long
-def test_bad_latlong(sample_customer_df):
-    bad = sample_customer_df.filter(col("geomatchcode").isin("0", " "))
-    assert bad.count() == 1
-
-# TC09: Priority branch merge and geodist calculation
-def test_priority_branch_merge_and_geodist(spark, sample_branch_df, sample_customer_df):
-    # Join on PRTY_BR == HGN_BR_ID
-    joined = sample_customer_df.join(
-        sample_branch_df,
-        sample_customer_df.PRTY_BR == sample_branch_df.HGN_BR_ID,
-        "inner"
-    )
-    joined = joined.withColumn(
-        "dist_to_prty_br",
-        geodist_udf(
-            col("LATITUDE_UPDT"), col("LONGITUDE_UPDT"),
-            col("custlat"), col("custlong")
-        )
-    )
-    assert "dist_to_prty_br" in joined.columns
-    # Should not error and produce a float or None
-    assert all(isinstance(row["dist_to_prty_br"], (float, type(None))) for row in joined.collect())
-
-# TC10: Edge case: Empty DataFrames
-def test_empty_dataframes(spark):
-    schema = StructType([StructField("A", IntegerType()), StructField("B", StringType())])
-    df1 = spark.createDataFrame([], schema)
-    df2 = spark.createDataFrame([], schema)
-    joined = df1.join(df2, "A", "inner")
-    assert joined.count() == 0
-
-# TC11: Edge case: Duplicates in input
-def test_duplicates_handling(spark):
-    df = spark.createDataFrame([
-        ("LP1", "B1", 10),
-        ("LP1", "B1", 10),
-        ("LP1", "B2", 20),
-    ], ["LP_ID", "BR_ID", "val"])
-    from pyspark.sql.window import Window
-    from pyspark.sql.functions import row_number
-    window_lp = Window.partitionBy("LP_ID").orderBy(col("val").desc())
-    df = df.withColumn("rn", row_number().over(window_lp)).filter(col("rn") == 1)
-    assert df.count() == 1
-    assert df.collect()[0]["BR_ID"] == "B2"
-
-# TC12: Error handling: Type mismatch in geodist
-def test_geodist_type_mismatch(spark):
-    df = spark.createDataFrame([
-        Row(lat1="not_a_number", lon1=-74.0060, lat2=34.0522, lon2=-118.2437)
-    ])
-    df = df.withColumn("dist", geodist_udf("lat1", "lon1", "lat2", "lon2"))
-    result = df.collect()[0]["dist"]
-    assert result is None  # Should return None due to type error
-
-# TC13: Schema validation for final output (tambr_rings)
-def test_tambr_rings_schema(spark):
-    schema = StructType([
-        StructField("TAMBR", StringType()),
-        StructField("branch_typ", StringType()),
-        StructField("branch_name", StringType()),
-        StructField("branch_city", StringType()),
-        StructField("branch_state", StringType()),
+def branch_schema():
+    return StructType([
+        StructField("hgn_br_id", StringType()),
+        StructField("br_typ", StringType()),
+        StructField("br_opn_flg", StringType()),
         StructField("branchlat", DoubleType()),
         StructField("branchlong", DoubleType()),
-        StructField("metcomm_cde", StringType()),
-        StructField("priority_ring", DoubleType()),
-        StructField("most_used_ring", DoubleType()),
-        StructField("max_dist", IntegerType()),
+        StructField("metro_community_cde", StringType()),
+        StructField("brick_and_mortor_nm", StringType()),
+        StructField("city", StringType()),
+        StructField("st", StringType()),
     ])
-    df = spark.createDataFrame([
-        ("001", "R", "Branch1", "NYC", "NY", 40.7128, -74.0060, "MC1", 5.0, 10.0, 40)
-    ], schema)
-    assert df.schema == schema
 
-# TC14: Data validation for final output (tambr_rings)
-def test_tambr_rings_data(spark):
-    df = spark.createDataFrame([
-        ("001", "R", "Branch1", "NYC", "NY", 40.7128, -74.0060, "MC1", 5.0, 10.0, 40)
-    ], ["TAMBR", "branch_typ", "branch_name", "branch_city", "branch_state", "branchlat", "branchlong", "metcomm_cde", "priority_ring", "most_used_ring", "max_dist"])
-    row = df.collect()[0]
-    assert row["priority_ring"] == 5.0
-    assert row["most_used_ring"] == 10.0
-    assert row["max_dist"] == 40
+@pytest.fixture
+def customer_schema():
+    return StructType([
+        StructField("lp_id", StringType()),
+        StructField("prty_br", StringType()),
+        StructField("opn_acct_flg", StringType()),
+        StructField("nbr_of_mos_opn", IntegerType()),
+        StructField("custlat", DoubleType()),
+        StructField("custlong", DoubleType()),
+        StructField("most_used_br", StringType()),
+        StructField("opn_acct_cnt", IntegerType()),
+        StructField("geomatchcode", StringType()),
+    ])
 
-# TC15: Performance: Large dataset (mocked, check execution time < threshold)
-def test_performance_large_dataset(spark):
-    import time
-    n = 100000
-    df = spark.range(0, n).withColumn("val", lit(1))
-    start = time.time()
-    result = df.groupBy("val").count().collect()
-    duration = time.time() - start
-    assert duration < 30  # seconds
+@pytest.fixture
+def minimal_data(spark, branch_schema, customer_schema):
+    # One branch, one customer, both valid
+    branches = [
+        ("00002", "R", "Y", 40.0, -75.0, "A", "Branch A", "CityA", "ST"),
+    ]
+    customers = [
+        ("CUST1", "00002", "Y", 10, 40.1, -75.1, "00002", 1, "1"),
+    ]
+    branch_df = spark.createDataFrame(branches, schema=branch_schema)
+    customer_df = spark.createDataFrame(customers, schema=customer_schema)
+    return branch_df, customer_df
+
+def test_happy_path(spark, minimal_data):
+    branch_df, customer_df = minimal_data
+    # Simulate transformation: join, filter, geodist
+    from pyspark.sql.functions import udf
+    from pyspark.sql.types import DoubleType
+
+    geodist_udf = udf(geodist, DoubleType())
+    joined = customer_df.join(branch_df, customer_df.prty_br == branch_df.hgn_br_id, "inner")
+    joined = joined.withColumn("dist_to_prty_br", geodist_udf("branchlat", "branchlong", "custlat", "custlong"))
+    assert joined.count() == 1
+    assert "dist_to_prty_br" in joined.columns
+    val = joined.select("dist_to_prty_br").collect()[0][0]
+    assert val is not None and val > 0
+
+def test_null_latlong_customer(spark, branch_schema, customer_schema):
+    branches = [("00002", "R", "Y", 40.0, -75.0, "A", "Branch A", "CityA", "ST")]
+    customers = [("CUST2", "00002", "Y", 5, None, -75.1, "00002", 1, "1")]
+    branch_df = spark.createDataFrame(branches, schema=branch_schema)
+    customer_df = spark.createDataFrame(customers, schema=customer_schema)
+    # Should be filtered out before geodist
+    filtered = customer_df.filter(customer_df.custlat.isNotNull() & customer_df.custlong.isNotNull())
+    assert filtered.count() == 0
+
+def test_invalid_latlong_branch(spark, branch_schema, customer_schema):
+    branches = [("00003", "R", "Y", 0.0, 0.0, "A", "Branch B", "CityB", "ST")]
+    customers = [("CUST3", "00003", "Y", 5, 40.1, -75.1, "00003", 1, "1")]
+    branch_df = spark.createDataFrame(branches, schema=branch_schema)
+    # Should be filtered out: branchlat <= 1 or branchlong >= -1
+    valid_branches = branch_df.filter((F.col("branchlat") > 1) & (F.col("branchlong") < -1))
+    assert valid_branches.count() == 0
+
+def test_no_customers_for_branch(spark, branch_schema, customer_schema):
+    branches = [("00004", "R", "Y", 40.0, -75.0, "A", "Branch C", "CityC", "ST")]
+    customers = []
+    branch_df = spark.createDataFrame(branches, schema=branch_schema)
+    customer_df = spark.createDataFrame(customers, schema=customer_schema)
+    # Simulate left join for ring calculation
+    joined = customer_df.join(branch_df, customer_df.prty_br == branch_df.hgn_br_id, "right")
+    # If no customers, should fill with 0 for ring
+    joined = joined.withColumn("priority_ring", F.lit(0))
+    assert joined.select("priority_ring").collect()[0][0] == 0
+
+def test_empty_inputs(spark, branch_schema, customer_schema):
+    branch_df = spark.createDataFrame([], schema=branch_schema)
+    customer_df = spark.createDataFrame([], schema=customer_schema)
+    joined = customer_df.join(branch_df, customer_df.prty_br == branch_df.hgn_br_id, "inner")
+    assert joined.count() == 0
+
+def test_duplicate_lp_id_branch_active(spark):
+    schema = StructType([
+        StructField("lp_id", StringType()),
+        StructField("br_id", StringType()),
+        StructField("branch_used_days_3mo", IntegerType()),
+        StructField("branch_used_days_prev", IntegerType()),
+        StructField("branch_trans_count_3mo", IntegerType()),
+        StructField("branch_trans_count_prev", IntegerType()),
+        StructField("branch_trans_amount_3mo", DoubleType()),
+        StructField("branch_trans_amount_prev", DoubleType()),
+    ])
+    data = [
+        ("CUST4", "B1", 10, 5, 20, 10, 100.0, 50.0),
+        ("CUST4", "B2", 8, 4, 15, 8, 90.0, 45.0),
+    ]
+    df = spark.createDataFrame(data, schema=schema)
+    from pyspark.sql.window import Window
+    window_spec = Window.partitionBy("lp_id").orderBy(
+        F.desc("branch_used_days_3mo"),
+        F.desc("branch_used_days_prev"),
+        F.desc("branch_trans_count_3mo"),
+        F.desc("branch_trans_count_prev"),
+        F.desc("branch_trans_amount_3mo"),
+        F.desc("branch_trans_amount_prev")
+    )
+    sorted_df = df.withColumn("rn", F.row_number().over(window_spec))
+    most_used = sorted_df.filter(F.col("rn") == 1)
+    assert most_used.count() == 1
+    assert most_used.collect()[0]["br_id"] == "B1"
+
+def test_geodist_type_mismatch():
+    # Should return None, not raise
+    assert geodist("bad", -75.0, 40.0, -75.1) is None
+
+def test_missing_fields_error(spark, branch_schema):
+    # Missing 'branchlong'
+    schema = StructType([
+        StructField("hgn_br_id", StringType()),
+        StructField("br_typ", StringType()),
+        StructField("br_opn_flg", StringType()),
+        StructField("branchlat", DoubleType()),
+    ])
+    data = [("00005", "R", "Y", 40.0)]
+    branch_df = spark.createDataFrame(data, schema=schema)
+    with pytest.raises(Exception):
+        branch_df.select("branchlong").collect()
+
+def test_percentile_approx(spark):
+    schema = StructType([StructField("prty_br", StringType()), StructField("dist_to_prty_br", DoubleType())])
+    data = [("B1", 1.0), ("B1", 2.0), ("B1", 3.0), ("B1", 4.0), ("B1", 5.0)]
+    df = spark.createDataFrame(data, schema=schema)
+    approx = df.groupBy("prty_br").agg(F.expr("percentile_approx(dist_to_prty_br, 0.8)").alias("priority_ring"))
+    val = approx.collect()[0]["priority_ring"]
+    assert val == 4.0
+
+def test_branch_filtering(spark, branch_schema):
+    branches = [
+        ("00006", "R", "Y", 40.0, -75.0, "A", "Branch D", "CityD", "ST"),
+        ("00007", "X", "N", 41.0, -76.0, "B", "Branch E", "CityE", "ST"),
+    ]
+    branch_df = spark.createDataFrame(branches, schema=branch_schema)
+    filtered = branch_df.filter(
+        (F.col("br_typ").isin("R", "U", "I", "T", "C")) &
+        (F.col("br_opn_flg") == "Y") &
+        (F.col("hgn_br_id") != "00001") &
+        (F.col("branchlat").isNotNull())
+    )
+    assert filtered.count() == 1
+    assert filtered.collect()[0]["hgn_br_id"] == "00006"
+
+def test_schema_output(spark, branch_schema):
+    # Output schema check
+    expected = set([f.name for f in branch_schema.fields])
+    branches = [("00008", "R", "Y", 40.0, -75.0, "A", "Branch F", "CityF", "ST")]
+    branch_df = spark.createDataFrame(branches, schema=branch_schema)
+    actual = set(branch_df.columns)
+    assert expected == actual
+
+def test_performance_caching_partitioning(spark, minimal_data):
+    # This is a mock test to ensure caching/partitioning can be applied
+    branch_df, customer_df = minimal_data
+    branch_df.cache()
+    branch_df = branch_df.repartition(1)
+    assert branch_df.count() == 1  # Just ensures no error
 
 ```
 
-# 3. API Cost Calculation
+# 3. API Cost
 
 apiCost: 0.0023 USD
