@@ -1,0 +1,769 @@
+```python
+import os
+import pyodbc
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, coalesce, expr, lit, when, row_number, desc
+from pyspark.sql.window import Window
+from pyspark.sql.types import StringType, IntegerType, DoubleType, DateType
+import json
+from datetime import datetime, timedelta
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configuration
+class Config:
+    # SQL Server connection details
+    SQL_SERVER = "your_sql_server"
+    SQL_DATABASE = "IntegrationsMart"
+    SQL_USERNAME = "your_username"
+    SQL_PASSWORD = "your_password"
+    SQL_DRIVER = "ODBC Driver 17 for SQL Server"
+    
+    # File paths
+    TEMP_DATA_PATH = "/tmp/account_data"
+    HDFS_DATA_PATH = "/data/account_data"
+    
+    # Spark configuration
+    SPARK_MASTER = "yarn"
+    SPARK_APP_NAME = "Account_Data_Reconciliation"
+    
+    # Loop instance to process
+    LOOP_INSTANCE = 0
+
+def get_sql_connection():
+    """Establish connection to SQL Server"""
+    try:
+        conn_str = f"DRIVER={Config.SQL_DRIVER};SERVER={Config.SQL_SERVER};DATABASE={Config.SQL_DATABASE};UID={Config.SQL_USERNAME};PWD={Config.SQL_PASSWORD}"
+        return pyodbc.connect(conn_str)
+    except Exception as e:
+        logger.error(f"Failed to connect to SQL Server: {str(e)}")
+        raise
+
+def execute_sql_procedure(conn, loop_instance):
+    """Execute the SQL stored procedure and return results as DataFrame"""
+    try:
+        logger.info(f"Executing SQL procedure for loop instance {loop_instance}")
+        cursor = conn.cursor()
+        cursor.execute(f"EXEC [RCT].[uspAPIPatchAccount] @LoopInstance = {loop_instance}")
+        
+        # Get column names
+        columns = [column[0] for column in cursor.description]
+        
+        # Fetch all rows
+        rows = cursor.fetchall()
+        
+        # Convert to DataFrame
+        df = pd.DataFrame.from_records(rows, columns=columns)
+        logger.info(f"SQL procedure returned {len(df)} rows")
+        return df
+    except Exception as e:
+        logger.error(f"Error executing SQL procedure: {str(e)}")
+        raise
+
+def save_to_temp_location(df, file_path):
+    """Save DataFrame to temporary location"""
+    try:
+        logger.info(f"Saving data to temporary location: {file_path}")
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        df.to_csv(file_path, index=False)
+        logger.info(f"Data saved successfully to {file_path}")
+    except Exception as e:
+        logger.error(f"Error saving data to temp location: {str(e)}")
+        raise
+
+def copy_to_hdfs(local_path, hdfs_path):
+    """Copy file from local filesystem to HDFS"""
+    try:
+        logger.info(f"Copying data from {local_path} to HDFS: {hdfs_path}")
+        os.system(f"hadoop fs -mkdir -p {os.path.dirname(hdfs_path)}")
+        os.system(f"hadoop fs -put -f {local_path} {hdfs_path}")
+        logger.info(f"Data copied successfully to HDFS")
+    except Exception as e:
+        logger.error(f"Error copying data to HDFS: {str(e)}")
+        raise
+
+def create_spark_session():
+    """Create and return a Spark session"""
+    try:
+        logger.info("Creating Spark session")
+        spark = SparkSession.builder \
+            .master(Config.SPARK_MASTER) \
+            .appName(Config.SPARK_APP_NAME) \
+            .config("spark.sql.legacy.timeParserPolicy", "LEGACY") \
+            .getOrCreate()
+        return spark
+    except Exception as e:
+        logger.error(f"Error creating Spark session: {str(e)}")
+        raise
+
+def process_with_pyspark(spark, hdfs_path, loop_instance):
+    """Process data using PySpark equivalent of the T-SQL procedure"""
+    try:
+        logger.info(f"Processing data with PySpark for loop instance {loop_instance}")
+        
+        # Current date minus 1 day
+        current_date = datetime.now() - timedelta(days=1)
+        
+        # Load account data
+        account_df = spark.table("RCT.Account")
+        
+        # Create NationalAccts DataFrame
+        national_accts_df = spark.sql("""
+            SELECT DISTINCT AccountNumber 
+            FROM EDSMART.Semantic.PolicyDescriptors
+            WHERE NationalAccountFlag = 1
+            AND ExpirationDate > current_timestamp() - INTERVAL 1 DAY
+        """)
+        
+        # Create InForceListCode DataFrame
+        inforce_list_code_data = [
+            ("2443", "inforce"),
+            ("2341", "propsect"),
+            ("2325", "inactive")
+        ]
+        inforce_list_schema = ["ItemID", "ItemCode"]
+        inforce_list_df = spark.createDataFrame(inforce_list_code_data, inforce_list_schema)
+        
+        # Create BrandCode DataFrame
+        brand_code_data = [
+            ("2533", "Accident Fund"),
+            ("2536", "Third Coast Underwriters"),
+            ("2534", "AF Specialty"),
+            ("2535", "United Heartland"),
+            ("2537", "CompWest")
+        ]
+        brand_code_schema = ["ItemID", "ItemCode"]
+        brand_code_df = spark.createDataFrame(brand_code_data, brand_code_schema)
+        
+        # Filter account data
+        filtered_account_df = account_df.filter(
+            (col("PostPatch") == "Patch") & 
+            col("Validated").isNull() & 
+            col("DateSent").isNull() & 
+            (col("SubmissionFlag") == 0)
+        )
+        
+        # Join with NationalAccts
+        account_with_national = filtered_account_df.join(
+            national_accts_df,
+            filtered_account_df["ContactNumber"] == national_accts_df["AccountNumber"],
+            "left"
+        )
+        
+        # Join with InForceListCode
+        account_with_inforce = account_with_national.join(
+            inforce_list_df,
+            account_with_national["AccountStatus"] == inforce_list_df["ItemCode"],
+            "left"
+        ).withColumnRenamed("ItemID", "InForceItemID")
+        
+        # Join with BrandCode
+        account_with_brand = account_with_inforce.join(
+            brand_code_df,
+            account_with_inforce["Brand"] == brand_code_df["ItemCode"],
+            "left"
+        ).withColumnRenamed("ItemID", "BrandItemID")
+        
+        # Join with AccountID
+        account_id_df = spark.table("RCT.AccountID")
+        account_with_id = account_with_brand.join(
+            account_id_df,
+            account_with_brand["ContactNumber"] == account_id_df["ContactNumber"],
+            "left"
+        ).withColumnRenamed("AccountID", "MappedAccountID")
+        
+        # Join with IdOverride
+        id_override_df = spark.table("RCT.IdOverride").filter(col("ObjectType") == "Account")
+        account_with_override = account_with_id.join(
+            id_override_df,
+            account_with_id["ExternalUniqueId"] == id_override_df["ExternalUniqueID"],
+            "left"
+        )
+        
+        # Calculate AccountID
+        account_with_override = account_with_override.withColumn(
+            "AccountID", 
+            coalesce(col("MappedAccountID"), col("RCT_ID"))
+        )
+        
+        # Calculate LoopInstance
+        window_spec = Window.orderBy("ContactNumber")
+        account_with_override = account_with_override.withColumn(
+            "RowNum", 
+            row_number().over(window_spec)
+        ).withColumn(
+            "LoopInstance", 
+            ((col("RowNum") - 1) / 250).cast("int")
+        )
+        
+        # Calculate UnderwriterId - NULL for national accounts
+        account_with_override = account_with_override.withColumn(
+            "UnderwriterId",
+            when(col("AccountNumber").isNotNull(), None).otherwise(col("UnderwriterId"))
+        )
+        
+        # Calculate ExternalUniqueId for field 167
+        account_with_override = account_with_override.withColumn(
+            "ExternalUniqueIdFormatted",
+            when(expr("length(ExternalUniqueId)") > 15, 
+                 expr("regexp_replace(ContactNumber, 'AF', '')"))
+            .otherwise(expr("regexp_replace(ExternalUniqueId, 'AF', '')"))
+        )
+        
+        # Calculate NewBusinessPolicyFlag for field 120
+        account_with_override = account_with_override.withColumn(
+            "NewBusinessPolicyFlagFormatted",
+            when(col("NewBusinessPolicyFlag") == 1, "2444").otherwise("2445")
+        )
+        
+        # Filter by LoopInstance
+        final_df = account_with_override.filter(col("LoopInstance") == loop_instance)
+        
+        # Generate JSON message
+        final_df = final_df.withColumn(
+            "JSON_Message",
+            generate_json_message(
+                col("UnderwriterId"), col("MailingAddressProvinceId"), col("MailingAddressAddressLine"),
+                col("MailingAddressCity"), col("MailingAddressPostalCode"), col("MailingAddressLongitude"),
+                col("MailingAddressLatitude"), col("MailingAddressCounty"), col("Name"),
+                col("BusinessPhone"), col("FaxPhone"), col("EmailAddress"), col("Notes"),
+                col("ContactNumber"), col("InForceItemID"), col("BDCName"), col("UnderwriterEmail"),
+                col("OnBaseLink"), col("Policy1"), col("LineOfBusiness1"), col("Premium1"),
+                col("PolicyEffectiveDate1"), col("PolicyExpirationDATE1"), col("PricingType1"),
+                col("GoverningClassCode1"), col("NAICSCode1"), col("Industry1"), col("HazardGroup1"),
+                col("PMScore1"), col("ExperienceModificationFactor1"), col("Payroll1"), col("Policy2"),
+                col("LineOfBusiness2"), col("Premium2"), col("PolicyEffectiveDate2"), col("PolicyExpirationDATE2"),
+                col("PricingType2"), col("GoverningClassCode2"), col("NAICSCode2"), col("Industry2"),
+                col("HazardGroup2"), col("PMScore2"), col("ExperienceModificationFactor2"), col("Payroll2"),
+                col("Policy3"), col("LineOfBusiness3"), col("Premium3"), col("PolicyEffectiveDate3"),
+                col("PolicyExpirationDATE3"), col("PricingType3"), col("GoverningClassCode3"),
+                col("NAICSCode3"), col("Industry3"), col("HazardGroup3"), col("PMScore3"),
+                col("ExperienceModificationFactor3"), col("Payroll3"), col("BrandItemID"),
+                col("OperatingCompany"), col("PreviousAccountID"), col("PolicyRegion"),
+                col("NewBusinessPolicyFlagFormatted"), col("AgencyID"), col("PrimaryContactName"),
+                col("PrimaryContactPhone"), col("ExternalUniqueIdFormatted"), col("WrittenLossRatio")
+            )
+        )
+        
+        # Select final columns
+        result_df = final_df.select(
+            "AccountID", "ContactNumber", "SubmissionFlag", "LoopInstance", "JSON_Message"
+        )
+        
+        return result_df
+    except Exception as e:
+        logger.error(f"Error processing data with PySpark: {str(e)}")
+        raise
+
+def generate_json_message(underwriter_id, mailing_province_id, mailing_address_line, mailing_city, 
+                         mailing_postal_code, mailing_longitude, mailing_latitude, mailing_county,
+                         name, phone, fax, email, notes, contact_number, inforce_item_id, bdc_name,
+                         underwriter_email, onbase_link, policy1, line_of_business1, premium1,
+                         policy_effective_date1, policy_expiration_date1, pricing_type1,
+                         governing_class_code1, naics_code1, industry1, hazard_group1,
+                         pm_score1, experience_mod_factor1, payroll1, policy2,
+                         line_of_business2, premium2, policy_effective_date2, policy_expiration_date2,
+                         pricing_type2, governing_class_code2, naics_code2, industry2,
+                         hazard_group2, pm_score2, experience_mod_factor2, payroll2,
+                         policy3, line_of_business3, premium3, policy_effective_date3,
+                         policy_expiration_date3, pricing_type3, governing_class_code3,
+                         naics_code3, industry3, hazard_group3, pm_score3,
+                         experience_mod_factor3, payroll3, brand_item_id,
+                         operating_company, previous_account_id, policy_region,
+                         new_business_policy_flag, agency_id, primary_contact_name,
+                         primary_contact_phone, external_unique_id, written_loss_ratio):
+    """Generate JSON message for API PATCH operations"""
+    
+    # Start building the JSON message
+    json_parts = ["["]
+    
+    # Add UnderwriterId if not NULL
+    if underwriter_id is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/UnderwriterId",
+  "value": "{underwriter_id}"
+}},""")
+    
+    # Add MailingAddress.ProvinceID if not NULL
+    if mailing_province_id is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/MailingAddress/ProvinceID",
+  "value": "{mailing_province_id}"
+}},""")
+    
+    # Add MailingAddress.AddressLine if not NULL
+    if mailing_address_line is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/MailingAddress/AddressLine",
+  "value": "{mailing_address_line}"
+}},""")
+    
+    # Add MailingAddress.City if not NULL
+    if mailing_city is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/MailingAddress/City",
+  "value": "{mailing_city}"
+}},""")
+    
+    # Add MailingAddress.PostalCode if not NULL
+    if mailing_postal_code is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/MailingAddress/PostalCode",
+  "value": "{mailing_postal_code}"
+}},""")
+    
+    # Add MailingAddress.Longitude if not NULL
+    if mailing_longitude is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/MailingAddress/Longitude",
+  "value": "{mailing_longitude}"
+}},""")
+    
+    # Add MailingAddress.Latitude if not NULL
+    if mailing_latitude is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/MailingAddress/Latitude",
+  "value": "{mailing_latitude}"
+}},""")
+    
+    # Add MailingAddress.County if not NULL
+    if mailing_county is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/MailingAddress/County",
+  "value": "{mailing_county}"
+}},""")
+    
+    # Add Name if not NULL
+    if name is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/Name",
+  "value": "{name}"
+}},""")
+    
+    # Add Phone if not NULL
+    if phone is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/Phone",
+  "value": "{phone}"
+}},""")
+    
+    # Add Fax if not NULL
+    if fax is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/Fax",
+  "value": "{fax}"
+}},""")
+    
+    # Add Email if not NULL and contains @
+    if email is not None and '@' in email:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/Email",
+  "value": "{email}"
+}},""")
+    
+    # Add Notes if not NULL
+    if notes is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/Notes",
+  "value": "{notes}"
+}},""")
+    
+    # Add ContactNumber if not NULL
+    if contact_number is not None:
+        json_parts.append(f"""
+{{
+  "op": "replace",
+  "path": "/ContactNumber",
+  "value": "{contact_number}"
+}},""")
+    
+    # Add ExtensionFields section
+    json_parts.append("""
+{
+      "op": "replace",
+      "path": "/ExtensionFields",
+      "value": [
+""")
+    
+    # Add Extension Field 11 (InForceItemID)
+    if inforce_item_id is not None:
+        json_parts.append(f"""{{
+  "Id":11,
+  "value": "{inforce_item_id}"
+}},""")
+    
+    # Add Extension Field 37 (BDCName)
+    if bdc_name is not None:
+        json_parts.append(f"""{{
+  "Id":37,
+  "value": "{bdc_name}"
+}},""")
+    
+    # Add Extension Field 40 (UnderwriterEmail)
+    if underwriter_email is not None and '@' in underwriter_email:
+        json_parts.append(f"""{{
+  "Id":40,
+  "value": "{underwriter_email}"
+}},""")
+    
+    # Add Extension Field 67 (OnBaseLink)
+    if onbase_link is not None:
+        json_parts.append(f"""{{
+  "Id":67,
+  "value": "{onbase_link}"
+}},""")
+    
+    # Add Extension Field 69 (Policy1)
+    if policy1 is not None:
+        json_parts.append(f"""{{
+  "Id":69,
+  "value": "{policy1}"
+}},""")
+    
+    # Add Extension Field 72 (LineOfBusiness1)
+    if line_of_business1 is not None:
+        json_parts.append(f"""{{
+  "Id":72,
+  "value": "{line_of_business1}"
+}},""")
+    
+    # Add Extension Field 73 (Premium1)
+    if premium1 is not None:
+        json_parts.append(f"""{{
+  "Id":73,
+  "value": "{premium1}"
+}},""")
+    
+    # Add Extension Field 74 (PolicyEffectiveDate1)
+    if policy_effective_date1 is not None:
+        json_parts.append(f"""{{
+  "Id":74,
+  "value": "{policy_effective_date1}"
+}},""")
+    
+    # Add Extension Field 75 (PolicyExpirationDATE1)
+    if policy_expiration_date1 is not None:
+        json_parts.append(f"""{{
+  "Id":75,
+  "value": "{policy_expiration_date1}"
+}},""")
+    
+    # Add Extension Field 76 (PricingType1)
+    if pricing_type1 is not None:
+        json_parts.append(f"""{{
+  "Id":76,
+  "value": "{pricing_type1}"
+}},""")
+    
+    # Add Extension Field 77 (GoverningClassCode1)
+    if governing_class_code1 is not None:
+        json_parts.append(f"""{{
+  "Id":77,
+  "value": "{governing_class_code1}"
+}},""")
+    
+    # Add Extension Field 78 (NAICSCode1)
+    if naics_code1 is not None:
+        json_parts.append(f"""{{
+  "Id":78,
+  "value": "{naics_code1}"
+}},""")
+    
+    # Add Extension Field 79 (Industry1)
+    if industry1 is not None:
+        json_parts.append(f"""{{
+  "Id":79,
+  "value": "{industry1}"
+}},""")
+    
+    # Add Extension Field 80 (HazardGroup1)
+    if hazard_group1 is not None:
+        json_parts.append(f"""{{
+  "Id":80,
+  "value": "{hazard_group1}"
+}},""")
+    
+    # Add Extension Field 81 (PMScore1)
+    if pm_score1 is not None:
+        json_parts.append(f"""{{
+  "Id":81,
+  "value": "{pm_score1}"
+}},""")
+    
+    # Add Extension Field 82 (ExperienceModificationFactor1)
+    if experience_mod_factor1 is not None:
+        json_parts.append(f"""{{
+  "Id":82,
+  "value": "{experience_mod_factor1}"
+}},""")
+    
+    # Add Extension Field 83 (Payroll1)
+    if payroll1 is not None:
+        json_parts.append(f"""{{
+  "Id":83,
+  "value": "{payroll1}"
+}},""")
+    
+    # Add Extension Field 85 (Policy2)
+    if policy2 is not None:
+        json_parts.append(f"""{{
+  "Id":85,
+  "value": "{policy2}"
+}},""")
+    
+    # Add Extension Field 88 (LineOfBusiness2)
+    if line_of_business2 is not None:
+        json_parts.append(f"""{{
+  "Id":88,
+  "value": "{line_of_business2}"
+}},""")
+    
+    # Add Extension Field 89 (Premium2)
+    if premium2 is not None:
+        json_parts.append(f"""{{
+  "Id":89,
+  "value": "{premium2}"
+}},""")
+    
+    # Add Extension Field 90 (PolicyEffectiveDate2)
+    if policy_effective_date2 is not None:
+        json_parts.append(f"""{{
+  "Id":90,
+  "value": "{policy_effective_date2}"
+}},""")
+    
+    # Add Extension Field 91 (PolicyExpirationDATE2)
+    if policy_expiration_date2 is not None:
+        json_parts.append(f"""{{
+  "Id":91,
+  "value": "{policy_expiration_date2}"
+}},""")
+    
+    # Add Extension Field 92 (PricingType2)
+    if pricing_type2 is not None:
+        json_parts.append(f"""{{
+  "Id":92,
+  "value": "{pricing_type2}"
+}},""")
+    
+    # Add Extension Field 93 (GoverningClassCode2)
+    if governing_class_code2 is not None:
+        json_parts.append(f"""{{
+  "Id":93,
+  "value": "{governing_class_code2}"
+}},""")
+    
+    # Add Extension Field 94 (NAICSCode2)
+    if naics_code2 is not None:
+        json_parts.append(f"""{{
+  "Id":94,
+  "value": "{naics_code2}"
+}},""")
+    
+    # Add Extension Field 95 (Industry2)
+    if industry2 is not None:
+        json_parts.append(f"""{{
+  "Id":95,
+  "value": "{industry2}"
+}},""")
+    
+    # Add Extension Field 96 (HazardGroup2)
+    if hazard_group2 is not None:
+        json_parts.append(f"""{{
+  "Id":96,
+  "value": "{hazard_group2}"
+}},""")
+    
+    # Add Extension Field 97 (PMScore2)
+    if pm_score2 is not None:
+        json_parts.append(f"""{{
+  "Id":97,
+  "value": "{pm_score2}"
+}},""")
+    
+    # Add Extension Field 98 (ExperienceModificationFactor2)
+    if experience_mod_factor2 is not None:
+        json_parts.append(f"""{{
+  "Id":98,
+  "value": "{experience_mod_factor2}"
+}},""")
+    
+    # Add Extension Field 99 (Payroll2)
+    if payroll2 is not None:
+        json_parts.append(f"""{{
+  "Id":99,
+  "value": "{payroll2}"
+}},""")
+    
+    # Add Extension Field 101 (Policy3)
+    if policy3 is not None:
+        json_parts.append(f"""{{
+  "Id":101,
+  "value": "{policy3}"
+}},""")
+    
+    # Add Extension Field 104 (LineOfBusiness3)
+    if line_of_business3 is not None:
+        json_parts.append(f"""{{
+  "Id":104,
+  "value": "{line_of_business3}"
+}},""")
+    
+    # Add Extension Field 105 (Premium3)
+    if premium3 is not None:
+        json_parts.append(f"""{{
+  "Id":105,
+  "value": "{premium3}"
+}},""")
+    
+    # Add Extension Field 106 (PolicyEffectiveDate3)
+    if policy_effective_date3 is not None:
+        json_parts.append(f"""{{
+  "Id":106,
+  "value": "{policy_effective_date3}"
+}},""")
+    
+    # Add Extension Field 107 (PolicyExpirationDATE3)
+    if policy_expiration_date3 is not None:
+        json_parts.append(f"""{{
+  "Id":107,
+  "value": "{policy_expiration_date3}"
+}},""")
+    
+    # Add Extension Field 108 (PricingType3)
+    if pricing_type3 is not None:
+        json_parts.append(f"""{{
+  "Id":108,
+  "value": "{pricing_type3}"
+}},""")
+    
+    # Add Extension Field 109 (GoverningClassCode3)
+    if governing_class_code3 is not None:
+        json_parts.append(f"""{{
+  "Id":109,
+  "value": "{governing_class_code3}"
+}},""")
+    
+    # Add Extension Field 110 (NAICSCode3)
+    if naics_code3 is not None:
+        json_parts.append(f"""{{
+  "Id":110,
+  "value": "{naics_code3}"
+}},""")
+    
+    # Add Extension Field 111 (Industry3)
+    if industry3 is not None:
+        json_parts.append(f"""{{
+  "Id":111,
+  "value": "{industry3}"
+}},""")
+    
+    # Add Extension Field 112 (HazardGroup3)
+    if hazard_group3 is not None:
+        json_parts.append(f"""{{
+  "Id":112,
+  "value": "{hazard_group3}"
+}},""")
+    
+    # Add Extension Field 113 (PMScore3)
+    if pm_score3 is not None:
+        json_parts.append(f"""{{
+  "Id":113,
+  "value": "{pm_score3}"
+}},""")
+    
+    # Add Extension Field 114 (ExperienceModificationFactor3)
+    if experience_mod_factor3 is not None:
+        json_parts.append(f"""{{
+  "Id":114,
+  "value": "{experience_mod_factor3}"
+}},""")
+    
+    # Add Extension Field 115 (Payroll3)
+    if payroll3 is not None:
+        json_parts.append(f"""{{
+  "Id":115,
+  "value": "{payroll3}"
+}},""")
+    
+    # Add Extension Field 116 (BrandItemID)
+    if brand_item_id is not None:
+        json_parts.append(f"""{{
+  "Id":116,
+  "value": "{brand_item_id}"
+}},""")
+    
+    # Add Extension Field 117 (OperatingCompany)
+    if operating_company is not None:
+        json_parts.append(f"""{{
+  "Id":117,
+  "value": "{operating_company}"
+}},""")
+    
+    # Add Extension Field 118 (PreviousAccountID)
+    if previous_account_id is not None:
+        json_parts.append(f"""{{
+  "Id":118,
+  "value": "{previous_account_id}"
+}},""")
+    
+    # Add Extension Field 119 (PolicyRegion)
+    if policy_region is not None:
+        json_parts.append(f"""{{
+  "Id":119,
+  "value": "{policy_region}"
+}},""")
+    
+    # Add Extension Field 120 (NewBusinessPolicyFlag)
+    if new_business_policy_flag is not None:
+        json_parts.append(f"""{{
+  "Id":120,
+  "value": "{new_business_policy_flag}"
+}},""")
+    
+    # Add Extension Field 121 (AgencyID)
+    if agency_id is not None:
+        json_parts.append(f"""{{
+  "Id":121,
+  "value": "{agency_id}"
+}},""")
+    
+    # Add Extension Field 122 (PrimaryContactName)
+    if primary_contact_name is not None:
+        json_parts.append(f"""{{
+  "Id":122,
+  "value": "{primary_contact_name}"
+}},""")
+    
+    # Add Extension Field 123 (PrimaryContactPhone) - use "Unknown" if NULL
+    primary_contact_phone_value = primary_contact_phone if primary_
