@@ -1,0 +1,330 @@
+# Comprehensive Unit Tests for uspAPIPatchAccount PySpark Function
+
+## Test Case List
+
+| Test Case ID | Test Case Description | Expected Outcome |
+|-------------|----------------------|------------------|
+| TC001 | Basic Filtering Test | Function correctly filters records based on conditions: PostPatch = 'Patch', Validated is NULL, DateSent is NULL, SubmissionFlag = 0 |
+| TC002 | AccountID Assignment Test | AccountID is correctly assigned from AccountID table or IdOverride table |
+| TC003 | National Accounts UnderwriterId Test | UnderwriterId is NULL for national accounts and preserved for non-national accounts |
+| TC004 | Loop Instance Filtering Test | Records are correctly filtered by the loop_instance parameter |
+| TC005 | JSON Message Structure Test | JSON_Message column exists and has the correct structure |
+| TC006 | Email Validation Test | Email addresses are properly validated (valid emails included, invalid emails excluded) |
+| TC007 | Extension Fields Test | Extension fields are correctly included in the JSON message |
+| TC008 | External Unique ID Handling Test | ExternalUniqueId is correctly formatted based on length |
+| TC009 | NULL Value Handling Test | NULL values are handled appropriately (defaults applied where needed) |
+| TC010 | Performance Test | Function processes large datasets efficiently across multiple loop instances |
+
+## Pytest Script
+
+```python
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit
+import datetime
+from unittest.mock import patch, MagicMock
+from uspAPIPatchAccount import uspAPIPatchAccount
+
+@pytest.fixture
+def spark():
+    """Create a SparkSession fixture for tests."""
+    return SparkSession.builder \
+        .appName("uspAPIPatchAccount_test") \
+        .master("local[*]") \
+        .getOrCreate()
+
+@pytest.fixture
+def mock_tables(spark):
+    """Create mock tables for testing."""
+    # Mock Account table
+    account_data = [
+        # ContactNumber, PostPatch, Validated, DateSent, SubmissionFlag, AccountStatus, Brand, ExternalUniqueId, UnderwriterId, etc.
+        ("ACC001", "Patch", None, None, 0, "inforce", "Accident Fund", "EXT001", "UW001", "Account 1", "123-456-7890", "123-456-7891", "test1@example.com", "Test notes 1"),
+        ("ACC002", "Patch", None, None, 0, "propsect", "CompWest", "EXT002", "UW002", "Account 2", "234-567-8901", "234-567-8902", "test2@example.com", "Test notes 2"),
+        ("ACC003", "Patch", "Yes", None, 0, "inactive", "AF Specialty", "EXT003", "UW003", "Account 3", "345-678-9012", "345-678-9013", "test3@example.com", "Test notes 3"),
+        ("ACC004", "Other", None, None, 0, "inforce", "United Heartland", "EXT004", "UW004", "Account 4", "456-789-0123", "456-789-0124", "test4@example.com", "Test notes 4"),
+        ("ACC005", "Patch", None, None, 1, "inforce", "Third Coast Underwriters", "EXT005", "UW005", "Account 5", "567-890-1234", "567-890-1235", "test5@example.com", "Test notes 5")
+    ]
+    account_schema = ["ContactNumber", "PostPatch", "Validated", "DateSent", "SubmissionFlag", "AccountStatus", "Brand", 
+                      "ExternalUniqueId", "UnderwriterId", "Name", "BusinessPhone", "FaxPhone", "EmailAddress", "Notes"]
+    account_df = spark.createDataFrame(account_data, account_schema)
+    account_df.createOrReplaceTempView("RCT.Account")
+    
+    # Mock PolicyDescriptors table
+    policy_data = [
+        ("ACC001", 1, datetime.datetime.now() + datetime.timedelta(days=30)),
+        ("ACC002", 0, datetime.datetime.now() + datetime.timedelta(days=30)),
+        ("ACC003", 1, datetime.datetime.now() - datetime.timedelta(days=30))
+    ]
+    policy_schema = ["AccountNumber", "NationalAccountFlag", "ExpirationDate"]
+    policy_df = spark.createDataFrame(policy_data, policy_schema)
+    policy_df.createOrReplaceTempView("EDSMART.Semantic.PolicyDescriptors")
+    
+    # Mock AccountID table
+    account_id_data = [
+        ("ACC001", "ID001"),
+        ("ACC002", "ID002")
+    ]
+    account_id_schema = ["ContactNumber", "AccountID"]
+    account_id_df = spark.createDataFrame(account_id_data, account_id_schema)
+    account_id_df.createOrReplaceTempView("RCT.AccountID")
+    
+    # Mock IdOverride table
+    id_override_data = [
+        ("EXT003", "Account", "ID003"),
+        ("EXT004", "Account", "ID004")
+    ]
+    id_override_schema = ["ExternalUniqueID", "ObjectType", "RCT_ID"]
+    id_override_df = spark.createDataFrame(id_override_data, id_override_schema)
+    id_override_df.createOrReplaceTempView("RCT.IdOverride")
+    
+    return {
+        "account": account_df,
+        "policy": policy_df,
+        "account_id": account_id_df,
+        "id_override": id_override_df
+    }
+
+class TestUspAPIPatchAccount:
+    """Test cases for uspAPIPatchAccount function."""
+    
+    def test_filter_conditions(self, spark, mock_tables):
+        """Test that the function correctly filters records based on conditions."""
+        result = uspAPIPatchAccount(spark, 0)
+        
+        # Check that only records with PostPatch='Patch', Validated=NULL, DateSent=NULL, SubmissionFlag=0 are included
+        assert result.filter(col("ContactNumber") == "ACC001").count() == 1
+        assert result.filter(col("ContactNumber") == "ACC002").count() == 1
+        assert result.filter(col("ContactNumber") == "ACC003").count() == 0  # Validated is not NULL
+        assert result.filter(col("ContactNumber") == "ACC004").count() == 0  # PostPatch is not 'Patch'
+        assert result.filter(col("ContactNumber") == "ACC005").count() == 0  # SubmissionFlag is not 0
+    
+    def test_account_id_assignment(self, spark, mock_tables):
+        """Test that AccountID is correctly assigned from AccountID table or IdOverride table."""
+        result = uspAPIPatchAccount(spark, 0)
+        
+        # Check AccountID assignment
+        assert result.filter(col("ContactNumber") == "ACC001").select("AccountID").collect()[0][0] == "ID001"
+        assert result.filter(col("ContactNumber") == "ACC002").select("AccountID").collect()[0][0] == "ID002"
+    
+    def test_national_accounts_underwriter_id(self, spark, mock_tables):
+        """Test that UnderwriterId is NULL for national accounts."""
+        result = uspAPIPatchAccount(spark, 0)
+        
+        # ACC001 is a national account, so UnderwriterId should be NULL
+        assert result.filter(col("ContactNumber") == "ACC001").select("UnderwriterId").collect()[0][0] is None
+        
+        # ACC002 is not a national account, so UnderwriterId should be preserved
+        assert result.filter(col("ContactNumber") == "ACC002").select("UnderwriterId").collect()[0][0] == "UW002"
+    
+    def test_loop_instance_filtering(self, spark, mock_tables):
+        """Test that the function correctly filters by loop instance."""
+        # Test with loop_instance = 0
+        result_0 = uspAPIPatchAccount(spark, 0)
+        assert result_0.count() > 0
+        
+        # Test with loop_instance = 1 (should be empty as we have few test records)
+        result_1 = uspAPIPatchAccount(spark, 1)
+        assert result_1.count() == 0
+    
+    def test_json_message_structure(self, spark, mock_tables):
+        """Test that the JSON message has the correct structure."""
+        result = uspAPIPatchAccount(spark, 0)
+        
+        # Check that JSON_Message column exists and has the expected structure
+        assert "JSON_Message" in result.columns
+        
+        json_message = result.select("JSON_Message").collect()[0][0]
+        assert json_message.startswith("[")
+        assert json_message.endswith("]")
+        assert '"op": "replace"' in json_message
+        assert '"path": "/ExtensionFields"' in json_message
+    
+    def test_email_validation(self, spark, mock_tables):
+        """Test that email addresses are validated correctly."""
+        # Create test data with invalid email
+        account_data = [
+            ("ACC006", "Patch", None, None, 0, "inforce", "Accident Fund", "EXT006", "UW006", 
+             "Account 6", "678-901-2345", "678-901-2346", "invalid-email", "Test notes 6")
+        ]
+        account_schema = ["ContactNumber", "PostPatch", "Validated", "DateSent", "SubmissionFlag", "AccountStatus", "Brand", 
+                          "ExternalUniqueId", "UnderwriterId", "Name", "BusinessPhone", "FaxPhone", "EmailAddress", "Notes"]
+        
+        # Append to existing account table
+        new_account_df = spark.createDataFrame(account_data, account_schema)
+        updated_account_df = mock_tables["account"].union(new_account_df)
+        updated_account_df.createOrReplaceTempView("RCT.Account")
+        
+        result = uspAPIPatchAccount(spark, 0)
+        
+        # Check that invalid email is not included in the JSON message
+        json_message = result.filter(col("ContactNumber") == "ACC006").select("JSON_Message").collect()[0][0]
+        assert '"Email"' not in json_message or '"value": null' in json_message
+    
+    def test_extension_fields(self, spark, mock_tables):
+        """Test that extension fields are correctly included in the JSON message."""
+        result = uspAPIPatchAccount(spark, 0)
+        
+        # Check that extension fields are included in the JSON message
+        json_message = result.filter(col("ContactNumber") == "ACC001").select("JSON_Message").collect()[0][0]
+        assert '"path": "/ExtensionFields"' in json_message
+        assert '"Id":11' in json_message  # Check for specific extension field IDs
+        
+    def test_external_unique_id_handling(self, spark, mock_tables):
+        """Test that ExternalUniqueId is correctly handled."""
+        # Create test data with ExternalUniqueId longer than 15 characters
+        account_data = [
+            ("ACC007", "Patch", None, None, 0, "inforce", "Accident Fund", "EXT007_VERY_LONG_ID", "UW007", 
+             "Account 7", "789-012-3456", "789-012-3457", "test7@example.com", "Test notes 7")
+        ]
+        account_schema = ["ContactNumber", "PostPatch", "Validated", "DateSent", "SubmissionFlag", "AccountStatus", "Brand", 
+                          "ExternalUniqueId", "UnderwriterId", "Name", "BusinessPhone", "FaxPhone", "EmailAddress", "Notes"]
+        
+        # Append to existing account table
+        new_account_df = spark.createDataFrame(account_data, account_schema)
+        updated_account_df = mock_tables["account"].union(new_account_df)
+        updated_account_df.createOrReplaceTempView("RCT.Account")
+        
+        result = uspAPIPatchAccount(spark, 0)
+        
+        # Check that ContactNumber is used when ExternalUniqueId is too long
+        json_message = result.filter(col("ContactNumber") == "ACC007").select("JSON_Message").collect()[0][0]
+        assert '"Id":167' in json_message
+        assert 'CC007' in json_message  # Should contain ContactNumber without 'AF' prefix
+        
+    def test_null_value_handling(self, spark, mock_tables):
+        """Test that NULL values are handled appropriately."""
+        # Create test data with NULL values
+        account_data = [
+            ("ACC008", "Patch", None, None, 0, "inforce", "Accident Fund", "EXT008", "UW008", 
+             None, None, None, None, None)  # All fields that can be NULL are NULL
+        ]
+        account_schema = ["ContactNumber", "PostPatch", "Validated", "DateSent", "SubmissionFlag", "AccountStatus", "Brand", 
+                          "ExternalUniqueId", "UnderwriterId", "Name", "BusinessPhone", "FaxPhone", "EmailAddress", "Notes"]
+        
+        # Append to existing account table
+        new_account_df = spark.createDataFrame(account_data, account_schema)
+        updated_account_df = mock_tables["account"].union(new_account_df)
+        updated_account_df.createOrReplaceTempView("RCT.Account")
+        
+        result = uspAPIPatchAccount(spark, 0)
+        
+        # Check that NULL values are handled appropriately
+        assert result.filter(col("ContactNumber") == "ACC008").count() == 1
+        
+        # Check specific NULL handling logic, e.g., PrimaryContactPhone defaults to "Unknown"
+        json_message = result.filter(col("ContactNumber") == "ACC008").select("JSON_Message").collect()[0][0]
+        assert '"Id":123' in json_message
+        assert '"value": "Unknown"' in json_message
+        
+    @patch("datetime.datetime")
+    def test_date_calculation(self, mock_datetime, spark, mock_tables):
+        """Test date calculation logic."""
+        # Mock current date
+        fixed_date = datetime.datetime(2023, 5, 15)
+        mock_datetime.now.return_value = fixed_date
+        
+        # Create policy descriptors with different expiration dates
+        policy_data = [
+            ("ACC009", 1, fixed_date + datetime.timedelta(days=30)),  # Valid
+            ("ACC010", 1, fixed_date - datetime.timedelta(days=1))    # Expired
+        ]
+        policy_schema = ["AccountNumber", "NationalAccountFlag", "ExpirationDate"]
+        policy_df = spark.createDataFrame(policy_data, policy_schema)
+        
+        # Create corresponding accounts
+        account_data = [
+            ("ACC009", "Patch", None, None, 0, "inforce", "Accident Fund", "EXT009", "UW009", 
+             "Account 9", "901-234-5678", "901-234-5679", "test9@example.com", "Test notes 9"),
+            ("ACC010", "Patch", None, None, 0, "inforce", "Accident Fund", "EXT010", "UW010", 
+             "Account 10", "012-345-6789", "012-345-6780", "test10@example.com", "Test notes 10")
+        ]
+        account_schema = ["ContactNumber", "PostPatch", "Validated", "DateSent", "SubmissionFlag", "AccountStatus", "Brand", 
+                          "ExternalUniqueId", "UnderwriterId", "Name", "BusinessPhone", "FaxPhone", "EmailAddress", "Notes"]
+        
+        # Update tables
+        new_policy_df = mock_tables["policy"].union(policy_df)
+        new_policy_df.createOrReplaceTempView("EDSMART.Semantic.PolicyDescriptors")
+        
+        new_account_df = spark.createDataFrame(account_data, account_schema)
+        updated_account_df = mock_tables["account"].union(new_account_df)
+        updated_account_df.createOrReplaceTempView("RCT.Account")
+        
+        result = uspAPIPatchAccount(spark, 0)
+        
+        # Check that expired national account is not treated as a national account
+        # (UnderwriterId should not be NULL)
+        assert result.filter(col("ContactNumber") == "ACC009").select("UnderwriterId").collect()[0][0] is None
+        assert result.filter(col("ContactNumber") == "ACC010").select("UnderwriterId").collect()[0][0] == "UW010"
+        
+    def test_performance(self, spark, mock_tables):
+        """Test performance with a large dataset."""
+        # Create a large number of test accounts
+        large_data = []
+        for i in range(300):  # 300 records should create at least 2 loop instances
+            large_data.append((
+                f"ACC{1000+i}", "Patch", None, None, 0, "inforce", "Accident Fund", f"EXT{1000+i}", f"UW{1000+i}", 
+                f"Account {1000+i}", f"555-{1000+i}", f"555-{2000+i}", f"test{1000+i}@example.com", f"Test notes {1000+i}"
+            ))
+        
+        account_schema = ["ContactNumber", "PostPatch", "Validated", "DateSent", "SubmissionFlag", "AccountStatus", "Brand", 
+                          "ExternalUniqueId", "UnderwriterId", "Name", "BusinessPhone", "FaxPhone", "EmailAddress", "Notes"]
+        
+        # Append to existing account table
+        large_df = spark.createDataFrame(large_data, account_schema)
+        updated_account_df = mock_tables["account"].union(large_df)
+        updated_account_df.createOrReplaceTempView("RCT.Account")
+        
+        # Measure execution time
+        import time
+        start_time = time.time()
+        
+        # Test with loop_instance = 0
+        result_0 = uspAPIPatchAccount(spark, 0)
+        count_0 = result_0.count()
+        
+        # Test with loop_instance = 1
+        result_1 = uspAPIPatchAccount(spark, 1)
+        count_1 = result_1.count()
+        
+        end_time = time.time()
+        execution_time = end_time - start_time
+        
+        # Verify results
+        assert count_0 > 0
+        assert count_1 > 0
+        assert count_0 + count_1 >= 300  # All large records should be distributed across loop instances
+        
+        # Performance assertion - should complete in reasonable time
+        assert execution_time < 30  # Should complete in less than 30 seconds
+```
+
+## Additional Test Considerations
+
+1. **Edge Cases**:
+   - Test with extremely long text fields
+   - Test with special characters in text fields
+   - Test with boundary values for numeric fields
+   - Test with different date formats
+
+2. **Error Handling**:
+   - Test with invalid loop_instance values (negative, non-integer)
+   - Test with missing required tables
+   - Test with schema mismatches
+
+3. **Integration Tests**:
+   - Test the full pipeline including the JSON message generation
+   - Test with real-world data samples
+
+4. **Mocking Strategies**:
+   - The tests use pytest fixtures to create mock data
+   - datetime.now() is mocked to ensure consistent test results
+   - SparkSession is configured for local testing
+
+5. **Performance Considerations**:
+   - Tests include performance benchmarks for large datasets
+   - Loop instance calculation is verified for correct distribution
+
+This comprehensive test suite ensures that the uspAPIPatchAccount PySpark function maintains the same functionality as the original T-SQL stored procedure while leveraging PySpark's distributed computing capabilities.
+
+**apiCost:** $0.00
