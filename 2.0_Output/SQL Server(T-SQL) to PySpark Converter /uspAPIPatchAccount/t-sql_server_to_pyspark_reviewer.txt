@@ -1,37 +1,628 @@
-### Output Template for SQL Server to PySpark
+### Output Template for SQL Server to PySpark  
 
-1. **Summary**
-   - The original T-SQL SQL Server stored procedure `[RCT].[uspAPIPatchAccount]` retrieves account data for PATCH operations in an API. It uses several CTEs to filter and enrich data, applies business logic (e.g., removing UnderwriterId for National Accounts), and constructs a complex JSON patch message for each qualifying account. The PySpark implementation closely follows the T-SQL logic: it builds equivalent DataFrames for CTEs, performs the same joins and filters, calculates LoopInstance, and constructs the JSON patch message using a Python UDF.
+1. **Summary**  
+   - The original SQL Server stored procedure `[RCT].[uspAPIPatchAccount]` generates a JSON PATCH message for accounts, partitioned by LoopInstance, for use in an API. It joins several reference tables (including National Accounts, InForceListCode, BrandCode, AccountID, IdOverride), applies business logic for field population (including special handling for National Accounts and extension fields), and outputs a JSON array per account with both core and extension fields.  
+   - The PySpark implementation replicates this logic using DataFrames, window functions, and UDFs to build the JSON message, with DataFrame-based joins and transformations for all the business logic, and includes a test suite for functional and edge-case validation.
 
-2. **Conversion Accuracy**
-   - The PySpark code accurately translates the SQL logic:
-     - All CTEs (`NationalAccts`, `INForceListCode`, `BrandCode`) are implemented as DataFrames.
-     - Joins and filters mirror the SQL, including handling of National Account logic for UnderwriterId.
-     - The LoopInstance calculation and filtering are preserved.
-     - The JSON patch message is constructed with a UDF, mimicking the T-SQL string concatenation and field inclusion logic.
-     - All extension fields and main fields are handled, with logic for email validation and null handling.
-     - The output schema matches the SQL output: `AccountID`, `ContactNumber`, `SubmissionFlag`, `LoopInstance`, `JSON_Message`.
+2. **Conversion Accuracy**  
+   - The PySpark code closely mirrors the SQL Server logic:
+     - All major CTEs (NationalAccts, InForceListCode, BrandCode) are implemented as DataFrames.
+     - Joins and filters are replicated using DataFrame APIs.
+     - The LoopInstance calculation and row partitioning logic are present.
+     - The business logic for UnderwriterId (null for National Accounts) is preserved.
+     - The JSON message construction is handled via a UDF, mapping all required fields and extension fields.
+     - All filtering logic (`PostPatch = 'Patch'`, `Validated IS NULL`, `DateSent IS NULL`, `SubmissionFlag = 0`) is present.
+     - Extension fields are handled via a mapping and included in the JSON.
+     - The output schema matches the SQL output: AccountID, ContactNumber, SubmissionFlag, LoopInstance, JSON_Message.
 
-3. **Discrepancies and Issues**
-   - The PySpark code is mostly complete, but:
-     - The JSON construction UDF is shown as a template and must be expanded to cover all fields and extension fields as in the T-SQL procedure. The T-SQL lists all extension fields by ID (e.g., `[11]`, `[37]`, etc.); the PySpark code should ensure all these are included.
-     - The T-SQL uses `IIF(... like '%@%', ..., NULL)` for email fields; the PySpark code should ensure this logic is applied for all such fields.
-     - The T-SQL uses explicit casting to `VARCHAR(MAX)` for all extension fields; the PySpark code should ensure all values are stringified.
-     - The T-SQL uses `COALESCE` and `IIF` for some fields; the PySpark code should ensure equivalent logic.
-     - The T-SQL uses `[RowN] % 2 AS SplitRow` (commented out); this is not present in PySpark, but it's not used in the output.
-     - The T-SQL output includes all extension fields in the JSON array, only if not null; the PySpark UDF should mimic this exactly.
+3. **Discrepancies and Issues**  
+   - The PySpark code uses placeholder lists for `select_exprs` and `extension_fields`, with a note to "expand as needed per the SQL". The SQL version has a much larger set of extension fields (over 50), while the PySpark code only shows a partial mapping. **This is a gap**; the PySpark code must be expanded to include all extension fields as in the SQL.
+   - Some address fields (e.g., `MailingAddress.ProvinceID`, etc.) are referenced in the JSON construction but are not shown in the `select_exprs` list in the PySpark code. The SQL version includes both primary and mailing address fields.
+   - The SQL code includes special logic for fields like `[167]` (complex REPLACE/LEN logic) and `[168]` (WrittenLossRatio), which are not explicitly shown in the PySpark code. These must be implemented in the PySpark mapping.
+   - The SQL code uses `COALESCE` and `IIF` for null/default handling and conditional logic; the PySpark code provides helpers but must ensure all such logic is fully mapped for each field.
+   - The SQL code includes casting to `VARCHAR(MAX)` for all extension fields; the PySpark code should ensure all extension fields are cast to string in the final output.
+   - The SQL code includes a comment to remove ConsultantID; ensure the PySpark code does not include this field.
+   - The SQL code includes a join to `[RCT].[AccountID]` on `ContactNumber` (not AccountID); the PySpark code matches this.
+   - The SQL code includes a join to `IdOverride` on `ExternalUniqueID` and `ObjectType = 'Account'`; the PySpark code matches this.
+   - The JSON construction in SQL is string concatenation, while the PySpark code builds a Python dict and serializes it. This is functionally equivalent but must ensure all field mappings and null-handling are identical.
 
-4. **Optimization Suggestions**
-   - The PySpark code can be further optimized:
-     - Avoid using a Python UDF for JSON construction if possible; use Spark SQL functions (`F.to_json`, `F.struct`, etc.) for better performance and serialization.
-     - Consider caching intermediate DataFrames if reused.
-     - Partition the final DataFrame by `LoopInstance` for large datasets to optimize filtering.
-     - Use broadcast joins for small lookup tables (`INForceListCode`, `BrandCode`).
-     - Ensure all joins are on indexed or partitioned columns for large tables.
-     - Validate that all columns used in joins and filters are present and have the correct types.
+4. **Optimization Suggestions**  
+   - Expand `select_exprs` and `extension_fields` in the PySpark code to cover all fields present in the SQL, ensuring full parity.
+   - Consider using `selectExpr` or explicit column selection to minimize DataFrame size before the UDF step.
+   - If the JSON construction UDF becomes a bottleneck, consider using PySpark's `to_json` and `struct` functions for native JSON construction where possible.
+   - Use DataFrame caching if the same intermediate DataFrame is used multiple times.
+   - Ensure all joins are on indexed or partitioned columns for efficiency.
+   - If the dataset is large, consider partitioning by `LoopInstance` before filtering for the target instance to minimize shuffling.
 
-5. **Overall Assessment**
-   - The conversion is highly accurate and complete, with all major business logic and data processing steps preserved. The main gap is in the completeness of the JSON construction UDF, which must be fully expanded to match the T-SQL output. The code is maintainable and follows PySpark best practices, with minor room for optimization around the use of UDFs and partitioning.
+5. **Overall Assessment**  
+   - The PySpark conversion is highly faithful to the original SQL Server logic and structure, with all core business logic and data integrity checks preserved.
+   - The main area for improvement is completeness: the PySpark code must expand its field mappings to cover all extension fields and address fields as in the SQL.
+   - The provided test suite is comprehensive and validates both happy path and edge cases, ensuring correctness.
+   - Performance optimizations are suggested but the current code is a solid foundation for distributed processing in PySpark.
 
- **API Cost**
-   - 0.0180
+ **API Cost**  
+   - apiCost: 0.016
+
+---
+**T-SQL Source:**
+
+SET QUOTED_IDENTIFIER ON
+SET ANSI_NULLS ON
+GO
+-- Stored Procedure
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+--SP Name				: uspAPIPatchAccount
+--Purpose               : Query needed to return PATCH Data in API
+--Database			    : IntegrationsMart
+--Schema				: RCT
+--Created By			: Jimmy.Garcia@afgroup.com
+--Create On			    : 07-May-2021
+--Revistion History
+--Ver.##   Updated By										Updated Date   Change History  
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+--0.1      Jimmy.Garcia@afgroup.com						    07-May-2021    Inital Version
+--0.2      Jimmy.Garcia@afgroup.com						    01-June-2021   Made change to join for IdOverride and added LoopInstance
+--0.3      Jimmy.Garcia@afgroup.com						    22-Aug-2021    Adding Submission Flag  
+--0.4      Deepak.Ghimirey@afgroup.com						11-Oct-2021	   Adding UniqueID 
+--0.5	   Jimmy.Garcia@Afgroup.com							20-Sep-2022    Changed Join to AccountID table to use ContactNumber
+--0.6      Deepak.Ghimirey@afgroup.com						23-Sep-2022     Adding LossRatio 
+--0.7      Jimmy.Garcia@afgroup.com							01-May-2023     Removing ConsultantID
+--0.8      Jimmy.Garcia@afgroup.com							18-May-2023     Removing UnderwriterID for NationalAccounts
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+CREATE PROCEDURE [RCT].[uspAPIPatchAccount] 
+(@LoopInstance INT)
+AS
+BEGIN
+
+DECLARE @Date DATETIME2 = DATEADD(DD,-1,GETDATE());
+
+WITH NationalAccts AS
+(
+	SELECT DISTINCT AccountNumber 
+	FROM EDSMART.Semantic.PolicyDescriptors
+	WHERE NationalAccountFlag = 1
+	AND ExpirationDate > @Date
+),INForceListCode 
+AS 
+( Select '2443' AS ItemID, 'inforce' AS ItemCode 
+	UNION ALL
+  Select '2341' AS ItemID, 'propsect' AS ItemCode 
+	UNION ALL
+  Select '2325' AS ItemID, 'inactive' AS ItemCode
+), BrandCode 
+AS 
+(
+  Select '2533' AS ItemID, 'Accident Fund' AS ItemCode 
+	UNION ALL
+  Select '2536' AS ItemID, 'Third Coast Underwriters' AS ItemCode 
+	UNION ALL
+  Select '2534' AS ItemID, 'AF Specialty' AS ItemCode 
+	UNION ALL
+  Select '2535' AS ItemID, 'United Heartland' AS ItemCode 
+	UNION ALL
+  Select '2537' AS ItemID, 'CompWest' AS ItemCode 
+), Final AS
+(
+SELECT
+ COALESCE(AC.AccountID,ID.RCT_ID) AS AccountID
+ ,(ROW_NUMBER() OVER (ORDER BY A.ContactNumber) -1) / 250 AS LoopInstance --Must be whole number
+,IIF(NA.AccountNumber IS NULL, UnderwriterId, NULL) AS UnderwriterId
+,A.ExternalUniqueId ExternalUniqueId
+,PrimaryLocationAddressProvinceId AS 'Location.Address.ProvinceID'
+,PrimaryLocationAddressAddressLine AS 'Location.Address.AddressLine'
+,PrimaryLocationAddressCity AS 'Location.Address.City'
+,PrimaryLocationAddressPostalCode AS 'Location.Address.PostalCode'
+,PrimaryLocationAddressLongitude AS 'Location.Address.Longitude'
+,PrimaryLocationAddressLatitude AS 'Location.Address.Latitude'
+,PrimaryLocationAddressCounty AS 'Location.Address.County'
+,CAST(PrimaryLocationAddressExternalUniqueId AS Varchar(100)) AS 'Location.ExternalUniqueId'
+,PrimaryLocationAddressLocationNumber AS 'Location.LocationNumber'
+,PrimaryLocationAddressDescription AS 'Location.Description'
+,PrimaryLocationAddressAdditionalInfo AS 'Location.AdditionalInfo'
+,MailingAddressProvinceId AS 'MailingAddress.ProvinceID'
+,MailingAddressAddressLine AS 'MailingAddress.AddressLine'
+,MailingAddressCity AS 'MailingAddress.City'
+,MailingAddressPostalCode AS 'MailingAddress.PostalCode'
+,MailingAddressLongitude AS 'MailingAddress.Longitude'
+,MailingAddressLatitude AS 'MailingAddress.Latitude'
+,MailingAddressCounty AS 'MailingAddress.County'
+--AddExtensionFieldsHere
+,CAST(BDCName AS Varchar(MAX)) AS [37]
+--,CAST(LCName AS Varchar(MAX)) AS [122]
+,CAST(F.ItemID AS Varchar(MAX)) AS [11]
+,CAST(Policy1 AS Varchar(MAX)) AS [69]
+,CAST(LineOfBusiness1 AS Varchar(MAX)) AS [72]
+,CAST(PricingType1 AS Varchar(MAX)) AS [76]
+,CAST(IIF(ContractAgencyBusinessEmail like '%@%',ContractAgencyBusinessEmail,NULL) AS Varchar(MAX)) AS [130]
+,CAST(MasterAgent AS Varchar(MAX)) AS [131]
+,CAST(OnBaseLink AS Varchar(MAX)) AS [67]
+,CAST(ComplianceFLAG AS Varchar(MAX)) AS [161]
+,CAST(IIF(PrimaryContactEmail like '%@%',PrimaryContactEmail,NULL) AS Varchar(MAX)) AS [124]
+,CAST(PrimaryContactTitle AS Varchar(MAX)) AS [125]
+,CAST(UnderwriterName AS Varchar(MAX)) AS [126]
+,CAST(UnderwriterPhone AS Varchar(MAX)) AS [127]
+,CAST(IIF(UnderwriterEmail like '%@%',UnderwriterEmail,NULL) AS Varchar(MAX)) AS [40]
+,CAST(ContractAgencyName AS Varchar(MAX)) AS [129]
+,CAST(B.ItemID AS Varchar(MAX)) AS [116]
+,CAST(OperatingCompany AS Varchar(MAX)) AS [117]
+,CAST(PreviousAccountID AS Varchar(MAX)) AS [118]
+,CAST(PolicyRegion AS Varchar(MAX)) AS [119]
+,CAST(PrimaryContactName AS Varchar(MAX)) AS [122]
+,CAST(COALESCE(PrimaryContactPhone,'Unknown') AS Varchar(MAX)) AS [123]
+,CAST(LineOfBusiness3 AS Varchar(MAX)) AS [104]
+,CAST(PricingType3 AS Varchar(MAX)) AS [108]
+,CAST(GoverningClassCode3 AS Varchar(MAX)) AS [109]
+,CAST(NAICSCode3 AS Varchar(MAX)) AS [110]
+,CAST(Industry3 AS Varchar(MAX)) AS [111]
+,CAST(HazardGroup3 AS Varchar(MAX)) AS [112]
+,CAST(PricingType2 AS Varchar(MAX)) AS [92]
+,CAST(GoverningClassCode2 AS Varchar(MAX)) AS [93]
+,CAST(NAICSCode2 AS Varchar(MAX)) AS [94]
+,CAST(Industry2 AS Varchar(MAX)) AS [95]
+,CAST(HazardGroup2 AS Varchar(MAX)) AS [96]
+,CAST(Policy3 AS Varchar(MAX)) AS [101]
+,CAST(GoverningClassCode1 AS Varchar(MAX)) AS [77]
+,CAST(NAICSCode1 AS Varchar(MAX)) AS [78]
+,CAST(Industry1 AS Varchar(MAX)) AS [79]
+,CAST(HazardGroup1 AS Varchar(MAX)) AS [80]
+,CAST(Policy2 AS Varchar(MAX)) AS [85]
+,CAST(LineOfBusiness2 AS Varchar(MAX)) AS [88]
+,CAST(IIF(NewBusinessPolicyFlag=1,'2444','2445') AS Varchar(MAX)) [120]
+,CAST(AgencyID AS Varchar(MAX)) AS [121]
+,CAST(PolicyEffectiveDate1 AS Varchar(MAX)) AS [74]
+,CAST(PolicyExpirationDATE1 AS Varchar(MAX)) AS [75]
+,CAST(PolicyEffectiveDate2 AS Varchar(MAX)) AS [90]
+,CAST(PolicyExpirationDATE2 AS Varchar(MAX)) AS [91]
+,CAST(PolicyEffectiveDate3 AS Varchar(MAX)) AS [106]
+,CAST(PolicyExpirationDATE3 AS Varchar(MAX)) AS [107]
+,CAST(COALESCE(ExperienceModificationFactor1,0.0000) AS Varchar(MAX)) AS [82]
+,CAST(ExperienceModificationFactor2 AS Varchar(MAX)) AS [98]
+,CAST(ExperienceModificationFactor3 AS Varchar(MAX)) AS [114]
+,CAST(Premium1 AS Varchar(MAX)) AS [73]
+,CAST(Payroll1 AS Varchar(MAX)) AS [83]
+,CAST(Premium2 AS Varchar(MAX)) AS [89]
+,CAST(Payroll2 AS Varchar(MAX)) AS [99]
+,CAST(Premium3 AS Varchar(MAX)) AS [105]
+,CAST(Payroll3 AS Varchar(MAX)) AS [115]
+,CAST(PMScore1 AS Varchar(MAX)) AS [81]
+,CAST(PMScore2 AS Varchar(MAX)) AS [97]
+,CAST(PMScore3 AS Varchar(MAX)) AS [113]
+,CAST(MasterCompany AS Varchar(MAX)) AS [160]
+,CAST(IIF(LEN(A.ExternalUniqueId) > 15, REPLACE(A.ContactNumber,'AF',''), REPLACE(A.ExternalUniqueId,'AF','')) AS VARCHAR(MAX)) as [167]
+,CAST(A.WrittenLossRatio AS Varchar(MAX)) AS [168]
+-----------------
+,Name
+,BusinessPhone AS Phone
+,FaxPhone AS Fax
+,IIF(EmailAddress like '%@%',EmailAddress,NULL) AS Email
+,CAST(Notes AS Varchar(150)) AS Notes
+,A.ContactNumber
+,A.SubmissionFlag
+,ROW_NUMBER() OVER (ORDER BY A.Premium1 DESC) AS RowN
+FROM RCT.Account A
+LEFT JOIN NationalAccts NA
+ ON A.ContactNumber = NA.AccountNumber
+LEFT JOIN INForceListCode F
+ ON F.ItemCode = A.AccountStatus
+LEFT JOIN BrandCode B
+ ON B.ItemCode = A.Brand
+LEFT JOIN [RCT].[AccountID] AC
+ ON AC.ContactNumber = A.ContactNumber
+LEFT JOIN RCT.IdOverride ID
+ ON ID.ExternalUniqueID = A.ExternalUniqueId 
+ and ID.ObjectType = 'Account'
+
+where a.PostPatch = 'Patch' AND A.Validated IS NULL and A.DateSent IS NULL and A.SubmissionFlag = 0
+
+) 
+Select AccountID
+,ContactNumber
+,SubmissionFlag
+,LoopInstance
+--,RowN % 2 AS SplitRow
+,
+'['+ COALESCE('
+{
+  "op": "replace",
+  "path": "/UnderwriterId",
+  "value": "'+[UnderwriterId]+'"
+},','') 
++COALESCE('
+{
+  "op": "replace",
+
+  "path": "/MailingAddress/ProvinceID",
+  "value": "'+CAST([MailingAddress.ProvinceID] AS Varchar(50))+'"
+},','') +COALESCE('
+{
+  "op": "replace",
+  "path": "/MailingAddress/AddressLine",
+  "value": "'+[MailingAddress.AddressLine]+'"
+},','') +COALESCE('
+{
+  "op": "replace",
+  "path": "/MailingAddress/City",
+  "value": "'+[MailingAddress.City]+'"
+},','') +COALESCE('
+{
+  "op": "replace",
+  "path": "/MailingAddress/PostalCode",
+  "value": "'+[MailingAddress.PostalCode]+'"
+},','') +COALESCE('
+{
+  "op": "replace",
+  "path": "/MailingAddress/Longitude",
+  "value": "'+CAST([MailingAddress.Longitude] AS Varchar(50))+'"
+},','') +COALESCE('
+{
+  "op": "replace",
+  "path": "/MailingAddress/Latitude",
+  "value": "'+CAST([MailingAddress.Latitude] AS Varchar(50))+'"
+},','') +COALESCE('
+{
+  "op": "replace",
+  "path": "/MailingAddress/County",
+  "value": "'+CAST([MailingAddress.County] AS Varchar(50))+'"
+},','') +COALESCE('
+{
+  "op": "replace",
+  "path": "/Name",
+  "value": "'+[Name]+'"
+},','') +COALESCE('
+{
+  "op": "replace",
+  "path": "/Phone",
+  "value": "'+[Phone]+'"
+},','') +COALESCE('
+{
+  "op": "replace",
+  "path": "/Fax",
+  "value": "'+[Fax]+'"
+},','') +COALESCE('
+{
+  "op": "replace",
+  "path": "/Email",
+  "value": "'+[Email]+'"
+},','') +COALESCE('
+{
+  "op": "replace",
+  "path": "/Notes",
+  "value": "'+[Notes]+'"
+},','') +COALESCE('
+{
+  "op": "replace",
+  "path": "/ContactNumber",
+  "value": "'+[ContactNumber]+'"
+},','') 
++'{
+      "op": "replace",
+      "path": "/ExtensionFields",
+      "value": [
+'
++COALESCE('
+{
+
+  "Id":11,
+  "value": "'+[11]+'"
+},','') +COALESCE('
+{
+
+  "Id":37,
+  "value": "'+[37]+'"
+},','') +COALESCE('
+{
+
+  "Id":40,
+  "value": "'+[40]+'"
+},','') +COALESCE('
+{
+
+  "Id":67,
+  "value": "'+[67]+'"
+},','') +COALESCE('
+{
+
+  "Id":69,
+  "value": "'+[69]+'"
+},','') +COALESCE('
+{
+
+  "Id":72,
+  "value": "'+[72]+'"
+},','') +COALESCE('
+{
+
+  "Id":73,
+  "value": "'+[73]+'"
+},','') +COALESCE('
+{
+
+  "Id":74,
+  "value": "'+[74]+'"
+},','') +COALESCE('
+{
+
+  "Id":75,
+  "value": "'+[75]+'"
+},','') +COALESCE('
+{
+
+  "Id":76,
+  "value": "'+[76]+'"
+},','') +COALESCE('
+{
+
+  "Id":77,
+  "value": "'+[77]+'"
+},','') +COALESCE('
+{
+
+  "Id":78,
+  "value": "'+[78]+'"
+},','') +COALESCE('
+{
+
+  "Id":79,
+  "value": "'+[79]+'"
+},','') +COALESCE('
+{
+
+  "Id":80,
+  "value": "'+[80]+'"
+},','') +COALESCE('
+{
+
+  "Id":81,
+  "value": "'+[81]+'"
+},','') +COALESCE('
+{
+
+  "Id":82,
+  "value": "'+[82]+'"
+},','') +COALESCE('
+{
+
+  "Id":83,
+  "value": "'+[83]+'"
+},','') +COALESCE('
+{
+
+  "Id":85,
+  "value": "'+[85]+'"
+},','') +COALESCE('
+{
+
+  "Id":88,
+  "value": "'+[88]+'"
+},','') +COALESCE('
+{
+
+  "Id":89,
+  "value": "'+[89]+'"
+},','') +COALESCE('
+{
+
+  "Id":90,
+  "value": "'+[90]+'"
+},','') +COALESCE('
+{
+
+  "Id":91,
+  "value": "'+[91]+'"
+},','') +COALESCE('
+{
+
+  "Id":92,
+  "value": "'+[92]+'"
+},','') +COALESCE('
+{
+
+  "Id":93,
+  "value": "'+[93]+'"
+},','') +COALESCE('
+{
+
+  "Id":94,
+  "value": "'+[94]+'"
+},','') +COALESCE('
+{
+
+  "Id":95,
+  "value": "'+[95]+'"
+},','') +COALESCE('
+{
+
+  "Id":96,
+  "value": "'+[96]+'"
+},','') +COALESCE('
+{
+
+  "Id":97,
+  "value": "'+[97]+'"
+},','') +COALESCE('
+{
+
+  "Id":98,
+  "value": "'+[98]+'"
+},','') +COALESCE('
+{
+
+  "Id":99,
+  "value": "'+[99]+'"
+},','') +COALESCE('
+{
+
+  "Id":101,
+  "value": "'+[101]+'"
+},','') +COALESCE('
+{
+
+  "Id":104,
+  "value": "'+[104]+'"
+},','') +COALESCE('
+{
+
+  "Id":105,
+  "value": "'+[105]+'"
+},','') +COALESCE('
+{
+
+  "Id":106,
+  "value": "'+[106]+'"
+},','') +COALESCE('
+{
+
+  "Id":107,
+  "value": "'+[107]+'"
+},','') +COALESCE('
+{
+
+  "Id":108,
+  "value": "'+[108]+'"
+},','') +COALESCE('
+{
+
+  "Id":109,
+  "value": "'+[109]+'"
+},','') +COALESCE('
+{
+
+  "Id":110,
+  "value": "'+[110]+'"
+},','') +COALESCE('
+{
+
+  "Id":111,
+  "value": "'+[111]+'"
+},','') +COALESCE('
+{
+
+  "Id":112,
+  "value": "'+[112]+'"
+},','') +COALESCE('
+{
+
+  "Id":113,
+  "value": "'+[113]+'"
+},','') +COALESCE('
+{
+
+  "Id":114,
+  "value": "'+[114]+'"
+},','') +COALESCE('
+{
+
+  "Id":115,
+  "value": "'+[115]+'"
+},','') +COALESCE('
+{
+
+  "Id":116,
+  "value": "'+[116]+'"
+},','') +COALESCE('
+{
+
+  "Id":117,
+  "value": "'+[117]+'"
+},','') +COALESCE('
+{
+
+  "Id":118,
+  "value": "'+[118]+'"
+},','') +COALESCE('
+{
+
+  "Id":119,
+  "value": "'+[119]+'"
+},','') +COALESCE('
+{
+
+  "Id":120,
+  "value": "'+[120]+'"
+},','') +COALESCE('
+{
+
+  "Id":121,
+  "value": "'+[121]+'"
+},','') +COALESCE('
+{
+
+  "Id":122,
+  "value": "'+[122]+'"
+},','') +COALESCE('
+{
+
+  "Id":123,
+  "value": "'+[123]+'"
+},','') +COALESCE('
+{
+
+  "Id":124,
+  "value": "'+[124]+'"
+},','') +COALESCE('
+{
+
+  "Id":125,
+  "value": "'+[125]+'"
+},','') +COALESCE('
+{
+
+  "Id":126,
+  "value": "'+[126]+'"
+},','') +COALESCE('
+{
+
+  "Id":127,
+  "value": "'+[127]+'"
+},','') +COALESCE('
+{
+
+  "Id":129,
+  "value": "'+[129]+'"
+},','') +COALESCE('
+{
+
+  "Id":130,
+  "value": "'+[130]+'"
+},','') +COALESCE('
+{
+
+  "Id":131,
+  "value": "'+[131]+'"
+},','') +COALESCE('
+{
+
+  "Id":160,
+  "value": "'+[160]+'"
+},','') +COALESCE('
+{
+
+  "Id":161,
+  "value": "'+COALESCE([161],'N')+'"
+},','')  +COALESCE('
+{
+
+  "Id":167,
+  "value": "'+[167]-- required field
+  +'"   
+}'+IIF([168] is NULL, '', ',')+'','')+
+COALESCE('
+{
+
+  "Id":168,
+  "value": "'+[168]+'"
+}','')+
+'  ]
+  }
+]
+' AS JSON_Message
+FROM FINAL
+WHERE LoopInstance = @LoopInstance
+
+END
+GO
+
+ **API Cost**  
+   - apiCost: 0.016
