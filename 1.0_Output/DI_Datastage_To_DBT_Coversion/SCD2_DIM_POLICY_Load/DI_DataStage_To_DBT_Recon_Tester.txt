@@ -1,8 +1,334 @@
-I am unable to proceed with your request because I do not have the necessary GitHub repository name (in the format 'owner/repo'), branch name, or a valid GitHub personal access token required to access the SCD2_DIM_POLICY_Load.dsx file and the converted DBT project files.
+=============================================
+Author:        Ascendion AAVA
+Created on:   
+Description:   Python-based validation suite to execute DataStage and DBT (Snowflake) SCD2 jobs, capture outputs, and perform systematic reconciliation to ensure functional equivalence and data accuracy.
+=============================================
 
-To generate the comprehensive Python-based reconciliation script with the required metadata and validation logic, please provide:
-- The GitHub repository name (e.g., 'your-org/your-repo')
-- The branch name where the DSX and DBT files are located
-- A valid GitHub personal access token
+import os
+import sys
+import subprocess
+import logging
+import json
+import csv
+import time
+from datetime import datetime
+from typing import List, Dict, Any
 
-Once you provide these details, I will use the GitHub File Reader Tool to access the files and deliver the complete output as per your requirements.
+import pandas as pd
+import snowflake.connector
+from sqlalchemy import create_engine
+
+# =========================
+# 1. CONFIGURATION & LOGGING
+# =========================
+
+LOG_FILE = os.environ.get("VALIDATION_LOG_PATH", "datastage_dbt_validation.log")
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+console.setFormatter(formatter)
+logging.getLogger().addHandler(console)
+
+def mask_sensitive(info: dict) -> dict:
+    masked = info.copy()
+    for k in masked:
+        if "password" in k.lower() or "token" in k.lower():
+            masked[k] = "****"
+    return masked
+
+def load_env_vars():
+    from dotenv import load_dotenv
+    load_dotenv()
+    # All required env vars should be loaded here
+
+# =========================
+# 2. SNOWFLAKE CONNECTION
+# =========================
+
+def get_snowflake_engine():
+    user = os.environ["SNOWFLAKE_USER"]
+    password = os.environ["SNOWFLAKE_PASSWORD"]
+    account = os.environ["SNOWFLAKE_ACCOUNT"]
+    warehouse = os.environ["SNOWFLAKE_WAREHOUSE"]
+    database = os.environ["SNOWFLAKE_DATABASE"]
+    schema = os.environ["SNOWFLAKE_SCHEMA"]
+    role = os.environ.get("SNOWFLAKE_ROLE")
+    params = {
+        "user": user,
+        "password": password,
+        "account": account,
+        "warehouse": warehouse,
+        "database": database,
+        "schema": schema,
+    }
+    if role:
+        params["role"] = role
+    conn_str = (
+        f"snowflake://{user}:{password}@{account}/{database}/{schema}?warehouse={warehouse}"
+    )
+    if role:
+        conn_str += f"&role={role}"
+    return create_engine(conn_str)
+
+def get_snowflake_connection():
+    user = os.environ["SNOWFLAKE_USER"]
+    password = os.environ["SNOWFLAKE_PASSWORD"]
+    account = os.environ["SNOWFLAKE_ACCOUNT"]
+    warehouse = os.environ["SNOWFLAKE_WAREHOUSE"]
+    database = os.environ["SNOWFLAKE_DATABASE"]
+    schema = os.environ["SNOWFLAKE_SCHEMA"]
+    role = os.environ.get("SNOWFLAKE_ROLE")
+    conn = snowflake.connector.connect(
+        user=user,
+        password=password,
+        account=account,
+        warehouse=warehouse,
+        database=database,
+        schema=schema,
+        role=role
+    )
+    return conn
+
+# =========================
+# 3. DATASTAGE EXECUTION
+# =========================
+
+def run_datastage_job(job_name: str, project: str, ds_params: dict) -> bool:
+    """
+    Executes DataStage job using dsjob CLI.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        dsjob_path = os.environ.get("DSJOB_PATH", "dsjob")
+        params = [dsjob_path, "-run", "-mode", "NORMAL", "-wait"]
+        for k, v in ds_params.items():
+            params += ["-param", f"{k}={v}"]
+        params += [project, job_name]
+        logging.info(f"Running DataStage job: {' '.join(params)}")
+        result = subprocess.run(params, capture_output=True, text=True)
+        logging.info(f"DataStage job stdout: {result.stdout}")
+        logging.info(f"DataStage job stderr: {result.stderr}")
+        if result.returncode != 0:
+            logging.error(f"DataStage job failed with code {result.returncode}")
+            return False
+        return True
+    except Exception as e:
+        logging.exception(f"Exception running DataStage job: {e}")
+        return False
+
+def export_datastage_output(query: str, output_path: str, conn_params: dict):
+    """
+    Export DataStage output (from Oracle, SQL Server, etc.) to CSV using SQL*Plus or similar.
+    """
+    # This is a placeholder; actual implementation depends on DataStage target DB.
+    pass
+
+# =========================
+# 4. DBT EXECUTION
+# =========================
+
+def run_dbt_model(model_name: str, dbt_project_dir: str, dbt_vars: dict) -> bool:
+    """
+    Runs a dbt model using the dbt CLI.
+    """
+    try:
+        dbt_cmd = ["dbt", "run", "--select", model_name]
+        for k, v in dbt_vars.items():
+            dbt_cmd += ["--vars", f"{k}: '{v}'"]
+        dbt_cmd += ["--project-dir", dbt_project_dir]
+        logging.info(f"Running DBT model: {' '.join(dbt_cmd)}")
+        result = subprocess.run(dbt_cmd, capture_output=True, text=True)
+        logging.info(f"DBT stdout: {result.stdout}")
+        logging.info(f"DBT stderr: {result.stderr}")
+        if result.returncode != 0:
+            logging.error(f"DBT run failed with code {result.returncode}")
+            return False
+        return True
+    except Exception as e:
+        logging.exception(f"Exception running DBT model: {e}")
+        return False
+
+# =========================
+# 5. DATA EXTRACTION
+# =========================
+
+def fetch_snowflake_table(table_name: str, engine, chunk_size=100000) -> pd.DataFrame:
+    """
+    Fetches a table from Snowflake into a pandas DataFrame.
+    """
+    try:
+        logging.info(f"Fetching table {table_name} from Snowflake")
+        df = pd.read_sql(f"SELECT * FROM {table_name}", engine, chunksize=chunk_size)
+        if hasattr(df, '__next__'):
+            # If chunked, concatenate
+            df = pd.concat(list(df))
+        return df
+    except Exception as e:
+        logging.exception(f"Failed to fetch table {table_name}: {e}")
+        return pd.DataFrame()
+
+def save_dataframe(df: pd.DataFrame, path: str, fmt: str = "csv"):
+    try:
+        if fmt == "csv":
+            df.to_csv(path, index=False)
+        elif fmt == "parquet":
+            df.to_parquet(path, index=False)
+        logging.info(f"Saved DataFrame to {path}")
+    except Exception as e:
+        logging.exception(f"Failed to save DataFrame to {path}: {e}")
+
+# =========================
+# 6. DATA COMPARISON
+# =========================
+
+def compare_dataframes(
+    df1: pd.DataFrame, df2: pd.DataFrame, keys: List[str]
+) -> Dict[str, Any]:
+    """
+    Compare two DataFrames on row and column level.
+    Returns a dict with match status, metrics, and mismatches.
+    """
+    result = {
+        "row_count_1": len(df1),
+        "row_count_2": len(df2),
+        "row_count_match": len(df1) == len(df2),
+        "column_match": set(df1.columns) == set(df2.columns),
+        "column_diffs": list(set(df1.columns).symmetric_difference(set(df2.columns))),
+        "row_mismatches": [],
+        "match_percentage": 0.0,
+    }
+    if not result["column_match"]:
+        return result
+    # Sort for deterministic comparison
+    df1_sorted = df1.sort_values(keys).reset_index(drop=True)
+    df2_sorted = df2.sort_values(keys).reset_index(drop=True)
+    # Handle NULLs, case, and type
+    df1_sorted = df1_sorted.fillna("~NULL~").astype(str)
+    df2_sorted = df2_sorted.fillna("~NULL~").astype(str)
+    mismatches = []
+    for i in range(min(len(df1_sorted), len(df2_sorted))):
+        row1 = df1_sorted.iloc[i].to_dict()
+        row2 = df2_sorted.iloc[i].to_dict()
+        if row1 != row2:
+            mismatches.append({"row1": row1, "row2": row2})
+    result["row_mismatches"] = mismatches[:10]  # sample
+    result["match_percentage"] = (
+        100.0 * (len(df1_sorted) - len(mismatches)) / max(len(df1_sorted), 1)
+    )
+    result["match_status"] = (
+        "MATCH"
+        if result["row_count_match"] and result["column_match"] and not mismatches
+        else "PARTIAL MATCH"
+        if result["row_count_match"] and result["column_match"]
+        else "NO MATCH"
+    )
+    return result
+
+# =========================
+# 7. REPORTING
+# =========================
+
+def generate_report(
+    table_name: str, compare_result: dict, output_dir: str = "."
+) -> None:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report = {
+        "table": table_name,
+        "match_status": compare_result.get("match_status"),
+        "row_count_1": compare_result.get("row_count_1"),
+        "row_count_2": compare_result.get("row_count_2"),
+        "row_count_match": compare_result.get("row_count_match"),
+        "column_match": compare_result.get("column_match"),
+        "column_diffs": compare_result.get("column_diffs"),
+        "match_percentage": compare_result.get("match_percentage"),
+        "row_mismatches": compare_result.get("row_mismatches"),
+    }
+    # Console
+    print(json.dumps(report, indent=2))
+    # CSV
+    csv_path = os.path.join(output_dir, f"reconciliation_{table_name}_{ts}.csv")
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=report.keys())
+        writer.writeheader()
+        writer.writerow({k: str(v) for k, v in report.items()})
+    # JSON
+    json_path = os.path.join(output_dir, f"reconciliation_{table_name}_{ts}.json")
+    with open(json_path, "w") as f:
+        json.dump(report, f, indent=2)
+    logging.info(f"Report generated for {table_name}: {csv_path}, {json_path}")
+
+# =========================
+# 8. MAIN VALIDATION LOGIC
+# =========================
+
+def main():
+    load_env_vars()
+    # Parameters
+    datastage_job = os.environ.get("DATASTAGE_JOB_NAME", "SCD2_DIM_POLICY_Load")
+    datastage_project = os.environ.get("DATASTAGE_PROJECT", "DWH")
+    datastage_params = {
+        "RUN_DATE": os.environ.get("RUN_DATE", "2024-01-01"),
+        "BATCH_ID": os.environ.get("BATCH_ID", "AUTO"),
+    }
+    dbt_model = os.environ.get("DBT_MODEL", "DataStage_To_DBT_Conversion")
+    dbt_project_dir = os.environ.get("DBT_PROJECT_DIR", "./DBT_Project")
+    dbt_vars = {
+        "run_date": os.environ.get("RUN_DATE", "2024-01-01"),
+        "batch_id": os.environ.get("BATCH_ID", "AUTO"),
+    }
+    output_dir = os.environ.get("VALIDATION_OUTPUT_DIR", ".")
+    # Table mapping
+    datastage_table = os.environ.get("DATASTAGE_OUTPUT_TABLE", "DATASTAGE_DIM_POLICY_OUTPUT")
+    dbt_table = os.environ.get("DBT_OUTPUT_TABLE", "DATASTAGE_TO_DBT_CONVERSION")
+    compare_keys = [
+        "policy_id", "effective_from"
+    ]  # SCD2 natural key
+
+    # 1. Run DataStage job
+    logging.info("=== Executing DataStage job ===")
+    ds_success = run_datastage_job(datastage_job, datastage_project, datastage_params)
+    if not ds_success:
+        logging.error("DataStage job failed. Exiting.")
+        sys.exit(2)
+
+    # 2. Run DBT job
+    logging.info("=== Executing DBT job ===")
+    dbt_success = run_dbt_model(dbt_model, dbt_project_dir, dbt_vars)
+    if not dbt_success:
+        logging.error("DBT job failed. Exiting.")
+        sys.exit(2)
+
+    # 3. Extract outputs
+    engine = get_snowflake_engine()
+    ds_df = fetch_snowflake_table(datastage_table, engine)
+    dbt_df = fetch_snowflake_table(dbt_table, engine)
+    save_dataframe(ds_df, os.path.join(output_dir, "datastage_output.csv"))
+    save_dataframe(dbt_df, os.path.join(output_dir, "dbt_output.csv"))
+
+    # 4. Compare outputs
+    logging.info("=== Comparing outputs ===")
+    compare_result = compare_dataframes(ds_df, dbt_df, compare_keys)
+    generate_report(dbt_table, compare_result, output_dir)
+
+    # 5. Exit code for CI/CD
+    if compare_result["match_status"] == "MATCH":
+        logging.info("Validation PASSED")
+        sys.exit(0)
+    elif compare_result["match_status"] == "PARTIAL MATCH":
+        logging.warning("Validation PARTIAL MATCH")
+        sys.exit(1)
+    else:
+        logging.error("Validation FAILED")
+        sys.exit(2)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logging.exception(f"Validation script failed: {e}")
+        sys.exit(2)
