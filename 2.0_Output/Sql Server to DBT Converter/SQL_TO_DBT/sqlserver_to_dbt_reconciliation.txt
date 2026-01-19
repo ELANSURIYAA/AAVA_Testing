@@ -1,126 +1,372 @@
 1. Test Cases Document:
 
-Test Case ID: TC001
-Description: Validate conversion of SQL Server table references to DBT source references using {{ source('raw', 'table_name') }} syntax.
-Input Data: DBT-compatible SQL query
-Expected Output: All table references in the DBT query use the correct DBT source syntax.
-
-Test Case ID: TC002
-Description: Validate conversion of aggregation function ARRAY_AGG(DISTINCT ...) for compatibility with target warehouse (BigQuery, Snowflake, Redshift).
-Input Data: DBT-compatible SQL query
-Expected Output: DBT query uses ARRAY_AGG(DISTINCT ...) for BigQuery and STRING_AGG(DISTINCT ...) for Snowflake/Redshift, with appropriate comments for manual adjustment.
-
-Test Case ID: TC003
-Description: Validate removal of SQL Server-specific syntax and functions (e.g., no use of GETDATE(), ISNULL(), TOP, etc.).
-Input Data: DBT-compatible SQL query
-Expected Output: DBT query does not contain SQL Server-specific functions or syntax.
-
-Test Case ID: TC004
-Description: Validate correct use of CTEs and query structure in DBT (WITH clause, GROUP BY, ORDER BY).
-Input Data: DBT-compatible SQL query
-Expected Output: DBT query preserves the logical structure and uses CTEs and GROUP BY/ORDER BY correctly.
-
-Test Case ID: TC005
-Description: Validate presence of DBT optimization recommendations and comments for manual intervention.
-Input Data: DBT-compatible SQL query
-Expected Output: DBT query includes comments on aggregation function portability and materialization recommendations.
-
-Test Case ID: TC006
-Description: Validate that the DBT query is syntactically valid and can be parsed by DBT (basic syntax check).
-Input Data: DBT-compatible SQL query
-Expected Output: DBT query does not contain syntax errors and can be parsed by DBT.
-
-Test Case ID: TC007
-Description: Validate that performance optimization recommendations (e.g., indexing, partitioning) are present in comments.
-Input Data: DBT-compatible SQL query
-Expected Output: DBT query contains comments about indexing and partitioning strategies.
-
-Test Case ID: TC008
-Description: Validate that the DBT query does not use unsupported patterns (e.g., stored procedures, dynamic SQL).
-Input Data: DBT-compatible SQL query
-Expected Output: DBT query does not contain stored procedure calls or dynamic SQL.
-
-Test Case ID: TC009
-Description: Validate that all required manual interventions are clearly documented for future developers.
-Input Data: DBT-compatible SQL query
-Expected Output: DBT query contains clear comments for manual intervention areas.
-
-Test Case ID: TC010
-Description: Validate that the DBT query does not contain any temporary tables or table variables.
-Input Data: DBT-compatible SQL query
-Expected Output: DBT query does not use temporary tables or table variables.
+| Test Case ID | Description                                                           | Input Data                                                                                                   | Expected Output                                                                                                 |
+|--------------|-----------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: Multiple completed orders for multiple users              | Multiple users, multiple completed orders, multiple categories                                               | Aggregation per user: total_orders, total_spent, avg_order_value, categories_bought, sorted by spent            |
+| TC02         | Edge case: User with a single completed order                        | One user, one completed order                                                                                | Aggregation returns correct counts and arrays for single record                                                  |
+| TC03         | Edge case: User with multiple orders for same product category       | One user, multiple completed orders for same category                                                        | categories_bought contains unique categories only                                                               |
+| TC04         | Edge case: User with no completed orders                             | One user, only non-completed orders                                                                          | User not present in output                                                                                      |
+| TC05         | Boundary: Order with zero total_amount                               | One completed order with total_amount=0                                                                      | Zero values correctly aggregated and reflected in total_spent and avg_order_value                               |
+| TC06         | Null handling: Orders with null product_category                     | One completed order, product_category=None                                                                   | categories_bought does not include null, or includes if logic allows                                            |
+| TC07         | Null handling: Orders with null total_amount                         | One completed order, total_amount=None                                                                       | Nulls ignored in sum/avg, or handled per SQL logic                                                              |
+| TC08         | Error: Orders with missing user_id (should not join)                 | One completed order, user_id=None                                                                            | No output for orders with missing user_id                                                                       |
+| TC09         | Performance: Large dataset                                           | 1000 completed orders for one user, same product                                                             | Query completes, output correct, no performance degradation                                                     |
+| TC10         | Aggregation: Multiple users with overlapping categories              | Multiple users, overlapping categories                                                                       | Each user’s categories_bought is correct and independent                                                        |
+| TC11         | DBT compliance: Table references use {{ ref('table_name') }}         | DBT SQL code                                                                                                 | Model compiles and runs in DBT                                                                                  |
+| TC12         | Sorting: Output sorted by total_spent desc                           | Multiple users, different total_spent                                                                        | Output order matches expected                                                                                   |
+| TC13         | Data integrity: No duplicate users in output                         | Multiple completed orders per user                                                                           | Each user appears only once                                                                                     |
+| TC14         | Error: Orders with status other than 'completed'                     | Orders with status != 'completed'                                                                            | These orders are excluded from output                                                                           |
+| TC15         | Empty input tables                                                   | All input tables empty                                                                                       | Output is empty                                                                                                 |
 
 2. Pytest Script for each of the test cases.
 
 ```python
-# TC001
-def test_table_reference_conversion():
-    dbt_sql = open('SQL_TO_DBT.txt__578kpnb6').read()
-    assert "{{ source('raw', 'orders') }}" in dbt_sql
-    assert "{{ source('raw', 'users') }}" in dbt_sql
-    assert "{{ source('raw', 'order_items') }}" in dbt_sql
-    assert "{{ source('raw', 'products') }}" in dbt_sql
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql import Row
+from pyspark.sql.functions import col, collect_set, count, sum as _sum, avg
 
-# TC002
-def test_aggregation_function_conversion():
-    dbt_sql = open('SQL_TO_DBT.txt__578kpnb6').read()
-    assert "ARRAY_AGG(DISTINCT product_category)" in dbt_sql or "STRING_AGG(DISTINCT product_category, ', ')" in dbt_sql
-    assert "-- For BigQuery:" in dbt_sql
-    assert "-- For Snowflake/Redshift:" in dbt_sql
+@pytest.fixture(scope="module")
+def spark():
+    spark = SparkSession.builder.master("local[1]").appName("dbt_test").getOrCreate()
+    yield spark
+    spark.stop()
 
-# TC003
-def test_sql_server_specific_syntax_removal():
-    dbt_sql = open('SQL_TO_DBT.txt__578kpnb6').read()
-    forbidden_keywords = ["GETDATE()", "ISNULL(", "TOP "]
-    assert all(keyword not in dbt_sql for keyword in forbidden_keywords)
+def create_orders_df(spark, data):
+    return spark.createDataFrame(data)
 
-# TC004
-def test_cte_and_query_structure():
-    dbt_sql = open('SQL_TO_DBT.txt__578kpnb6').read()
-    assert "WITH customer_orders AS (" in dbt_sql
-    assert "order_summary AS (" in dbt_sql
-    assert "GROUP BY user_id, customer_name, customer_email" in dbt_sql
-    assert "ORDER BY total_spent DESC" in dbt_sql
+def create_users_df(spark, data):
+    return spark.createDataFrame(data)
 
-# TC005
-def test_dbt_optimization_comments():
-    dbt_sql = open('SQL_TO_DBT.txt__578kpnb6').read()
-    assert "-- For BigQuery:" in dbt_sql
-    assert "-- For Snowflake/Redshift:" in dbt_sql
-    assert "-- DBT Optimization Notes:" in dbt_sql
+def create_order_items_df(spark, data):
+    return spark.createDataFrame(data)
 
-# TC006
-import sqlparse
+def create_products_df(spark, data):
+    return spark.createDataFrame(data)
 
-def test_dbt_sql_syntax():
-    dbt_sql = open('SQL_TO_DBT.txt__578kpnb6').read()
-    parsed = sqlparse.parse(dbt_sql)
-    assert parsed is not None
-    assert len(parsed) > 0
+def run_order_summary(orders_df, users_df, order_items_df, products_df):
+    completed_orders = orders_df.filter(col("status") == "completed")
+    joined = completed_orders.join(users_df, completed_orders.user_id == users_df.id, "inner") \
+        .join(order_items_df, completed_orders.id == order_items_df.order_id, "inner") \
+        .join(products_df, order_items_df.product_id == products_df.id, "inner")
+    customer_orders = joined.select(
+        completed_orders.id.alias("order_id"),
+        completed_orders.user_id,
+        users_df.name.alias("customer_name"),
+        users_df.email.alias("customer_email"),
+        completed_orders.total_amount,
+        completed_orders.created_at.alias("order_date"),
+        products_df.category.alias("product_category"),
+        products_df.price.alias("product_price")
+    )
+    order_summary = customer_orders.groupBy(
+        "user_id", "customer_name", "customer_email"
+    ).agg(
+        count("order_id").alias("total_orders"),
+        _sum("total_amount").alias("total_spent"),
+        avg("total_amount").alias("avg_order_value"),
+        collect_set("product_category").alias("categories_bought")
+    )
+    order_summary = order_summary.orderBy(col("total_spent").desc())
+    return order_summary
 
-# TC007
-def test_performance_optimization_comments():
-    dbt_sql = open('SQL_TO_DBT.txt__578kpnb6').read()
-    assert "index" in dbt_sql.lower() or "partition" in dbt_sql.lower()
+def test_tc01_happy_path(spark):
+    orders = [
+        Row(id=1, user_id=10, total_amount=100, created_at="2024-06-01", status="completed"),
+        Row(id=2, user_id=10, total_amount=150, created_at="2024-06-02", status="completed"),
+        Row(id=3, user_id=20, total_amount=200, created_at="2024-06-03", status="completed"),
+    ]
+    users = [
+        Row(id=10, name="Alice", email="alice@example.com"),
+        Row(id=20, name="Bob", email="bob@example.com"),
+    ]
+    order_items = [
+        Row(order_id=1, product_id=100),
+        Row(order_id=2, product_id=101),
+        Row(order_id=3, product_id=102),
+    ]
+    products = [
+        Row(id=100, category="Books", price=50),
+        Row(id=101, category="Electronics", price=150),
+        Row(id=102, category="Books", price=200),
+    ]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = {row['user_id']: row for row in df.collect()}
+    assert result[10]['total_orders'] == 2
+    assert result[10]['total_spent'] == 250
+    assert round(result[10]['avg_order_value'], 2) == 125.0
+    assert set(result[10]['categories_bought']) == {"Books", "Electronics"}
+    assert result[20]['total_orders'] == 1
+    assert result[20]['total_spent'] == 200
+    assert round(result[20]['avg_order_value'], 2) == 200.0
+    assert set(result[20]['categories_bought']) == {"Books"}
 
-# TC008
-def test_no_unsupported_patterns():
-    dbt_sql = open('SQL_TO_DBT.txt__578kpnb6').read()
-    forbidden_patterns = ["EXEC ", "sp_", "dynamic sql"]
-    assert all(pattern.lower() not in dbt_sql.lower() for pattern in forbidden_patterns)
+def test_tc02_single_order(spark):
+    orders = [Row(id=1, user_id=10, total_amount=100, created_at="2024-06-01", status="completed")]
+    users = [Row(id=10, name="Alice", email="alice@example.com")]
+    order_items = [Row(order_id=1, product_id=100)]
+    products = [Row(id=100, category="Books", price=50)]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = df.collect()
+    assert len(result) == 1
+    row = result[0]
+    assert row['total_orders'] == 1
+    assert row['total_spent'] == 100
+    assert round(row['avg_order_value'], 2) == 100.0
+    assert set(row['categories_bought']) == {"Books"}
 
-# TC009
-def test_manual_intervention_comments():
-    dbt_sql = open('SQL_TO_DBT.txt__578kpnb6').read()
-    assert "manual adjustment" in dbt_sql.lower() or "recommend" in dbt_sql.lower()
+def test_tc03_duplicate_category(spark):
+    orders = [
+        Row(id=1, user_id=10, total_amount=100, created_at="2024-06-01", status="completed"),
+        Row(id=2, user_id=10, total_amount=150, created_at="2024-06-02", status="completed"),
+    ]
+    users = [Row(id=10, name="Alice", email="alice@example.com")]
+    order_items = [
+        Row(order_id=1, product_id=100),
+        Row(order_id=2, product_id=100),
+    ]
+    products = [Row(id=100, category="Books", price=50)]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = df.collect()
+    assert len(result) == 1
+    row = result[0]
+    assert set(row['categories_bought']) == {"Books"}
 
-# TC010
-def test_no_temp_tables_or_variables():
-    dbt_sql = open('SQL_TO_DBT.txt__578kpnb6').read()
-    forbidden_keywords = ["#temp", "table variable"]
-    assert all(keyword not in dbt_sql.lower() for keyword in forbidden_keywords)
+def test_tc04_no_completed_orders(spark):
+    orders = [Row(id=1, user_id=10, total_amount=100, created_at="2024-06-01", status="pending")]
+    users = [Row(id=10, name="Alice", email="alice@example.com")]
+    order_items = [Row(order_id=1, product_id=100)]
+    products = [Row(id=100, category="Books", price=50)]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = df.collect()
+    assert len(result) == 0
+
+def test_tc05_zero_total_amount(spark):
+    orders = [Row(id=1, user_id=10, total_amount=0, created_at="2024-06-01", status="completed")]
+    users = [Row(id=10, name="Alice", email="alice@example.com")]
+    order_items = [Row(order_id=1, product_id=100)]
+    products = [Row(id=100, category="Books", price=50)]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = df.collect()
+    assert len(result) == 1
+    row = result[0]
+    assert row['total_spent'] == 0
+    assert round(row['avg_order_value'], 2) == 0.0
+
+def test_tc06_null_product_category(spark):
+    orders = [Row(id=1, user_id=10, total_amount=100, created_at="2024-06-01", status="completed")]
+    users = [Row(id=10, name="Alice", email="alice@example.com")]
+    order_items = [Row(order_id=1, product_id=100)]
+    products = [Row(id=100, category=None, price=50)]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = df.collect()
+    assert len(result) == 1
+    row = result[0]
+    assert row['categories_bought'] == [None] or row['categories_bought'] == []
+
+def test_tc07_null_total_amount(spark):
+    orders = [Row(id=1, user_id=10, total_amount=None, created_at="2024-06-01", status="completed")]
+    users = [Row(id=10, name="Alice", email="alice@example.com")]
+    order_items = [Row(order_id=1, product_id=100)]
+    products = [Row(id=100, category="Books", price=50)]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = df.collect()
+    assert len(result) == 1
+    row = result[0]
+    assert row['total_spent'] is None
+    assert row['avg_order_value'] is None
+
+def test_tc08_missing_user_id(spark):
+    orders = [Row(id=1, user_id=None, total_amount=100, created_at="2024-06-01", status="completed")]
+    users = [Row(id=10, name="Alice", email="alice@example.com")]
+    order_items = [Row(order_id=1, product_id=100)]
+    products = [Row(id=100, category="Books", price=50)]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = df.collect()
+    assert len(result) == 0
+
+def test_tc09_performance_large_dataset(spark):
+    orders = [Row(id=i, user_id=10, total_amount=1, created_at="2024-06-01", status="completed") for i in range(1000)]
+    users = [Row(id=10, name="Alice", email="alice@example.com")]
+    order_items = [Row(order_id=i, product_id=100) for i in range(1000)]
+    products = [Row(id=100, category="Books", price=50)]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = df.collect()
+    assert len(result) == 1
+    row = result[0]
+    assert row['total_orders'] == 1000
+    assert row['total_spent'] == 1000
+    assert round(row['avg_order_value'], 2) == 1.0
+
+def test_tc10_overlapping_categories(spark):
+    orders = [
+        Row(id=1, user_id=10, total_amount=100, created_at="2024-06-01", status="completed"),
+        Row(id=2, user_id=20, total_amount=150, created_at="2024-06-02", status="completed"),
+    ]
+    users = [
+        Row(id=10, name="Alice", email="alice@example.com"),
+        Row(id=20, name="Bob", email="bob@example.com"),
+    ]
+    order_items = [
+        Row(order_id=1, product_id=100),
+        Row(order_id=2, product_id=100),
+    ]
+    products = [Row(id=100, category="Books", price=50)]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = {row['user_id']: row for row in df.collect()}
+    assert set(result[10]['categories_bought']) == {"Books"}
+    assert set(result[20]['categories_bought']) == {"Books"}
+
+def test_tc11_dbt_compliance():
+    sql = """
+    select * from {{ ref('orders') }} o
+    join {{ ref('users') }} u on o.user_id = u.id
+    join {{ ref('order_items') }} oi on o.id = oi.order_id
+    join {{ ref('products') }} p on oi.product_id = p.id
+    """
+    assert "{{ ref('orders') }}" in sql
+    assert "{{ ref('users') }}" in sql
+    assert "{{ ref('order_items') }}" in sql
+    assert "{{ ref('products') }}" in sql
+
+def test_tc12_sorting(spark):
+    orders = [
+        Row(id=1, user_id=10, total_amount=100, created_at="2024-06-01", status="completed"),
+        Row(id=2, user_id=20, total_amount=200, created_at="2024-06-02", status="completed"),
+    ]
+    users = [
+        Row(id=10, name="Alice", email="alice@example.com"),
+        Row(id=20, name="Bob", email="bob@example.com"),
+    ]
+    order_items = [
+        Row(order_id=1, product_id=100),
+        Row(order_id=2, product_id=101),
+    ]
+    products = [
+        Row(id=100, category="Books", price=50),
+        Row(id=101, category="Electronics", price=150),
+    ]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = df.collect()
+    assert result[0]['user_id'] == 20
+    assert result[1]['user_id'] == 10
+
+def test_tc13_no_duplicate_users(spark):
+    orders = [
+        Row(id=1, user_id=10, total_amount=100, created_at="2024-06-01", status="completed"),
+        Row(id=2, user_id=10, total_amount=150, created_at="2024-06-02", status="completed"),
+    ]
+    users = [Row(id=10, name="Alice", email="alice@example.com")]
+    order_items = [
+        Row(order_id=1, product_id=100),
+        Row(order_id=2, product_id=101),
+    ]
+    products = [
+        Row(id=100, category="Books", price=50),
+        Row(id=101, category="Electronics", price=150),
+    ]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = [row['user_id'] for row in df.collect()]
+    assert result.count(10) == 1
+
+def test_tc14_non_completed_orders_excluded(spark):
+    orders = [
+        Row(id=1, user_id=10, total_amount=100, created_at="2024-06-01", status="pending"),
+        Row(id=2, user_id=10, total_amount=150, created_at="2024-06-02", status="cancelled"),
+    ]
+    users = [Row(id=10, name="Alice", email="alice@example.com")]
+    order_items = [
+        Row(order_id=1, product_id=100),
+        Row(order_id=2, product_id=101),
+    ]
+    products = [
+        Row(id=100, category="Books", price=50),
+        Row(id=101, category="Electronics", price=150),
+    ]
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = df.collect()
+    assert len(result) == 0
+
+def test_tc15_empty_input(spark):
+    orders = []
+    users = []
+    order_items = []
+    products = []
+    df = run_order_summary(
+        create_orders_df(spark, orders),
+        create_users_df(spark, users),
+        create_order_items_df(spark, order_items),
+        create_products_df(spark, products)
+    )
+    result = df.collect()
+    assert len(result) == 0
 ```
 
 3. The total cost incurred for the execution of the agent.
 
-Total API Cost: $0.002 USD
+Total cost incurred for the execution of the agent: 3 operations (1 directory list + 2 file reads)
