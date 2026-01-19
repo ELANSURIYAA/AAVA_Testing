@@ -1,29 +1,26 @@
-1. Test Case Document:
+1. **Test Case Document:**
 
-- Test Case ID: TC01  
-  Description: Happy path – All required fields present, all joins succeed, all extension fields populated, and the account is not a National Account.  
-- Test Case ID: TC02  
-  Description: National Account logic – Account is a National Account, UnderwriterId should be null in JSON.  
-- Test Case ID: TC03  
-  Description: Edge case – Some extension fields are null.  
-- Test Case ID: TC04  
-  Description: Edge case – Input DataFrames are empty.  
-- Test Case ID: TC05  
-  Description: Edge case – NULLs in join keys (e.g., ContactNumber, ExternalUniqueId).  
-- Test Case ID: TC06  
-  Description: Error handling – Unexpected data type in a numeric field (e.g., string in Premium1).  
-- Test Case ID: TC07  
-  Description: Filtering logic – Only records with PostPatch='Patch', Validated is NULL, DateSent is NULL, SubmissionFlag=0 are returned.  
-- Test Case ID: TC08  
-  Description: LoopInstance calculation and filtering.  
-- Test Case ID: TC09  
-  Description: JSON_Message construction – Email fields with and without '@', ExtensionFields with and without values, and correct JSON structure.  
-- Test Case ID: TC10  
-  Description: Schema mismatch – Missing required columns in input DataFrames.  
+| Test Case ID | Description |
+|--------------|-------------|
+| TC01 | Happy path: All required fields present, all joins succeed, valid data for JSON construction |
+| TC02 | Edge: NationalAccountFlag=1, ExpirationDate > yesterday, triggers National Account logic (UnderwriterId is NULL) |
+| TC03 | Edge: NationalAccountFlag=0, ExpirationDate < yesterday, not a National Account |
+| TC04 | Edge: AccountStatus not matching any INForceListCode |
+| TC05 | Edge: Brand not matching any BrandCode |
+| TC06 | Edge: EmailAddress does not contain '@' |
+| TC07 | Edge: PrimaryContactEmail does not contain '@' |
+| TC08 | Edge: UnderwriterEmail does not contain '@' |
+| TC09 | Edge: All fields for extension fields are NULL |
+| TC10 | Edge: Empty input DataFrames |
+| TC11 | Error: Missing required columns in input DataFrames |
+| TC12 | Error: Invalid data types (e.g., string in numeric field) |
+| TC13 | Edge: Multiple rows, test LoopInstance partitioning and row_number logic |
+| TC14 | Edge: a.PostPatch != 'Patch', a.Validated IS NOT NULL, a.DateSent IS NOT NULL, a.SubmissionFlag != 0 |
+| TC15 | Edge: Complex string/numeric values (special chars, long strings, boundary numeric values) |
 
 ---
 
-2. Pytest Script for each test case
+2. **Pytest Script for each test case:**
 
 ```python
 import pytest
@@ -32,246 +29,405 @@ from pyspark.sql import functions as F
 from pyspark.sql.types import *
 import json
 
-# Assume uspAPIPatchAccount is imported from the module
+# Assume the uspAPIPatchAccount function is imported and available
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def spark():
-    return SparkSession.builder.master("local[1]").appName("pytest-pyspark").getOrCreate()
+    return SparkSession.builder.master("local[2]").appName("unit-tests").getOrCreate()
 
-def make_df(spark, schema, data):
-    return spark.createDataFrame(data, schema=schema)
-
-def extract_json_ops(json_message):
-    return json.loads(json_message)
-
-# --- Test Cases ---
-
-def test_TC01_happy_path(spark):
-    # All required fields present, all joins succeed, all extension fields populated
-    schema_account = StructType([
-        StructField("ContactNumber", StringType()),
-        StructField("AccountStatus", StringType()),
-        StructField("Brand", StringType()),
-        StructField("ExternalUniqueId", StringType()),
-        StructField("UnderwriterId", StringType()),
-        StructField("PostPatch", StringType()),
-        StructField("Validated", StringType()),
-        StructField("DateSent", StringType()),
-        StructField("SubmissionFlag", IntegerType()),
-        StructField("MailingAddressProvinceId", StringType()),
-        StructField("MailingAddressAddressLine", StringType()),
-        StructField("MailingAddressCity", StringType()),
-        StructField("MailingAddressPostalCode", StringType()),
-        StructField("MailingAddressLongitude", StringType()),
-        StructField("MailingAddressLatitude", StringType()),
-        StructField("MailingAddressCounty", StringType()),
-        StructField("Name", StringType()),
-        StructField("BusinessPhone", StringType()),
-        StructField("FaxPhone", StringType()),
-        StructField("EmailAddress", StringType()),
-        StructField("Notes", StringType()),
-        StructField("Policy1", StringType()),
-        StructField("LineOfBusiness1", StringType()),
-        StructField("PricingType1", StringType()),
-        StructField("PrimaryContactEmail", StringType()),
-        StructField("PrimaryContactPhone", StringType()),
-        StructField("NewBusinessPolicyFlag", IntegerType()),
-        StructField("Premium1", StringType()),
-        # ... add all other required fields for extension fields ...
+def make_account_df(spark, rows):
+    schema = StructType([
+        StructField("AccountID", StringType(), True),
+        StructField("ContactNumber", StringType(), True),
+        StructField("SubmissionFlag", IntegerType(), True),
+        StructField("LoopInstance", IntegerType(), True),
+        StructField("Name", StringType(), True),
+        StructField("BusinessPhone", StringType(), True),
+        StructField("FaxPhone", StringType(), True),
+        StructField("EmailAddress", StringType(), True),
+        StructField("Notes", StringType(), True),
+        StructField("AccountStatus", StringType(), True),
+        StructField("Brand", StringType(), True),
+        StructField("ExternalUniqueId", StringType(), True),
+        StructField("UnderwriterId", StringType(), True),
+        StructField("PostPatch", StringType(), True),
+        StructField("Validated", StringType(), True),
+        StructField("DateSent", StringType(), True),
+        StructField("PrimaryContactEmail", StringType(), True),
+        StructField("UnderwriterEmail", StringType(), True),
+        StructField("Premium1", DoubleType(), True),
+        # ... add all other required columns for extension fields
     ])
-    data_account = [
-        ("C1", "inforce", "Accident Fund", "EU1", "UW1", "Patch", None, None, 0,
-         "MI", "123 Main", "Lansing", "48910", "84.5", "42.7", "Ingham",
-         "Acme Inc", "517-555-1234", "517-555-4321", "user@acme.com", "Test Note",
-         "P1", "LOB1", "PT1", "contact@acme.com", "555-1234", 1, "10000")
-    ]
-    df_account = make_df(spark, schema_account, data_account)
+    return spark.createDataFrame(rows, schema=schema)
 
-    schema_policy = StructType([
-        StructField("NationalAccountFlag", IntegerType()),
-        StructField("ExpirationDate", TimestampType()),
-        StructField("AccountNumber", StringType()),
+def make_policydescriptors_df(spark, rows):
+    schema = StructType([
+        StructField("AccountNumber", StringType(), True),
+        StructField("NationalAccountFlag", IntegerType(), True),
+        StructField("ExpirationDate", StringType(), True),
     ])
-    from datetime import datetime, timedelta
-    data_policy = [
-        (0, datetime.now() + timedelta(days=10), "C1")
-    ]
-    df_policy = make_df(spark, schema_policy, data_policy)
+    return spark.createDataFrame(rows, schema=schema)
 
-    schema_accountid = StructType([
-        StructField("ContactNumber", StringType()),
-        StructField("AccountID", StringType())
+def make_accountid_df(spark, rows):
+    schema = StructType([
+        StructField("ContactNumber", StringType(), True),
+        StructField("RCT_ID", StringType(), True),
+        StructField("AccountID", StringType(), True),
     ])
-    data_accountid = [("C1", "AID1")]
-    df_accountid = make_df(spark, schema_accountid, data_accountid)
+    return spark.createDataFrame(rows, schema=schema)
 
-    schema_idoverride = StructType([
-        StructField("ExternalUniqueID", StringType()),
-        StructField("ObjectType", StringType()),
-        StructField("RCT_ID", StringType())
+def make_idoverride_df(spark, rows):
+    schema = StructType([
+        StructField("ExternalUniqueID", StringType(), True),
+        StructField("ObjectType", StringType(), True),
     ])
-    data_idoverride = [("EU1", "Account", "IDO1")]
-    df_idoverride = make_df(spark, schema_idoverride, data_idoverride)
+    return spark.createDataFrame(rows, schema=schema)
 
-    result = uspAPIPatchAccount(
-        spark,
-        loop_instance=0,
-        df_account=df_account,
-        df_policy_descriptors=df_policy,
-        df_accountid=df_accountid,
-        df_idoverride=df_idoverride
-    ).collect()
+def register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df):
+    account_df.createOrReplaceTempView("RCT.Account")
+    policydescriptors_df.createOrReplaceTempView("EDSMART.Semantic.PolicyDescriptors")
+    accountid_df.createOrReplaceTempView("RCT.AccountID")
+    idoverride_df.createOrReplaceTempView("RCT.IdOverride")
+
+def parse_json_message(json_str):
+    # Helper to parse JSON_Message column
+    return json.loads(json_str)
+
+# TC01: Happy path
+def test_happy_path(spark):
+    account_df = make_account_df(spark, [
+        ("A1", "C1", 0, 0, "Test Name", "555-1234", "555-4321", "test@email.com", "note", "inforce", "Accident Fund", "EU1", "UW1", "Patch", None, None, "pc@email.com", "uw@email.com", 1000.0)
+    ])
+    policydescriptors_df = make_policydescriptors_df(spark, [
+        ("C1", 0, "2099-12-31")
+    ])
+    accountid_df = make_accountid_df(spark, [
+        ("C1", "RCT1", "A1")
+    ])
+    idoverride_df = make_idoverride_df(spark, [
+        ("EU1", "Account")
+    ])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    result = result_df.collect()
     assert len(result) == 1
     row = result[0]
-    assert row.AccountID == "AID1"
+    assert row.AccountID == "A1"
     assert row.ContactNumber == "C1"
     assert row.SubmissionFlag == 0
     assert row.LoopInstance == 0
-    ops = extract_json_ops(row.JSON_Message)
-    assert any(op["path"] == "/UnderwriterId" and op["value"] == "UW1" for op in ops)
-    assert any(op["path"] == "/MailingAddress/ProvinceID" and op["value"] == "MI" for op in ops)
+    json_msg = parse_json_message(row.JSON_Message)
+    assert any(j['path'] == "/UnderwriterId" and j['value'] == "UW1" for j in json_msg)
 
-def test_TC02_national_account_underwriterid_null(spark):
-    # National Account logic
-    schema_account = StructType([
-        StructField("ContactNumber", StringType()),
-        StructField("AccountStatus", StringType()),
-        StructField("Brand", StringType()),
-        StructField("ExternalUniqueId", StringType()),
-        StructField("UnderwriterId", StringType()),
-        StructField("PostPatch", StringType()),
-        StructField("Validated", StringType()),
-        StructField("DateSent", StringType()),
-        StructField("SubmissionFlag", IntegerType()),
-        StructField("MailingAddressProvinceId", StringType()),
-        # ... other fields ...
+# TC02: National Account logic
+def test_national_account_logic(spark):
+    account_df = make_account_df(spark, [
+        ("A2", "C2", 0, 0, "Nat Acct", "555-0000", "555-1111", "nat@email.com", "note", "inforce", "Accident Fund", "EU2", "UW2", "Patch", None, None, "pc@email.com", "uw@email.com", 2000.0)
     ])
-    data_account = [
-        ("C2", "inforce", "Accident Fund", "EU2", "UW2", "Patch", None, None, 0, "CA")
-    ]
-    df_account = make_df(spark, schema_account, data_account)
-
-    schema_policy = StructType([
-        StructField("NationalAccountFlag", IntegerType()),
-        StructField("ExpirationDate", TimestampType()),
-        StructField("AccountNumber", StringType()),
+    policydescriptors_df = make_policydescriptors_df(spark, [
+        ("C2", 1, "2099-12-31")
     ])
-    from datetime import datetime, timedelta
-    data_policy = [
-        (1, datetime.now() + timedelta(days=10), "C2")
-    ]
-    df_policy = make_df(spark, schema_policy, data_policy)
-
-    schema_accountid = StructType([
-        StructField("ContactNumber", StringType()),
-        StructField("AccountID", StringType())
+    accountid_df = make_accountid_df(spark, [
+        ("C2", "RCT2", "A2")
     ])
-    data_accountid = [("C2", "AID2")]
-    df_accountid = make_df(spark, schema_accountid, data_accountid)
-
-    schema_idoverride = StructType([
-        StructField("ExternalUniqueID", StringType()),
-        StructField("ObjectType", StringType()),
-        StructField("RCT_ID", StringType())
+    idoverride_df = make_idoverride_df(spark, [
+        ("EU2", "Account")
     ])
-    data_idoverride = [("EU2", "Account", "IDO2")]
-    df_idoverride = make_df(spark, schema_idoverride, data_idoverride)
-
-    result = uspAPIPatchAccount(
-        spark,
-        loop_instance=0,
-        df_account=df_account,
-        df_policy_descriptors=df_policy,
-        df_accountid=df_accountid,
-        df_idoverride=df_idoverride
-    ).collect()
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    result = result_df.collect()
     assert len(result) == 1
-    row = result[0]
-    ops = extract_json_ops(row.JSON_Message)
-    assert not any(op["path"] == "/UnderwriterId" for op in ops)
+    json_msg = parse_json_message(result[0].JSON_Message)
+    # UnderwriterId should be empty string for National Account
+    assert any(j['path'] == "/UnderwriterId" and j['value'] == "" for j in json_msg)
 
-def test_TC03_null_extension_fields(spark):
-    # Some extension fields are null
-    # ... similar to above, but set some extension fields to None ...
-    pass # Implement as above, asserting only non-null fields appear in JSON
-
-def test_TC04_empty_inputs(spark):
-    # All input DataFrames are empty
-    schema = StructType([StructField("ContactNumber", StringType())])
-    df_empty = make_df(spark, schema, [])
-    result = uspAPIPatchAccount(
-        spark,
-        loop_instance=0,
-        df_account=df_empty,
-        df_policy_descriptors=df_empty,
-        df_accountid=df_empty,
-        df_idoverride=df_empty
-    ).collect()
-    assert len(result) == 0
-
-def test_TC05_null_join_keys(spark):
-    # NULLs in join keys
-    # ... create records with null ContactNumber or ExternalUniqueId ...
-    pass # Implement and assert AccountID is set from IdOverride if AccountID is null
-
-def test_TC06_invalid_numeric_type(spark):
-    # Unexpected data type in Premium1
-    schema_account = StructType([
-        StructField("ContactNumber", StringType()),
-        StructField("AccountStatus", StringType()),
-        StructField("Brand", StringType()),
-        StructField("ExternalUniqueId", StringType()),
-        StructField("UnderwriterId", StringType()),
-        StructField("PostPatch", StringType()),
-        StructField("Validated", StringType()),
-        StructField("DateSent", StringType()),
-        StructField("SubmissionFlag", IntegerType()),
-        StructField("Premium1", StringType()),
+# TC03: Not a National Account
+def test_not_national_account(spark):
+    account_df = make_account_df(spark, [
+        ("A3", "C3", 0, 0, "Non Nat Acct", "555-2222", "555-3333", "nonat@email.com", "note", "inforce", "Accident Fund", "EU3", "UW3", "Patch", None, None, "pc@email.com", "uw@email.com", 3000.0)
     ])
-    data_account = [
-        ("C3", "inforce", "Accident Fund", "EU3", "UW3", "Patch", None, None, 0, "not_a_number")
-    ]
-    df_account = make_df(spark, schema_account, data_account)
-    # ... other inputs ...
-    # Should not raise error, as Premium1 is string in both schema and data
-    # If schema mismatch, test for exception
-    pass
-
-def test_TC07_filtering_logic(spark):
-    # Only records with PostPatch='Patch', Validated is NULL, DateSent is NULL, SubmissionFlag=0
-    # ... create records with various combinations ...
-    pass
-
-def test_TC08_loopinstance_calculation(spark):
-    # Test LoopInstance calculation and filtering
-    # ... create >250 records and check LoopInstance values ...
-    pass
-
-def test_TC09_json_message_structure(spark):
-    # Test JSON_Message construction for various field values
-    # ... create records with/without '@' in emails, etc. ...
-    pass
-
-def test_TC10_schema_mismatch(spark):
-    # Missing required columns
-    schema_account = StructType([
-        StructField("ContactNumber", StringType())
-        # Missing required fields
+    policydescriptors_df = make_policydescriptors_df(spark, [
+        ("C3", 0, "2000-01-01")
     ])
-    df_account = make_df(spark, schema_account, [("C4",)])
-    # ... other inputs ...
+    accountid_df = make_accountid_df(spark, [
+        ("C3", "RCT3", "A3")
+    ])
+    idoverride_df = make_idoverride_df(spark, [
+        ("EU3", "Account")
+    ])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    result = result_df.collect()
+    assert len(result) == 1
+    json_msg = parse_json_message(result[0].JSON_Message)
+    # UnderwriterId should be preserved
+    assert any(j['path'] == "/UnderwriterId" and j['value'] == "UW3" for j in json_msg)
+
+# TC04: AccountStatus not matching INForceListCode
+def test_accountstatus_not_matching_inforcelistcode(spark):
+    account_df = make_account_df(spark, [
+        ("A4", "C4", 0, 0, "No Inforce", "555-4444", "555-5555", "noinforce@email.com", "note", "not_inforce", "Accident Fund", "EU4", "UW4", "Patch", None, None, "pc@email.com", "uw@email.com", 4000.0)
+    ])
+    policydescriptors_df = make_policydescriptors_df(spark, [])
+    accountid_df = make_accountid_df(spark, [
+        ("C4", "RCT4", "A4")
+    ])
+    idoverride_df = make_idoverride_df(spark, [
+        ("EU4", "Account")
+    ])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    result = result_df.collect()
+    assert len(result) == 1
+    json_msg = parse_json_message(result[0].JSON_Message)
+    # Extension field [11] should be empty string
+    ext_fields = [j for j in json_msg if j['path'] == "/ExtensionFields"][0]['value']
+    ext_11 = next((e for e in ext_fields if e['Id'] == 11), None)
+    assert ext_11 is not None and ext_11['value'] == ""
+
+# TC05: Brand not matching BrandCode
+def test_brand_not_matching_brandcode(spark):
+    account_df = make_account_df(spark, [
+        ("A5", "C5", 0, 0, "No Brand", "555-6666", "555-7777", "nobrand@email.com", "note", "inforce", "UnknownBrand", "EU5", "UW5", "Patch", None, None, "pc@email.com", "uw@email.com", 5000.0)
+    ])
+    policydescriptors_df = make_policydescriptors_df(spark, [])
+    accountid_df = make_accountid_df(spark, [
+        ("C5", "RCT5", "A5")
+    ])
+    idoverride_df = make_idoverride_df(spark, [
+        ("EU5", "Account")
+    ])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    result = result_df.collect()
+    assert len(result) == 1
+    json_msg = parse_json_message(result[0].JSON_Message)
+    ext_fields = [j for j in json_msg if j['path'] == "/ExtensionFields"][0]['value']
+    ext_116 = next((e for e in ext_fields if e['Id'] == 116), None)
+    assert ext_116 is not None and ext_116['value'] == ""
+
+# TC06: EmailAddress does not contain '@'
+def test_emailaddress_invalid(spark):
+    account_df = make_account_df(spark, [
+        ("A6", "C6", 0, 0, "No Email", "555-8888", "555-9999", "invalidemail", "note", "inforce", "Accident Fund", "EU6", "UW6", "Patch", None, None, "pc@email.com", "uw@email.com", 6000.0)
+    ])
+    policydescriptors_df = make_policydescriptors_df(spark, [])
+    accountid_df = make_accountid_df(spark, [
+        ("C6", "RCT6", "A6")
+    ])
+    idoverride_df = make_idoverride_df(spark, [
+        ("EU6", "Account")
+    ])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    result = result_df.collect()
+    assert len(result) == 1
+    json_msg = parse_json_message(result[0].JSON_Message)
+    assert any(j['path'] == "/Email" and j['value'] == "" for j in json_msg)
+
+# TC07: PrimaryContactEmail does not contain '@'
+def test_primarycontactemail_invalid(spark):
+    account_df = make_account_df(spark, [
+        ("A7", "C7", 0, 0, "No PC Email", "555-0001", "555-0002", "valid@email.com", "note", "inforce", "Accident Fund", "EU7", "UW7", "Patch", None, None, "invalidemail", "uw@email.com", 7000.0)
+    ])
+    policydescriptors_df = make_policydescriptors_df(spark, [])
+    accountid_df = make_accountid_df(spark, [
+        ("C7", "RCT7", "A7")
+    ])
+    idoverride_df = make_idoverride_df(spark, [
+        ("EU7", "Account")
+    ])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    result = result_df.collect()
+    assert len(result) == 1
+    json_msg = parse_json_message(result[0].JSON_Message)
+    ext_fields = [j for j in json_msg if j['path'] == "/ExtensionFields"][0]['value']
+    ext_124 = next((e for e in ext_fields if e['Id'] == 124), None)
+    assert ext_124 is not None and ext_124['value'] == ""
+
+# TC08: UnderwriterEmail does not contain '@'
+def test_underwriteremail_invalid(spark):
+    account_df = make_account_df(spark, [
+        ("A8", "C8", 0, 0, "No UW Email", "555-0003", "555-0004", "valid@email.com", "note", "inforce", "Accident Fund", "EU8", "UW8", "Patch", None, None, "pc@email.com", "invalidemail", 8000.0)
+    ])
+    policydescriptors_df = make_policydescriptors_df(spark, [])
+    accountid_df = make_accountid_df(spark, [
+        ("C8", "RCT8", "A8")
+    ])
+    idoverride_df = make_idoverride_df(spark, [
+        ("EU8", "Account")
+    ])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    result = result_df.collect()
+    json_msg = parse_json_message(result[0].JSON_Message)
+    ext_fields = [j for j in json_msg if j['path'] == "/ExtensionFields"][0]['value']
+    ext_40 = next((e for e in ext_fields if e['Id'] == 40), None)
+    assert ext_40 is not None and ext_40['value'] == ""
+
+# TC09: All extension fields NULL
+def test_all_extension_fields_null(spark):
+    # Only required columns, all extension fields missing/None
+    account_df = make_account_df(spark, [
+        ("A9", "C9", 0, 0, "All Ext Null", "555-0005", "555-0006", "valid@email.com", "note", "inforce", "Accident Fund", "EU9", "UW9", "Patch", None, None, "pc@email.com", "uw@email.com", 9000.0)
+    ])
+    policydescriptors_df = make_policydescriptors_df(spark, [])
+    accountid_df = make_accountid_df(spark, [
+        ("C9", "RCT9", "A9")
+    ])
+    idoverride_df = make_idoverride_df(spark, [
+        ("EU9", "Account")
+    ])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    result = result_df.collect()
+    assert len(result) == 1
+    json_msg = parse_json_message(result[0].JSON_Message)
+    ext_fields = [j for j in json_msg if j['path'] == "/ExtensionFields"][0]['value']
+    for ext in ext_fields:
+        assert ext['value'] == "" or ext['value'] is None
+
+# TC10: Empty input DataFrames
+def test_empty_input(spark):
+    account_df = make_account_df(spark, [])
+    policydescriptors_df = make_policydescriptors_df(spark, [])
+    accountid_df = make_accountid_df(spark, [])
+    idoverride_df = make_idoverride_df(spark, [])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    assert result_df.count() == 0
+
+# TC11: Missing required columns
+def test_missing_required_columns(spark):
+    # Remove required column
+    schema = StructType([
+        StructField("AccountID", StringType(), True),
+        # Missing ContactNumber
+        StructField("SubmissionFlag", IntegerType(), True),
+        StructField("LoopInstance", IntegerType(), True),
+        StructField("Name", StringType(), True),
+        StructField("BusinessPhone", StringType(), True),
+        StructField("FaxPhone", StringType(), True),
+        StructField("EmailAddress", StringType(), True),
+        StructField("Notes", StringType(), True),
+        StructField("AccountStatus", StringType(), True),
+        StructField("Brand", StringType(), True),
+        StructField("ExternalUniqueId", StringType(), True),
+        StructField("UnderwriterId", StringType(), True),
+        StructField("PostPatch", StringType(), True),
+        StructField("Validated", StringType(), True),
+        StructField("DateSent", StringType(), True),
+        StructField("PrimaryContactEmail", StringType(), True),
+        StructField("UnderwriterEmail", StringType(), True),
+        StructField("Premium1", DoubleType(), True),
+    ])
+    account_df = spark.createDataFrame([], schema=schema)
+    policydescriptors_df = make_policydescriptors_df(spark, [])
+    accountid_df = make_accountid_df(spark, [])
+    idoverride_df = make_idoverride_df(spark, [])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
     with pytest.raises(Exception):
-        uspAPIPatchAccount(
-            spark,
-            loop_instance=0,
-            df_account=df_account,
-            df_policy_descriptors=df_account, # empty
-            df_accountid=df_account,
-            df_idoverride=df_account
-        )
+        uspAPIPatchAccount(loop_instance=0, spark=spark)
 
-# Additional helper and utility functions can be added as needed.
+# TC12: Invalid data types
+def test_invalid_data_types(spark):
+    # Premium1 as string instead of double
+    schema = StructType([
+        StructField("AccountID", StringType(), True),
+        StructField("ContactNumber", StringType(), True),
+        StructField("SubmissionFlag", IntegerType(), True),
+        StructField("LoopInstance", IntegerType(), True),
+        StructField("Name", StringType(), True),
+        StructField("BusinessPhone", StringType(), True),
+        StructField("FaxPhone", StringType(), True),
+        StructField("EmailAddress", StringType(), True),
+        StructField("Notes", StringType(), True),
+        StructField("AccountStatus", StringType(), True),
+        StructField("Brand", StringType(), True),
+        StructField("ExternalUniqueId", StringType(), True),
+        StructField("UnderwriterId", StringType(), True),
+        StructField("PostPatch", StringType(), True),
+        StructField("Validated", StringType(), True),
+        StructField("DateSent", StringType(), True),
+        StructField("PrimaryContactEmail", StringType(), True),
+        StructField("UnderwriterEmail", StringType(), True),
+        StructField("Premium1", StringType(), True),  # Should be DoubleType
+    ])
+    account_df = spark.createDataFrame([], schema=schema)
+    policydescriptors_df = make_policydescriptors_df(spark, [])
+    accountid_df = make_accountid_df(spark, [])
+    idoverride_df = make_idoverride_df(spark, [])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    with pytest.raises(Exception):
+        uspAPIPatchAccount(loop_instance=0, spark=spark)
 
+# TC13: Multiple rows, LoopInstance partitioning
+def test_loopinstance_partitioning(spark):
+    rows = []
+    for i in range(500):
+        rows.append((
+            f"A{i}", f"C{i}", 0, 0, f"Name{i}", "555-0000", "555-0000", f"user{i}@email.com", "note", "inforce", "Accident Fund", f"EU{i}", f"UW{i}", "Patch", None, None, "pc@email.com", "uw@email.com", float(i)
+        ))
+    account_df = make_account_df(spark, rows)
+    policydescriptors_df = make_policydescriptors_df(spark, [])
+    accountid_df = make_accountid_df(spark, [(f"C{i}", f"RCT{i}", f"A{i}") for i in range(500)])
+    idoverride_df = make_idoverride_df(spark, [(f"EU{i}", "Account") for i in range(500)])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df_0 = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    result_df_1 = uspAPIPatchAccount(loop_instance=1, spark=spark)
+    assert result_df_0.count() == 250
+    assert result_df_1.count() == 250
+
+# TC14: Filtering out by PostPatch, Validated, DateSent, SubmissionFlag
+def test_filtering_logic(spark):
+    # Only one row matches all filters
+    rows = [
+        ("A1", "C1", 0, 0, "Name1", "555-0000", "555-0000", "user1@email.com", "note", "inforce", "Accident Fund", "EU1", "UW1", "Patch", None, None, "pc@email.com", "uw@email.com", 1.0),
+        ("A2", "C2", 0, 0, "Name2", "555-0000", "555-0000", "user2@email.com", "note", "inforce", "Accident Fund", "EU2", "UW2", "NotPatch", None, None, "pc@email.com", "uw@email.com", 2.0),
+        ("A3", "C3", 0, 0, "Name3", "555-0000", "555-0000", "user3@email.com", "note", "inforce", "Accident Fund", "EU3", "UW3", "Patch", "Yes", None, "pc@email.com", "uw@email.com", 3.0),
+        ("A4", "C4", 0, 0, "Name4", "555-0000", "555-0000", "user4@email.com", "note", "inforce", "Accident Fund", "EU4", "UW4", "Patch", None, "2022-01-01", "pc@email.com", "uw@email.com", 4.0),
+        ("A5", "C5", 1, 0, "Name5", "555-0000", "555-0000", "user5@email.com", "note", "inforce", "Accident Fund", "EU5", "UW5", "Patch", None, None, "pc@email.com", "uw@email.com", 5.0),
+    ]
+    account_df = make_account_df(spark, rows)
+    policydescriptors_df = make_policydescriptors_df(spark, [])
+    accountid_df = make_accountid_df(spark, [(f"C{i}", f"RCT{i}", f"A{i}") for i in range(1, 6)])
+    idoverride_df = make_idoverride_df(spark, [(f"EU{i}", "Account") for i in range(1, 6)])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    result = result_df.collect()
+    assert len(result) == 1
+    assert result[0].AccountID == "A1"
+
+# TC15: Complex string/numeric values
+def test_complex_values(spark):
+    account_df = make_account_df(spark, [
+        ("A10", "C10", 0, 0, "Name\nWith\"Special\\Chars", "555-0000", "555-0000", "user10@email.com", "note\nwith special chars", "inforce", "Accident Fund", "EU10", "UW10", "Patch", None, None, "pc@email.com", "uw@email.com", 10.0)
+    ])
+    policydescriptors_df = make_policydescriptors_df(spark, [])
+    accountid_df = make_accountid_df(spark, [
+        ("C10", "RCT10", "A10")
+    ])
+    idoverride_df = make_idoverride_df(spark, [
+        ("EU10", "Account")
+    ])
+    register_temp_tables(spark, account_df, policydescriptors_df, accountid_df, idoverride_df)
+    result_df = uspAPIPatchAccount(loop_instance=0, spark=spark)
+    result = result_df.collect()
+    assert len(result) == 1
+    json_msg = parse_json_message(result[0].JSON_Message)
+    # Should not throw, and JSON should be valid
+    assert any(j['path'] == "/Name" and "Special\\Chars" in j['value'] for j in json_msg)
 ```
 
-3. apiCost: 0.0180
+---
+
+**Test Execution Report Template**
+
+| Test Case ID | Description | Input Data | Expected Output | Actual Output | Status | Execution Time (s) |
+|--------------|-------------|------------|----------------|--------------|--------|--------------------|
+| TCXX         | ...         | ...        | ...            | ...          | Pass/Fail | ...               |
+
+---
+
+**apiCost:** 0.016
