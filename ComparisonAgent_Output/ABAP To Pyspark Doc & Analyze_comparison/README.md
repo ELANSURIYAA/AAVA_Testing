@@ -1,12 +1,11 @@
 # Comparison Report
 
-Generated: 2026-01-19 01:12:40
+Generated: 2026-01-19 08:31:24
 
 ## Sources
 - AAVA 1.0: ABAP_To_Pyspark_Doc___Analyze
 - AAVA 2.0: ABAP To Pyspark Doc & Analyze
 
 ## Files
-- 📄 TXT: Full comparison report
-- 📊 JSON: Structured data
-- 📊 Excel: Extracted tables
+- 📊 Excel: `<agent_name>.xlsx` - All tables
+- 📄 JSON: `*.json` - Full structured data
