@@ -1,0 +1,241 @@
+# T-SQL to PySpark Conversion Analysis: uspAPIPatchAccount
+
+## 1. Script Overview
+
+The `uspAPIPatchAccount` stored procedure is designed to generate PATCH data in JSON format for API integration related to account information. It retrieves account data that requires updating (where `PostPatch = 'Patch'` and `Validated IS NULL` and `DateSent IS NULL`) and formats it into a structured JSON payload with PATCH operations for each field. The procedure supports batched processing of accounts to manage data volume efficiently, handles special cases like national accounts, and ensures data quality by validating email formats and handling null values appropriately.
+
+The primary business objective is to synchronize account data between internal systems and external APIs through incremental updates, maintaining consistent account information across systems while optimizing API calls through batched processing.
+
+## 2. Complexity Metrics
+
+| Metric | Count | Details |
+|--------|-------|---------|
+| **Number of Lines** | 325 | Total lines in the SQL script |
+| **Tables Used** | 4 | EDSMART.Semantic.PolicyDescriptors, RCT.Account, RCT.AccountID, RCT.IdOverride |
+| **Joins** | 5 | All LEFT JOINs between tables and CTEs |
+| **Temporary Tables** | 0 | Uses CTEs instead of temporary tables |
+| **Aggregate Functions** | 2 | ROW_NUMBER() for batch calculation and sorting by premium |
+| **DML Statements** | 1 | SELECT statement (read-only procedure) |
+| **Conditional Logic** | 15+ | Multiple IIF statements, COALESCE operations, and conditional filtering |
+| **CTEs** | 4 | NationalAccts, INForceListCode, BrandCode, Final |
+
+## 3. Syntax Differences
+
+The T-SQL code contains approximately **25 syntax differences** that need to be addressed when converting to PySpark:
+
+| Category | Count | Examples |
+|----------|-------|----------|
+| Function Calls | 8 | COALESCE → coalesce(), DATEADD → date_add(), GETDATE → current_date() |
+| String Operations | 5 | String concatenation using '+' → concat() or concat_ws() |
+| Control Flow | 4 | IIF → when().otherwise() |
+| Window Functions | 2 | ROW_NUMBER() OVER → row_number().over() |
+| Join Syntax | 5 | T-SQL JOIN → DataFrame.join() |
+| Parameter Handling | 1 | @LoopInstance → function parameter |
+
+## 4. Manual Adjustments
+
+### Function Replacements
+
+| T-SQL Function | PySpark Equivalent | Example |
+|----------------|-------------------|---------|
+| COALESCE | coalesce() | `coalesce(col("AC.AccountID"), col("ID.RCT_ID"))` |
+| IIF | when().otherwise() | `when(col("NA.AccountNumber").isNull(), col("UnderwriterId")).otherwise(lit(None))` |
+| DATEADD | date_add() | `date_add(current_date(), -1)` |
+| GETDATE | current_date() | `current_date()` |
+| CAST | cast() | `col("column").cast("string")` |
+| ROW_NUMBER() | row_number().over() | `row_number().over(Window.orderBy("ContactNumber"))` |
+| String LIKE | like() | `col("EmailAddress").like("%@%")` |
+
+### Syntax Adjustments
+
+1. **JSON Construction**: The most complex part requiring complete redesign
+   ```python
+   # Instead of string concatenation for JSON:
+   patch_operations = []
+   
+   # For each field that needs to be included:
+   if row.UnderwriterId is not None:
+       patch_operations.append({
+           "op": "replace",
+           "path": "/UnderwriterId",
+           "value": row.UnderwriterId
+       })
+   
+   # Convert to JSON string
+   import json
+   json_message = json.dumps(patch_operations)
+   ```
+
+2. **Batching Logic**: Replace integer division for batching
+   ```python
+   # Instead of:
+   # (ROW_NUMBER() OVER (ORDER BY A.ContactNumber) -1) / 250 AS LoopInstance
+   
+   # Use:
+   window_spec = Window.orderBy("ContactNumber")
+   df = df.withColumn("LoopInstance", 
+                     (row_number().over(window_spec) - 1) / lit(250))
+   ```
+
+3. **CTEs**: Replace with temporary views or DataFrame variables
+   ```python
+   # Instead of WITH CTEs:
+   national_accts = spark.table("EDSMART.Semantic.PolicyDescriptors") \
+       .filter(col("NationalAccountFlag") == 1) \
+       .filter(col("ExpirationDate") > lit(date_param)) \
+       .select("AccountNumber").distinct()
+   ```
+
+### Unsupported Features
+
+1. **Complex String Concatenation for JSON**: Replace with structured JSON building
+   ```python
+   # Use struct() to build nested structures
+   from pyspark.sql.functions import struct, to_json
+   
+   # For nested structures like MailingAddress
+   mailing_address = struct(
+       col("MailingAddressProvinceId").alias("ProvinceID"),
+       col("MailingAddressAddressLine").alias("AddressLine"),
+       col("MailingAddressCity").alias("City"),
+       col("MailingAddressPostalCode").alias("PostalCode"),
+       col("MailingAddressLongitude").alias("Longitude"),
+       col("MailingAddressLatitude").alias("Latitude"),
+       col("MailingAddressCounty").alias("County")
+   )
+   
+   # Convert to JSON
+   df = df.withColumn("MailingAddressJson", to_json(mailing_address))
+   ```
+
+2. **Extensive COALESCE Chains**: Replace with more efficient null handling
+   ```python
+   # For extension fields, build an array of structs
+   from pyspark.sql.functions import array, struct, when
+   
+   extension_fields = []
+   for field_id, field_name in field_mappings:
+       # Only add non-null fields
+       if col(field_name).isNotNull():
+           extension_fields.append(
+               struct(lit(field_id).alias("Id"), 
+                     col(field_name).alias("value"))
+           )
+   
+   df = df.withColumn("ExtensionFields", array(extension_fields))
+   ```
+
+## 5. Conversion Complexity
+
+**Complexity Score: 80/100**
+
+The high complexity score is based on:
+
+1. **Data Volume**: Large tables (1TB, 500GB, 300GB, 200GB) with ~200GB processed
+2. **Complex JSON Construction**: Extensive string manipulation for building JSON
+3. **Multiple Joins**: Five LEFT JOINs between tables and CTEs
+4. **Conditional Logic**: Numerous IIF and COALESCE operations
+5. **Extensive Field Mapping**: Over 60 fields being processed and formatted
+
+**High-Complexity Areas:**
+
+1. **JSON Construction**: The most complex part is the extensive string concatenation to build the JSON payload, which requires a complete redesign in PySpark.
+2. **Null Handling**: The procedure uses COALESCE extensively to handle NULL values in the JSON.
+3. **Batching Logic**: The ROW_NUMBER() and integer division for batching needs careful implementation in PySpark.
+4. **Extension Fields**: The dynamic construction of extension fields with varying IDs requires special handling.
+
+## 6. Optimization Techniques
+
+### PySpark Optimization Strategies
+
+1. **Partitioning Strategy**:
+   - Partition by ContactNumber or AccountID to distribute processing
+   - Use approximately 200-400 partitions for the ~200GB of processed data
+
+2. **Broadcast Joins**:
+   ```python
+   from pyspark.sql.functions import broadcast
+   
+   # Broadcast smaller lookup tables
+   df = main_df.join(broadcast(national_accts), 
+                    main_df["ContactNumber"] == national_accts["AccountNumber"], 
+                    "left")
+   ```
+
+3. **Column Pruning**:
+   ```python
+   # Select only necessary columns early
+   account_df = spark.table("RCT.Account").select(
+       "ContactNumber", "PostPatch", "Validated", "DateSent", 
+       "SubmissionFlag", "UnderwriterId", "Name", "BusinessPhone",
+       # Other required columns...
+   )
+   ```
+
+4. **Caching Strategy**:
+   ```python
+   # Cache lookup tables
+   national_accts.cache()
+   inforce_list_code.cache()
+   brand_code.cache()
+   ```
+
+5. **JSON Optimization**:
+   - Use struct() and to_json() instead of string concatenation
+   - Consider using Pandas UDFs for complex JSON formatting if needed
+
+6. **Memory Management**:
+   ```python
+   # Process in smaller batches if memory pressure is high
+   for batch_id in range(0, total_batches):
+       process_batch(batch_id)
+       # Clear cache between batches if needed
+       spark.catalog.clearCache()
+   ```
+
+### Recommendation: **Rebuild**
+
+**Reasoning**: The extensive string manipulation for JSON construction in the original T-SQL code is fundamentally incompatible with PySpark's data processing model. A simple refactoring would result in inefficient code that doesn't leverage PySpark's strengths. A complete rebuild allows:
+
+1. Proper structuring of data using DataFrame operations
+2. Efficient handling of JSON construction using PySpark's native functions
+3. Better parallelization and distribution of processing
+4. Optimization of memory usage and shuffle operations
+5. Implementation of proper error handling and monitoring
+
+The rebuild approach will require more initial development effort but will result in a more maintainable, efficient, and scalable solution in the long term.
+
+## 7. API Cost Calculation
+
+To calculate the API cost for this analysis, we need to consider:
+
+1. **Data Volume**: ~200GB processed data
+2. **Processing Complexity**: High due to joins, string operations, and JSON formatting
+3. **Databricks Pricing**: $0.15 - $0.75 per DBU-hour for Enterprise tier
+
+```python
+# Estimated execution time for processing 200GB with complex transformations
+execution_time_hours = 0.5  # Estimated time in hours
+
+# Data complexity factor based on query complexity
+data_complexity_factor = 1.2
+
+# Estimate DBUs consumed
+estimated_dbus = (200 / 100) * data_complexity_factor * execution_time_hours
+
+# Calculate cost range
+min_cost_usd = estimated_dbus * 0.15
+max_cost_usd = estimated_dbus * 0.75
+avg_cost_usd = (min_cost_usd + max_cost_usd) / 2
+
+# For a medium-sized cluster processing 200GB of data with complex transformations
+```
+
+Based on these calculations:
+- Minimum Cost: 0.18 USD
+- Maximum Cost: 0.90 USD
+- Average Cost: 0.54 USD
+
+**apiCost: 0.540000 USD**
+
+This cost estimate assumes a medium-sized Databricks cluster with default configurations. Actual costs may vary based on specific cluster configurations, optimization levels, and actual execution times.
