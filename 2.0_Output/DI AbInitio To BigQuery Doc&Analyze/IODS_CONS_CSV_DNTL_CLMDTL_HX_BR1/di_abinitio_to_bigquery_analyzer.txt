@@ -1,4 +1,3 @@
-```
 =======================================================================================
 Author:        Ascendion AVA+
 Created on:    
@@ -9,100 +8,123 @@ Description:   Pre-conversion analysis of Ab Initio ETL flow for BigQuery SQL mi
 
 ### Major Ab Initio Components and BigQuery Mapping
 
-| Ab Initio Component         | Purpose/Behavior                                                                 | BigQuery SQL Mapping/Pattern                | Notes/Challenges                                    |
-|----------------------------|-----------------------------------------------------------------------------------|---------------------------------------------|-----------------------------------------------------|
-| **Input Table**            | Reads from BigQuery via complex SQL join, parameterized                           | `WITH` clause or direct `SELECT`            | Already SQL, but parameterization must be handled   |
-| **Reformat**               | Field mapping, DML adaptation, business logic, enrichment                        | `SELECT` with expressions, UDFs             | Embedded `.xfr` logic may need UDFs or CTEs         |
-| **Sort**                   | Sorts data by composite key                                                       | `ORDER BY`                                  | Sorting is only meaningful with `ROW_NUMBER()` etc. |
-| **Dedup Sorted**           | Removes duplicates on composite key, keeps first occurrence                       | `ROW_NUMBER() OVER (PARTITION BY ...)`      | Must use window functions for deduplication         |
-| **Partition by Key**       | Distributes records for parallelism                                               | Not needed (BigQuery is parallel)           | Ignore for SQL, but consider for performance tuning |
-| **Output Table**           | Loads to BigQuery staging table                                                   | `INSERT INTO` or `CREATE TABLE AS SELECT`   | Direct mapping                                      |
-| **Output File (MFS)**      | Writes to multifile system                                                        | External table or export                    | May need to use BigQuery EXPORT or GCS integration  |
-| **Reject/Error/Log Ports** | Captures rejects, errors, logs at each step                                       | Use `EXCEPTIONS`, logging tables, or arrays | No direct mapping; must be emulated                 |
-| **Parameters/Variables**   | Dynamic dataset names, date ranges, DML paths, env vars                           | Use scripting, templating, or BQ scripting  | Manual intervention for orchestration               |
+| Ab Initio Component         | Functionality / Role                                 | BigQuery SQL Mapping / Notes                                              |
+|----------------------------|------------------------------------------------------|--------------------------------------------------------------------------|
+| **Input Table**            | Reads from BigQuery using complex SQL (joins, filters)| Direct mapping to BigQuery `SELECT` with `JOIN`, `WHERE`, `COALESCE`, etc.|
+| **Reformat (.xfr)**        | Field mapping, enrichment, business logic            | SQL `SELECT` with expressions, CASE, COALESCE, or UDFs for complex logic |
+| **Partition by Key**       | Distributes data for parallel processing             | Not directly needed; BigQuery is distributed; use `PARTITION BY` if needed|
+| **Sort**                   | Sorts data by deduplication keys                     | Use `ORDER BY` in subqueries/CTEs; but BigQuery is unordered by default   |
+| **Dedup Sorted**           | Removes duplicates on sorted keys                    | Use `ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...)` and filter        |
+| **Output Table**           | Loads to BigQuery staging table                      | Use `INSERT INTO ... SELECT ...` or `CREATE TABLE AS SELECT`              |
+| **Output File**            | Writes to file in DML-defined format                 | Use `EXPORT DATA` or external table writes                                |
+| **Reject/Error/Log Ports** | Error/reject handling                                | Use `EXCEPTIONS`, logging tables, or capture via scripting                |
 
-### Incompatible/Non-Native SQL Behaviors
+#### Incompatible/Non-Native SQL Behaviors
 
-- **Reject Ports**: Ab Initio's reject/error ports are not natively supported in SQL. Must be emulated via error tables, logging, or exception handling logic.
-- **Procedural/Branching**: Ab Initio supports procedural flows and conditional branching, which must be flattened into declarative SQL using CTEs, CASE, or scripting.
-- **Record-level Transformations**: `.xfr` files may contain procedural logic not directly translatable to SQL; may require UDFs or multiple CTEs.
-- **Parallelism**: Explicit partitioning for parallelism is not needed in BigQuery, but performance tuning may require clustering or partitioned tables.
+- **Reject Ports**: Ab Initio's reject/error ports route bad records; BigQuery requires explicit error handling (e.g., `SAFE_CAST`, logging failed inserts, or scripting).
+- **Procedural/Iterative Logic**: Ab Initio can have procedural flows (loops, conditional branches); BigQuery SQL is declarative—must use CTEs, scripting, or UDFs.
+- **Multi-Output Reformats**: Ab Initio can output to multiple ports; in SQL, must use CASE or split logic into multiple queries.
+- **Parameterization**: Ab Initio uses graph/environment variables; BigQuery supports scripting variables, but orchestration may be needed for dynamic SQL.
+- **Metadata Propagation**: Ab Initio propagates DML/schema; in SQL, schema must be managed explicitly.
 
 ---
 
 ## Anticipated Manual Interventions
 
-- **Embedded `.xfr` Logic**: 
-    - Custom business logic in `$AI_XFR/table_adaptor.xfr`, `$AI_XFR/GEN_CSV_FIRST_DEFINED.xfr`, and custom output mapping `.xfr` files will need to be manually translated to SQL expressions or BigQuery UDFs.
-    - Inline transforms like `out.* :: in.*;` are direct, but any complex logic (e.g., CASE, COALESCE, data type conversions) must be reviewed for SQL compatibility.
-- **.dml Schema Restructuring**: 
-    - Ab Initio DMLs define record-level schemas; BigQuery requires column-level definitions. Data types (e.g., `utf8 string(unsigned integer(4))`, `decimal(40.9, sign_reserved)`) must be mapped to BigQuery types (`STRING`, `NUMERIC`, `INT64`, `DATE`).
-    - Nullability and default values must be explicitly handled.
-- **Parameterization/Variables**: 
-    - Parameters like `${IODS_PUB_BQ_DATASET_ENR}`, `${CSVDNTL_START_DATE}` must be replaced with templating or scripting in BigQuery (e.g., using BQ scripting, dbt, or orchestration tools).
-- **Error/Reject Handling**: 
-    - No direct equivalent for reject/error ports. Must implement error logging, exception tables, or use scripting to capture failed inserts/transformations.
-- **Procedural Constructs**: 
-    - Any conditional branching or iterative logic must be flattened into SQL using CTE chains, nested queries, or scripting.
-- **Output File (MFS)**: 
-    - Multifile outputs must be replaced with BigQuery EXPORT to GCS or similar mechanisms.
+- **.xfr Logic Translation**: Custom `.xfr` files (e.g., `table_adaptor.xfr`, `GEN_CSV_FIRST_DEFINED.xfr`, `IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1_V353S6P2.xfr`) contain business logic, field derivations, error tagging, and enrichment. These must be manually reviewed and rewritten as SQL expressions or BigQuery UDFs.
+- **.dml Schema Restructuring**: Ab Initio DMLs define record-level schemas; BigQuery requires explicit column definitions. Data types (e.g., `decimal(40.9, sign_reserved)`, `utf8 string(unsigned integer(4))`) must be mapped to BigQuery types (`NUMERIC`, `STRING`, etc.).
+- **Parameter/Variable Handling**: Extensive use of parameters (e.g., dataset names, date ranges) will require orchestration via Dataform, dbt, or external scripting to inject variables into SQL.
+- **Reject/Error Handling**: Ab Initio's reject/error ports must be mapped to explicit error handling in SQL (e.g., using `SAFE_CAST`, error tables, or scripting).
+- **Procedural Constructs**: Any conditional branching, iterative logic, or multi-output flows must be refactored into CTE chains, scripting blocks, or multiple SQL statements.
+- **Performance Tuning**: Ab Initio's parallelism and partitioning are implicit; in BigQuery, must optimize via clustering, partitioning, and query design.
+- **Output File Generation**: Ab Initio writes to files with specific DML; in BigQuery, use `EXPORT DATA` or Dataflow for file outputs, ensuring delimiter and schema compatibility.
 
 ---
 
 ## Complexity Evaluation
 
-**Score: 85/100**
+**Score:** **85/100**
 
-### Justification
-
-- **Number and Variety of Components**: 20+ components, including multiple Reformat, Sort, Dedup, Partition, Output Table/File, error/reject/log ports.
-- **Use of `.xfr` Logic and Nested Expressions**: Multiple custom and generic `.xfr` files, some with complex business logic.
-- **Depth of Joins and Data Dependencies**: Multi-table joins (LEFT OUTER, INNER), composite keys, and field enrichment.
-- **File Types/Complex Formats**: Multifile system (MFS) outputs, Ab Initio DMLs, and parameterized paths.
-- **Need for BigQuery UDFs/Scripting**: Required for translating `.xfr` logic, error handling, and possibly for complex field transformations.
-- **Error/Reject Handling**: Robust error/reject/logging in Ab Initio, requiring emulation in SQL.
-- **Parameterization**: Heavy use of parameters and environment variables, requiring orchestration outside SQL.
+**Justification:**
+- **Component Variety**: 20+ components, including multiple Reformats, Dedup, Partition, Sort, Output Table/File, and error handling.
+- **Custom Transform Logic**: Multiple `.xfr` scripts with business rules, enrichment, error tagging, and field derivations.
+- **Joins & Data Dependencies**: Complex SQL in Input Table with multi-table joins, COALESCE, CASE, and conditional logic.
+- **Schema Complexity**: Large, wide schemas (hundreds of columns), with nuanced type handling and field mapping.
+- **Error/Reject Handling**: Extensive use of reject/error ports, requiring explicit mapping in SQL.
+- **Parameterization**: Heavy use of parameters for environment, paths, and dynamic SQL.
+- **Output Targets**: Both BigQuery tables and delimited files, with different schema requirements.
+- **Manual UDFs/Scripting**: Several areas require custom UDFs or scripting for logic not natively expressible in SQL.
+- **Procedural/Branching Logic**: Some procedural flows (multi-output Reformats, error tagging) not directly translatable.
+- **Metadata Management**: DML propagation and dynamic schema handling require careful mapping.
 
 ---
 
 ## Optimization Recommendation
 
-### **Rebuild**
+**Recommendation:**  
+**Rebuild** (not just refactor)
 
-- **Rationale**: The graph's complexity, heavy use of custom `.xfr` logic, procedural constructs, and robust error/reject handling mean that a direct, automated translation is not feasible. A full redesign is recommended, expressing the logic as a series of BigQuery SQL views, UDFs, and/or BQ scripting blocks.
-- **Direct Mapping**: Some components (e.g., Input Table SQL, simple Reformat, Output Table) can be mapped directly.
-- **Areas for Manual Rewrite**: All `.xfr` logic, error/reject handling, parameterization, and multifile outputs.
-
----
-
-## Recommended BigQuery SQL Patterns
-
-- **CTE Chains**: Use `WITH` clauses to replicate multi-step transformations and intermediate datasets.
-- **Window Functions**: Use `ROW_NUMBER() OVER (PARTITION BY ...)` for deduplication.
-- **UDFs**: For complex field logic from `.xfr` files, implement as BigQuery JavaScript or SQL UDFs.
-- **CASE/COALESCE**: Use for conditional logic and null handling.
-- **Scripting/Templating**: Use BQ scripting or external orchestration (e.g., dbt, Airflow) for parameterization and dynamic dataset/table names.
-- **Error Logging**: Implement error tables or logging tables to capture rejects/errors.
-- **EXPORT Statements**: Use BigQuery EXPORT to GCS for multifile outputs.
+- **Why:** The ETL flow leverages Ab Initio's procedural and component-based strengths (multi-step Reformats, error/reject ports, parameterization, and parallelism) that do not have direct, one-to-one mappings in BigQuery SQL. The presence of custom `.xfr` logic, complex error handling, and wide schemas means a full redesign is needed to ensure maintainability, performance, and correctness in BigQuery.
+- **How:** 
+  - **CTE Chains**: Use `WITH` clauses to replicate multi-step transformations.
+  - **UDFs**: Implement complex field derivations and reusable logic as BigQuery UDFs (in SQL or JavaScript).
+  - **Subqueries**: Use subqueries for intermediate transformations and enrichment.
+  - **Partitioning/Clustering**: Leverage BigQuery's table partitioning and clustering for performance.
+  - **Error Handling**: Use `SAFE_CAST`, `IFERROR`, or scripting to capture and log rejects.
+  - **Orchestration**: Use dbt, Dataform, or Cloud Composer to manage parameterization and workflow.
+  - **Validation Checkpoints**: Insert validation queries after each major transformation (row counts, hash totals, null checks).
 
 ---
 
-## Validation and Data Assurance Checkpoints
+## SQL Patterns & Strategies
 
-- **Schema Validation**: Ensure all Ab Initio DML fields are mapped to correct BigQuery types and nullability.
-- **Deduplication**: Validate deduplication logic using window functions matches Ab Initio's behavior.
-- **Business Logic**: Unit test all custom field logic/UDFs against known input/output pairs.
-- **Reject/Error Handling**: Confirm that all records that would be rejected in Ab Initio are captured in error tables/logs.
-- **Performance**: Test query performance and optimize with clustering/partitioning as needed.
-- **Data Lineage**: Document field-level lineage for audit/regulatory requirements.
+- **Deduplication**:  
+  ```sql
+  SELECT * EXCEPT(row_num)
+  FROM (
+    SELECT *, ROW_NUMBER() OVER (
+      PARTITION BY AK_UCK_ID, AK_UCK_ID_PREFIX_CD, AK_UCK_ID_SEGMENT_NO, AK_SUBMT_SVC_LN_NO
+      ORDER BY <dedup_order_cols>
+    ) AS row_num
+    FROM ...
+  )
+  WHERE row_num = 1
+  ```
+- **Field Mapping/Enrichment**:  
+  Use `SELECT ... AS ...`, `COALESCE`, `CASE`, and UDFs for complex logic.
+- **Error Handling**:  
+  Use `SAFE_CAST`, `TRY_CAST`, or wrap logic in UDFs to tag errors and route to error tables.
+- **Parameterization**:  
+  Use scripting variables or external orchestration to inject parameters.
+- **Output File**:  
+  Use `EXPORT DATA` with explicit schema and delimiter matching Ab Initio DML.
+
+---
+
+## Validation & Data Assurance Checkpoints
+
+- **Row Count Checks**: After each major transformation, compare input/output row counts.
+- **Hash Totals**: Compute hash/checksum of key columns to ensure data integrity.
+- **Null/Type Checks**: Validate that all required fields are populated and types match expectations.
+- **Reject/Error Logging**: Capture and review all records that fail transformation or load.
+- **Sample Data Audits**: Compare samples between Ab Initio output and BigQuery results.
 
 ---
 
 ## API Cost
 
-`apiCost: 0.054 USD`
+`apiCost: 0.069 USD`
 
 ---
 
-**End of Report**
-```
+## Input Files Analyzed
+
+- `/src/d9475a58-d520-47a9-8cf2-8906daacae92/tmppzd88b35/tmpgglik2jo` (Ab Initio graph, parameters, component wiring, SQL, DML)
+- (Other referenced files such as .xfr and .dml are referenced but not directly provided; their logic must be manually ported.)
+
+---
+
+**Summary:**  
+This ETL flow is highly componentized and procedural, leveraging Ab Initio's strengths in error handling, parameterization, and parallelism. Migrating to BigQuery SQL will require a full redesign, with careful attention to custom transformation logic, error/reject handling, and schema mapping. Automated translation is feasible for basic mappings, but manual intervention is required for `.xfr` logic, error handling, and orchestration. Validation checkpoints and performance tuning are essential for a successful migration.
+
+---
