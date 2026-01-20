@@ -1,131 +1,145 @@
-```
 ==================================================================================
 Author:        Ascendion AVA+
 Created on:    
 Description:   Pre-conversion analysis of Ab Initio ETL flow for PySpark migration
 ==================================================================================
 
-# IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1.mp – Pre-Conversion Analysis for PySpark Migration
-
----
-
 ## Syntax & Logical Structure Analysis
 
 ### Breakdown of Components
 
-| Ab Initio Component | Description | PySpark Equivalent | Notes |
-|---------------------|-------------|--------------------|-------|
-| **Input Table (BigQuery)** | Executes complex SQL with LEFT OUTER JOIN, INNER JOIN, and date filtering | `spark.read.format("bigquery")` or `spark.read.jdbc()` with equivalent SQL | SQL logic must be ported; ensure all joins and filters are preserved |
-| **Reformat (table_adaptor.xfr)** | Standardizes input schema, data types | `.selectExpr()`, `.withColumn()`, custom mapping functions | Map all field conversions; handle type casting explicitly |
-| **Reformat (GEN_CSV_FIRST_DEFINED.xfr)** | Applies FIRST_DEFINED logic, null handling, validation | `.na.fill()`, `.when()`, `.coalesce()`, chained `.withColumn()` | Manual translation of FIRST_DEFINED logic required |
-| **Multi-output Reformat (V353S6 Xfm Jnr)** | Splits flow into two transformation paths for output and staging | Two separate DataFrame transformations, possibly using `.cache()` or `.persist()` | Maintain parallel flows; ensure both outputs are generated |
-| **Partition by Key** | Partitions data for parallelism | `.repartition()` on key columns | Partitioning strategy must be tuned for cluster size and data skew |
-| **Sort** | Sorts by composite key | `.sortWithinPartitions()` or `.orderBy()` | Sorting is expensive; use only if necessary for deduplication |
-| **Deduplication** | Removes duplicates, keeps first occurrence | `.dropDuplicates()` or `.withColumn("row_number", ...)` + filter | Use window functions for complex deduplication logic |
-| **Output File (GCS)** | Writes to temporary GCS location | `.write.format("csv").save()` to GCS | Ensure schema and delimiter match downstream requirements |
-| **Output Table (BigQuery)** | Loads to BigQuery staging table | `.write.format("bigquery").save()` or via GCS intermediate | Use BigQuery connector; handle schema mapping carefully |
+**1. Input Table (V351S3P1 CSV 5010 DNTL CLMDTL)**
+- **Type:** BigQuery source (complex SQL)
+- **Behavior:** Executes a multi-join SQL with LEFT OUTER and INNER JOINs, COALESCE, CASE for overflow, and parameterized date filtering.
+- **PySpark Equivalent:** `spark.read.format("bigquery")` with SQL pushdown or DataFrame API for joins and filters.
+
+**2. Reformat (RFMT V351S3P1 Adaptor)**
+- **Type:** Data adaptation using `table_adaptor.xfr`
+- **Behavior:** Standardizes BigQuery output to Ab Initio internal format.
+- **PySpark Equivalent:** DataFrame schema mapping, type casting, and null handling.
+
+**3. Reformat (FD_RFMT-2)**
+- **Type:** Field definition using `GEN_CSV_FIRST_DEFINED.xfr`
+- **Behavior:** Applies first-defined logic, field validation, and standardization.
+- **PySpark Equivalent:** DataFrame column selection, `when`/`coalesce` for first-defined logic.
+
+**4. Partition by Key-3**
+- **Type:** Partitioning
+- **Behavior:** Hash partitions data on `{AK_UCK_ID, AK_UCK_ID_PREFIX_CD, AK_UCK_ID_SEGMENT_NO}` for parallelism.
+- **PySpark Equivalent:** `repartition` on key columns.
+
+**5. Sort (SORT V353S0P3)**
+- **Type:** Sort
+- **Behavior:** Sorts on `{AK_UCK_ID, AK_UCK_ID_PREFIX_CD, AK_UCK_ID_SEGMENT_NO, AK_SUBMT_SVC_LN_NO}`.
+- **PySpark Equivalent:** `orderBy` on key columns.
+
+**6. Dedup (DEDU V353S0)**
+- **Type:** Deduplication
+- **Behavior:** Removes duplicates, keeps the first record per composite key.
+- **PySpark Equivalent:** `dropDuplicates` or `window` with `row_number`.
+
+**7. Multi-output Reformat (RFMT V353S6 Xfm Jnr)**
+- **Type:** Multi-output reformat using `.xfr` files
+- **Behavior:** Splits data into two streams for different output formats.
+- **PySpark Equivalent:** DataFrame branching with different transformations per output.
+
+**8. Output File (V353S5 DS CONS CSV DENTAL CLMDTL HX)**
+- **Type:** File output (GCS)
+- **Behavior:** Writes to GCS in delimited format.
+- **PySpark Equivalent:** `df.write.format("csv").option(...).save(...)`
+
+**9. Output Table**
+- **Type:** BigQuery staging table
+- **Behavior:** Loads data into BigQuery via storage_load.
+- **PySpark Equivalent:** `df.write.format("bigquery").option(...).save(...)`
 
 ### Chained/Conditional Flows
 
-- **Multi-output Reformat**: Data splits into two transformation paths, each requiring separate PySpark logic.
-- **Reject/Log/Error Ports**: Each transformation has reject/error handling; in PySpark, this must be implemented via exception handling, error DataFrames, or logging.
-- **Parameterization**: Embedded parameter sets and dynamic dataset references must be mapped to PySpark config or environment variables.
+- **Reject/Error Ports:** Every component has reject/error ports, aborts on first reject.
+- **Branching:** Multi-output reformat splits data for different targets.
+- **Parameterization:** Extensive use of parameter sets for environment, file paths, and date ranges.
 
 ---
 
 ## Anticipated Manual Interventions
 
-- **Custom .xfr Logic**: 
-  - `table_adaptor.xfr`, `GEN_CSV_FIRST_DEFINED.xfr`, and the two output-specific `.xfr` files contain business logic (FIRST_DEFINED, null handling, validation, formatting) that must be manually re-implemented as PySpark functions or chained DataFrame operations.
-- **DML to Schema Translation**: 
-  - All field types from Ab Initio DML must be mapped to PySpark/BigQuery types. Pay special attention to large integers (e.g., `9223372036854775807`), dates, and string padding.
-- **Parameter Sets (.pset) and Dynamic Inputs**: 
-  - Ab Initio parameterization (e.g., date ranges, environment-specific configs) must be refactored as PySpark config files, environment variables, or notebook parameters.
-- **Multi-Input Joins**: 
-  - The initial SQL join logic must be carefully translated to PySpark DataFrame joins, ensuring join types and null-handling are preserved.
-- **Reject/Abort Logic**: 
-  - Ab Initio’s reject ports and abort-on-first-reject must be manually implemented using DataFrame filters, exception handling, and logging.
-- **Branching and Conditional Logic**: 
-  - CASE statements and multi-output flows require explicit branching in PySpark code.
-- **BigQuery Load Interface**: 
-  - PySpark must use the BigQuery connector or export to GCS and trigger a load job, handling errors and schema mismatches.
+- **Custom .xfr Logic:** 
+  - `table_adaptor.xfr`, `GEN_CSV_FIRST_DEFINED.xfr`, and two output-specific `.xfr` files will require manual translation to PySpark functions/UDFs.
+  - Inline logic like `out.* :: in.*` is straightforward, but business rules in `.xfr` must be reverse-engineered.
+
+- **DML Field Types:**
+  - Manual mapping from Ab Initio DML types (e.g., `utf8 string(unsigned integer(4))`, `decimal(40.9, sign_reserved)`, `date("YYYY-MM-DD")`) to PySpark schema types.
+
+- **Parameter Sets (.pset):**
+  - Dynamic parameters for file paths, dates, and environment must be mapped to PySpark config/argument parsing.
+
+- **Ab Initio-Specific Behaviors:**
+  - Multi-output reformat (one component, two outputs) must be split into explicit DataFrame branches.
+  - Reject/error handling (abort on first reject) must be implemented via exception handling or DataFrame validation.
+  - No direct PySpark equivalent for graph-level aborts on reject; requires custom error handling logic.
+
+- **SQL Pushdown:**
+  - The complex BigQuery SQL should be reviewed for compatibility with Spark SQL or DataFrame API; some logic (e.g., CASE for overflow) may need to be reimplemented in PySpark if not fully supported in pushdown.
 
 ---
 
 ## Complexity Evaluation
 
-**Score: 75 / 100**
+**Score:** **75 / 100**
 
-### Justification
-
-- **Component Count & Graph Depth**: 8 main components, moderate depth, but with multi-path flows.
-- **.xfr and .pset Usage**: 4 transformation functions, 1 parameter set; each `.xfr` likely contains non-trivial business logic.
-- **Joins & Lookups**: Complex SQL with multiple joins; no external lookup files, but join logic is dense.
-- **Iterative/Feedback Loops**: None detected.
-- **Conditional Logic**: Multi-output reformat, CASE statements, and reject handling.
-- **Output Complexity**: Dual outputs (file + BigQuery), each with its own schema and transformation path.
-- **Error Handling**: Reject and error ports require custom implementation.
-- **File Types**: Delimited CSV and BigQuery native; manageable but require careful schema handling.
-- **External Dependencies**: BigQuery, GCS, DML/XFR files.
-
-**Summary**: The graph is moderately complex, with the main challenges being translation of custom transformation logic, error handling, and dual-output management. The lack of iterative components or external lookups keeps complexity below the highest tier.
+**Justification:**
+- **Component Count & Depth:** 8 main components, linear with some branching.
+- **.xfr Usage:** 4 major .xfr files, some with business logic.
+- **Parameterization:** Moderate, but environment and date handling is dynamic.
+- **Joins:** Multi-table, multi-type (LEFT OUTER, INNER) in SQL.
+- **Deduplication:** Composite key deduplication.
+- **Conditional Logic:** CASE, COALESCE, overflow protection.
+- **File Types:** Delimited, variable-length, BigQuery native.
+- **Error Handling:** Strict (abort on first reject), requires custom translation.
+- **Manual Effort:** High for .xfr and DML translation, moderate for parameterization.
 
 ---
 
 ## Performance & Scalability Recommendations
 
-- **Broadcast Joins**: 
-  - If provider or claim reference tables are small, use `broadcast()` in PySpark to optimize join performance.
-- **Caching**: 
-  - Cache DataFrames after expensive transformations if reused in multiple output paths.
-- **Partitioning**: 
-  - Use `.repartition()` on `{AK_UCK_ID, AK_UCK_ID_PREFIX_CD, AK_UCK_ID_SEGMENT_NO}` before deduplication to minimize shuffles.
-- **Avoid UDFs**: 
-  - Implement FIRST_DEFINED and null-handling logic using native PySpark functions (`coalesce`, `when`, etc.) for better performance.
-- **Sorting**: 
-  - Use `sortWithinPartitions()` where possible; avoid global sorts unless required for deduplication.
-- **Error Handling**: 
-  - Implement error and reject tracking using side DataFrames or logging frameworks.
-- **BigQuery Writes**: 
-  - Use batch loads or partitioned writes to optimize BigQuery ingestion.
-- **Schema Management**: 
-  - Explicitly define schemas for all DataFrames to avoid inference errors and mismatches.
+- **Broadcast Joins:** If provider tables are small, use `broadcast()` in PySpark for efficient joins.
+- **Caching:** Cache intermediate DataFrames after expensive joins or transformations, especially before deduplication.
+- **Avoid UDFs:** Where possible, use native PySpark functions for COALESCE, CASE, and first-defined logic to maximize performance.
+- **Repartitioning:** Use `repartition` on partition keys before heavy shuffles (sort, dedup) to avoid data skew.
+- **Checkpointing:** For long pipelines, consider checkpointing after deduplication to avoid recomputation on failure.
+- **Vectorized Operations:** Leverage built-in PySpark vectorized functions for type conversions and null handling.
+- **Error Handling:** Implement DataFrame-level validation and exception handling to mimic "abort on first reject" logic.
 
 ---
 
 ## Refactor vs. Rebuild Recommendation
 
-**Recommendation: REBUILD**
+**Recommendation:** **Rebuild**
 
-- **Rationale**: 
-  - The presence of multiple transformation layers, custom `.xfr` logic, dual-output flows, and Ab Initio-specific error handling means a direct line-by-line refactor is not advisable.
-  - A clean PySpark implementation will be more maintainable, testable, and performant, especially if modularized by transformation stage and output path.
-  - Rebuilding allows for better alignment with PySpark/BigQuery best practices, improved error handling, and easier future enhancements.
+**Rationale:**  
+While the overall ETL flow is linear and the transformation logic is clear, the heavy reliance on custom `.xfr` logic, Ab Initio-specific error handling, and parameterization means a direct refactor would result in convoluted PySpark code. A clean rebuild, using modular PySpark functions and DataFrame APIs, will yield more maintainable, scalable, and performant code. This approach also allows for better integration with Spark-native error handling, logging, and configuration management.
 
 ---
 
-## Manual Tasks & Review Checkpoints
+## Manual Tasks & Review Checkpoints for PySpark Developers
 
-1. **Extract and Document All .xfr Logic**: Review each `.xfr` file and document transformation rules for manual translation.
-2. **Map DML to PySpark Schema**: Create a mapping table for all fields, including data types, nullability, and validation rules.
-3. **Parameterization Strategy**: Define how Ab Initio parameters will be passed to PySpark (config files, environment variables, etc.).
-4. **SQL to DataFrame Translation**: Manually translate complex SQL joins and filters to PySpark DataFrame operations.
-5. **Error/Reject Handling**: Design a framework for capturing and logging rejects and errors in PySpark.
-6. **Output Validation**: Ensure both output formats (CSV and BigQuery) are validated against downstream requirements.
-7. **Performance Testing**: Benchmark partitioning, caching, and join strategies on representative data volumes.
-8. **Logging & Monitoring**: Integrate logging for all transformation stages, including error and performance metrics.
+1. **Reverse-engineer all .xfr files** into PySpark functions/UDFs, documenting business rules.
+2. **Map DML types** to PySpark schema, ensuring precision for decimals and dates.
+3. **Translate parameter sets** into PySpark config/argument parsing.
+4. **Reimplement error/reject logic** using DataFrame validation and exception handling.
+5. **Validate SQL pushdown compatibility** for BigQuery source queries; refactor as needed.
+6. **Design modular DataFrame transformations** for each ETL stage.
+7. **Implement branching logic** for multi-output reformats as explicit DataFrame splits.
+8. **Test deduplication logic** for correctness and performance.
+9. **Review partitioning and sorting strategies** for large datasets.
+10. **Document all manual translations** and assumptions for future maintainers.
 
 ---
 
 ## API Cost
 
-- **Tokens Used (Prompt + Completion)**: ~8,500 tokens
-- **Cost per 1K tokens**: $0.002
-- **Final Cost in USD**: $0.017
-
-**apiCost: 0.017 USD**
+**apiCost: 0.024 USD**
 
 ---
 
 **End of Report**
-```
