@@ -1,0 +1,58 @@
+==================================================================================
+Author:        AAVA
+Created on:    
+Description:   Pre-conversion analysis of Ab Initio ETL flow for PySpark EMR/Glue migration
+==================================================================================
+
+####Syntax & Logical Structure Analysis:
+
+| Component             | Description of Behavior                                                                 | Likely PySpark Equivalent                | Notes (Rejects, branching, conditions)                  |
+|-----------------------|----------------------------------------------------------------------------------------|------------------------------------------|--------------------------------------------------------|
+| Read_AWS_S3           | Reads raw transaction data from S3 using specified DML schema                          | spark.read.csv/parquet from S3           | Input schema from retail_txn_raw.dml                   |
+| Read_Product_Dim      | Reads product dimension data from local directory using DML                            | spark.read.csv/parquet from S3/local     | Input schema from retail_product_dim.dml               |
+| Cleanse_Data          | Cleanses and validates transactions via cleanse_validate.xfr; routes rejects            | DataFrame.withColumn/Filter + UDFs       | Rejects to Write_Cleanse_Rejects, error tagging        |
+| Dedup_Transactions    | Deduplicates transactions on txn_id                                                    | dropDuplicates(['txn_id'])               | Branch for duplicates (not used in output)             |
+| Enrichment_Join       | Inner join with product dimension on product_sku; enriches with category, standard_cost| DataFrame.join (inner)                   | Unmatched records to Write_Product_Misses              |
+| Apply_Pricing         | Applies pricing logic via pricing_rules.xfr                                            | withColumn + custom function/UDF         | Transformation, requires business logic porting        |
+| Sort_for_Rollup       | Sorts by store_id, txn_date for rollup                                                 | orderBy(['store_id', 'txn_date'])        | Prepares for aggregation                              |
+| Store_Aggregation     | Aggregates by store/date via store_rollup.xfr                                          | groupBy(['store_id', 'txn_date']).agg    | SUM, COUNT, AVG, custom rollup logic                  |
+| Write_Summary         | Outputs daily summary to file                                                          | DataFrame.write.csv/parquet to S3        | Output schema from retail_store_summary.dml            |
+| Write_Cleanse_Rejects | Logs records rejected during cleansing                                                 | DataFrame.write.csv/parquet to S3/local  | Error log, includes error_message field                |
+| Write_Product_Misses  | Logs records missing product lookup                                                    | DataFrame.write.csv/parquet to S3/local  | Data quality log                                      |
+
+####Anticipated Manual Interventions:
+
+- Custom logic in `.xfr` files (`cleanse_validate.xfr`, `pricing_rules.xfr`, `store_rollup.xfr`) must be manually rewritten as PySpark functions, likely requiring translation of validation, pricing, and aggregation rules.
+- DML types (retail_txn_raw.dml, retail_product_dim.dml, retail_txn_enriched.dml, retail_store_summary.dml) must be manually mapped to Glue Catalog schemas, ensuring type compatibility and handling any Ab Initio-specific constructs.
+- No explicit `.pset` usage, but parameterized paths and filenames will require translation to PySpark config management or environment variables.
+- Ab Initio reject/branching flows (e.g., error tagging, product lookup misses) must be implemented using DataFrame filters and separate write operations.
+- Any Ab Initio-specific metadata or control file logic (not present here) would require manual handling if encountered in future graphs.
+
+####Complexity Evaluation:
+
+- **Complexity Score:** 68
+- **Justification:**
+    - Component count: 11 (moderate)
+    - .xfr density: 3 custom transforms (validation, pricing, rollup) requiring manual translation
+    - Joins/lookups: 1 inner join, 1 lookup miss branch
+    - Iterative/feedback loops: None
+    - Schema/file format complexity: Multiple DMLs, reject/error logs, enrichment, aggregation
+    - Branching: Rejects and misses handled via separate output flows
+
+####Performance & Scalability Recommendations:
+
+- Use broadcast joins for product dimension if it is small enough to fit in memory; otherwise, rely on standard join with partitioning.
+- Cache intermediate DataFrames after cleansing and enrichment if reused in multiple steps, especially before aggregation.
+- Partition S3 output by store_id and txn_date for efficient downstream querying and parallelism.
+- Avoid UDFs where possible; prefer native PySpark functions for validation, pricing, and aggregation logic.
+- Minimize shuffle volume by pre-partitioning on join and aggregation keys (`store_id`, `txn_date`, `product_sku`).
+- Use Glue Catalog for schema management and downstream compatibility.
+
+####Refactor vs. Rebuild Recommendation:
+
+- **Refactor:** Mostly direct translation. The graph structure is linear with clear mapping to PySpark DataFrame operations. Custom logic in .xfr files will require manual translation, but overall flow and branching can be refactored with minimal redesign.
+
+####API Cost:
+apiCost: 0.0159 USD
+
+---
