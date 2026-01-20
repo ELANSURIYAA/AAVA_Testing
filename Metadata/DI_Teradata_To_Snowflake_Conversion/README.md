@@ -1,6 +1,6 @@
 # Metadata Comparison Report - DI_Teradata_To_Snowflake_Conversion
 
-Generated: 2026-01-21 02:26:58
+Generated: 2026-01-21 03:06:03
 
 ## Sources
 - AAVA 1.0: workflow_7885.json
