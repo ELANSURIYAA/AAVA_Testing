@@ -1,14 +1,16 @@
-```python
-"""
-==================================================================
-Author:        Ascendion AVA+
-Created on:    2024-06-14
-Description:   End-to-end orchestration script for Ab Initio to PySpark migration validation on GCP.
-               - Executes Ab Initio graph and PySpark job on GCP.
-               - Performs deep reconciliation of outputs.
-               - Generates structured comparison report.
-==================================================================
-"""
+# ================================================================
+# AbInitio to PySpark Migration Validation Orchestration Script
+# Author: Ascendion AVA+
+# Description:
+#   End-to-end Python orchestration for validating AbInitio to PySpark
+#   migration on GCP. This script:
+#     1. Runs the AbInitio graph on a GCP VM, outputs to GCS (Parquet)
+#     2. Submits the converted PySpark job to Dataproc, outputs to GCS (Parquet)
+#     3. Submits a reconciliation PySpark job to compare both outputs
+#     4. Generates a structured JSON/CSV report of the comparison
+#     5. Implements robust error handling, logging, and GCP best practices
+#     6. Can be integrated into CI/CD or automated test pipelines
+# ================================================================
 
 import os
 import sys
@@ -16,340 +18,401 @@ import subprocess
 import logging
 import json
 import time
-import tempfile
+import uuid
 from datetime import datetime
 
 from google.cloud import storage
-from google.cloud import dataproc_v1 as dataproc
+from google.cloud import dataproc_v1
+from google.api_core.exceptions import NotFound
 
 # =========================
-# CONFIGURATION & LOGGING
+# Configuration & Constants
 # =========================
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-
-# Load configuration from environment variables (never hardcode secrets!)
+# Environment variables (set these in your CI/CD or runtime environment)
 GCP_PROJECT = os.environ.get("GCP_PROJECT")
 GCS_BUCKET = os.environ.get("GCS_BUCKET")
 DATAPROC_CLUSTER = os.environ.get("DATAPROC_CLUSTER")
-GCP_REGION = os.environ.get("GCP_REGION", "us-central1")
-ABINITIO_HOST = os.environ.get("ABINITIO_HOST")  # Hostname or IP for Ab Initio execution
-ABINITIO_USER = os.environ.get("ABINITIO_USER")
-ABINITIO_KEY_PATH = os.environ.get("ABINITIO_KEY_PATH")  # Path to SSH key for Ab Initio host
+DATAPROC_REGION = os.environ.get("DATAPROC_REGION", "us-central1")
+ABINITIO_VM = os.environ.get("ABINITIO_VM")  # e.g., "abinitio-vm-name"
+ABINITIO_VM_ZONE = os.environ.get("ABINITIO_VM_ZONE")  # e.g., "us-central1-a"
+ABINITIO_USER = os.environ.get("ABINITIO_USER", "abinitio_user")
+GCP_BQ_DATASET_ENR = os.environ.get("IODS_PUB_BQ_DATASET_ENR")
+GCP_BQ_DATASET_CNS = os.environ.get("IODS_PUB_BQ_DATASET_CNS")
+CSVDNTL_START_DATE = os.environ.get("CSVDNTL_START_DATE")
+CSVDNTL_END_DATE = os.environ.get("CSVDNTL_END_DATE")
 
-# Output locations (timestamped for uniqueness)
-RUN_TIMESTAMP = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-ABINITIO_OUTPUT_PATH = f"gs://{GCS_BUCKET}/abinitio_output_{RUN_TIMESTAMP}/"
-PYSPARK_OUTPUT_PATH = f"gs://{GCS_BUCKET}/pyspark_output_{RUN_TIMESTAMP}/"
-RECONCILE_REPORT_PATH = f"gs://{GCS_BUCKET}/reconcile_report_{RUN_TIMESTAMP}/"
+# Paths (relative or GCS)
+ABINITIO_GRAPH_PATH = sys.argv[1]  # e.g., "./IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1.mp"
+PYSPARK_SCRIPT_PATH = sys.argv[2]  # e.g., "./converted_pyspark_script.py"
+
+# Output directories (timestamped for uniqueness)
+RUN_ID = datetime.utcnow().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid.uuid4())[:8]
+ABINITIO_OUTPUT_PREFIX = f"abinitio_output_{RUN_ID}"
+PYSPARK_OUTPUT_PREFIX = f"pyspark_output_{RUN_ID}"
+RECONCILE_OUTPUT_PREFIX = f"reconcile_output_{RUN_ID}"
+
+ABINITIO_OUTPUT_GCS = f"gs://{GCS_BUCKET}/{ABINITIO_OUTPUT_PREFIX}/"
+PYSPARK_OUTPUT_GCS = f"gs://{GCS_BUCKET}/{PYSPARK_OUTPUT_PREFIX}/"
+RECONCILE_OUTPUT_GCS = f"gs://{GCS_BUCKET}/{RECONCILE_OUTPUT_PREFIX}/"
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(f"migration_validation_{RUN_ID}.log")
+    ]
+)
+logger = logging.getLogger("MigrationValidationOrchestrator")
 
 # =========================
-# UTILITY FUNCTIONS
+# Utility Functions
 # =========================
 
-def run_shell_command(cmd, env=None, capture_output=True):
-    """Run a shell command and return output, raise on error."""
-    logging.info(f"Running shell command: {cmd}")
+def check_env_vars():
+    required_vars = [
+        "GCP_PROJECT", "GCS_BUCKET", "DATAPROC_CLUSTER", "DATAPROC_REGION",
+        "ABINITIO_VM", "ABINITIO_VM_ZONE", "ABINITIO_USER",
+        "IODS_PUB_BQ_DATASET_ENR", "IODS_PUB_BQ_DATASET_CNS",
+        "CSVDNTL_START_DATE", "CSVDNTL_END_DATE"
+    ]
+    missing = [v for v in required_vars if not os.environ.get(v)]
+    if missing:
+        logger.error(f"Missing required environment variables: {missing}")
+        sys.exit(1)
+
+def run_cmd(cmd, shell=False, check=True):
+    logger.info(f"Running command: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
     try:
-        result = subprocess.run(
-            cmd, shell=True, check=True,
-            stdout=subprocess.PIPE if capture_output else None,
-            stderr=subprocess.PIPE if capture_output else None,
-            env=env
-        )
-        if capture_output:
-            stdout = result.stdout.decode()
-            stderr = result.stderr.decode()
-            logging.info(f"Command output: {stdout}")
-            if stderr:
-                logging.warning(f"Command stderr: {stderr}")
-            return stdout
-        return ""
+        result = subprocess.run(cmd, shell=shell, check=check, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        logger.info(f"Command output: {result.stdout}")
+        if result.stderr:
+            logger.warning(f"Command stderr: {result.stderr}")
+        return result.stdout
     except subprocess.CalledProcessError as e:
-        logging.error(f"Command failed: {e.stderr.decode() if e.stderr else str(e)}")
+        logger.error(f"Command failed: {e.stderr}")
         raise
 
-def check_gcs_path_exists(gcs_path):
-    """Check if a GCS path exists."""
-    client = storage.Client()
-    bucket_name, prefix = gcs_path.replace("gs://", "").split("/", 1)
-    bucket = client.bucket(bucket_name)
-    blobs = list(client.list_blobs(bucket, prefix=prefix))
-    return len(blobs) > 0
-
-def wait_for_gcs_output(gcs_path, timeout=900, poll_interval=30):
-    """Wait for GCS output to appear, with timeout."""
-    logging.info(f"Waiting for GCS output at {gcs_path} (timeout={timeout}s)...")
-    start = time.time()
-    while time.time() - start < timeout:
-        if check_gcs_path_exists(gcs_path):
-            logging.info(f"Output found at {gcs_path}")
+def wait_for_gcs_file(gcs_uri, timeout_sec=600, interval_sec=15):
+    """Wait for a file or directory to appear in GCS."""
+    logger.info(f"Waiting for GCS output: {gcs_uri}")
+    storage_client = storage.Client()
+    bucket_name, prefix = gcs_uri.replace("gs://", "").split("/", 1)
+    bucket = storage_client.bucket(bucket_name)
+    waited = 0
+    while waited < timeout_sec:
+        blobs = list(bucket.list_blobs(prefix=prefix))
+        if blobs:
+            logger.info(f"Found {len(blobs)} files in {gcs_uri}")
             return True
-        time.sleep(poll_interval)
-    raise TimeoutError(f"Timed out waiting for GCS output at {gcs_path}")
+        time.sleep(interval_sec)
+        waited += interval_sec
+    logger.error(f"Timeout waiting for GCS output: {gcs_uri}")
+    return False
 
-def upload_to_gcs(local_path, gcs_path):
+def upload_to_gcs(local_path, gcs_uri):
     """Upload a local file to GCS."""
-    client = storage.Client()
-    bucket_name, blob_name = gcs_path.replace("gs://", "").split("/", 1)
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
+    storage_client = storage.Client()
+    bucket_name, prefix = gcs_uri.replace("gs://", "").split("/", 1)
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(prefix)
     blob.upload_from_filename(local_path)
-    logging.info(f"Uploaded {local_path} to {gcs_path}")
+    logger.info(f"Uploaded {local_path} to {gcs_uri}")
+
+def download_from_gcs(gcs_uri, local_path):
+    """Download a GCS file to local."""
+    storage_client = storage.Client()
+    bucket_name, prefix = gcs_uri.replace("gs://", "").split("/", 1)
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(prefix)
+    blob.download_to_filename(local_path)
+    logger.info(f"Downloaded {gcs_uri} to {local_path}")
 
 # =========================
-# 1. EXECUTE AB INITIO GRAPH
+# 1. Run AbInitio Graph
 # =========================
 
-def run_abinitio_graph(graph_path, abinitio_output_path):
+def run_abinitio_graph():
     """
-    SSH into Ab Initio host and run the graph, writing output to GCS.
-    Assumes Ab Initio environment is configured to allow GCS writes.
+    SSH to AbInitio VM and run the graph, outputting to GCS as Parquet.
+    Assumes AbInitio environment is configured for GCS output.
     """
-    graph_name = os.path.basename(graph_path)
-    remote_cmd = (
-        f"air sandbox run {graph_name} "
-        f"--output_path {abinitio_output_path} "
-        f"--logfile abinitio_run_{RUN_TIMESTAMP}.log"
+    logger.info("Starting AbInitio graph execution...")
+    # Compose the command to run on the AbInitio VM
+    # The graph should be parameterized to output to ABINITIO_OUTPUT_GCS
+    ab_cmd = (
+        f"air sandbox run {os.path.basename(ABINITIO_GRAPH_PATH)} "
+        f"--param:GCS_OUTPUT_PATH={ABINITIO_OUTPUT_GCS} "
+        f"--param:IODS_PUB_BQ_DATASET_ENR={GCP_BQ_DATASET_ENR} "
+        f"--param:IODS_PUB_BQ_DATASET_CNS={GCP_BQ_DATASET_CNS} "
+        f"--param:CSVDNTL_START_DATE={CSVDNTL_START_DATE} "
+        f"--param:CSVDNTL_END_DATE={CSVDNTL_END_DATE} "
+        f"--log"
     )
-    ssh_cmd = (
-        f"ssh -i {ABINITIO_KEY_PATH} {ABINITIO_USER}@{ABINITIO_HOST} "
-        f"'{remote_cmd}'"
-    )
-    logging.info(f"Submitting Ab Initio graph via SSH: {ssh_cmd}")
-    run_shell_command(ssh_cmd)
-    logging.info("Ab Initio graph execution submitted.")
-
-# =========================
-# 2. EXECUTE PYSPARK JOB ON DATAPROC
-# =========================
-
-def submit_pyspark_job(pyspark_code_path, pyspark_output_path, job_args=None):
-    """
-    Submit the PySpark job to Dataproc.
-    pyspark_code_path: local path to the PySpark script.
-    pyspark_output_path: GCS path for output.
-    job_args: list of additional arguments to pass to the script.
-    """
-    # Upload PySpark script to GCS (Dataproc requires GCS location)
-    client = storage.Client()
-    bucket = client.bucket(GCS_BUCKET)
-    blob_name = f"pyspark_scripts/{os.path.basename(pyspark_code_path)}_{RUN_TIMESTAMP}.py"
-    blob = bucket.blob(blob_name)
-    blob.upload_from_filename(pyspark_code_path)
-    pyspark_gcs_path = f"gs://{GCS_BUCKET}/{blob_name}"
-
-    # Build Dataproc job submission command
-    args = [
-        "gcloud", "dataproc", "jobs", "submit", "pyspark", pyspark_gcs_path,
-        "--cluster", DATAPROC_CLUSTER,
-        "--region", GCP_REGION,
-        "--project", GCP_PROJECT,
-        "--",
-        f"--output_path={pyspark_output_path}"
+    # Copy the graph file to the VM
+    scp_cmd = [
+        "gcloud", "compute", "scp",
+        ABINITIO_GRAPH_PATH,
+        f"{ABINITIO_USER}@{ABINITIO_VM}:~/{os.path.basename(ABINITIO_GRAPH_PATH)}",
+        "--zone", ABINITIO_VM_ZONE
     ]
-    if job_args:
-        args.extend(job_args)
-    cmd = " ".join(args)
-    run_shell_command(cmd)
-    logging.info("PySpark job submitted to Dataproc.")
+    run_cmd(scp_cmd)
+    # SSH and run the graph
+    ssh_cmd = [
+        "gcloud", "compute", "ssh",
+        f"{ABINITIO_USER}@{ABINITIO_VM}",
+        "--zone", ABINITIO_VM_ZONE,
+        "--command", ab_cmd
+    ]
+    run_cmd(ssh_cmd)
+    # Wait for output in GCS
+    if not wait_for_gcs_file(ABINITIO_OUTPUT_GCS):
+        raise RuntimeError("AbInitio output not found in GCS after timeout.")
+    logger.info("AbInitio graph execution completed.")
 
 # =========================
-# 3. RECONCILIATION PYSPARK SCRIPT GENERATION
+# 2. Run PySpark Job on Dataproc
 # =========================
 
-def generate_reconcile_script(local_path, abinitio_output_path, pyspark_output_path, report_output_path):
+def submit_pyspark_job():
     """
-    Generate a PySpark script that compares two datasets in GCS and writes a JSON report.
+    Submits the converted PySpark script to Dataproc.
+    The script must be parameterized to write output to PYSPARK_OUTPUT_GCS.
+    """
+    logger.info("Submitting PySpark job to Dataproc...")
+    # Upload PySpark script to GCS (Dataproc requires GCS location)
+    pyspark_gcs_path = f"gs://{GCS_BUCKET}/scripts/{os.path.basename(PYSPARK_SCRIPT_PATH)}"
+    upload_to_gcs(PYSPARK_SCRIPT_PATH, pyspark_gcs_path)
+    # Prepare job arguments
+    job_args = [
+        f"--output_path={PYSPARK_OUTPUT_GCS}",
+        f"--IODS_PUB_BQ_DATASET_ENR={GCP_BQ_DATASET_ENR}",
+        f"--IODS_PUB_BQ_DATASET_CNS={GCP_BQ_DATASET_CNS}",
+        f"--CSVDNTL_START_DATE={CSVDNTL_START_DATE}",
+        f"--CSVDNTL_END_DATE={CSVDNTL_END_DATE}"
+    ]
+    # Submit job
+    job_client = dataproc_v1.JobControllerClient(
+        client_options={"api_endpoint": f"{DATAPROC_REGION}-dataproc.googleapis.com:443"}
+    )
+    job = {
+        "placement": {"cluster_name": DATAPROC_CLUSTER},
+        "pyspark_job": {
+            "main_python_file_uri": pyspark_gcs_path,
+            "args": job_args
+        }
+    }
+    operation = job_client.submit_job_as_operation(
+        request={"project_id": GCP_PROJECT, "region": DATAPROC_REGION, "job": job}
+    )
+    logger.info("Waiting for PySpark job to finish...")
+    response = operation.result()
+    logger.info(f"PySpark job finished with state: {response.status.state.name}")
+    if response.status.state.name != "DONE":
+        raise RuntimeError(f"PySpark job failed: {response.status.details}")
+    # Wait for output in GCS
+    if not wait_for_gcs_file(PYSPARK_OUTPUT_GCS):
+        raise RuntimeError("PySpark output not found in GCS after timeout.")
+    logger.info("PySpark job execution completed.")
+
+# =========================
+# 3. Submit Reconciliation PySpark Job
+# =========================
+
+def generate_reconcile_script(local_path):
+    """
+    Generates a PySpark script for reconciliation and saves to local_path.
     """
     script = f"""
-from pyspark.sql import SparkSession
-import json
 import sys
-import os
-
-abinitio_path = "{abinitio_output_path}"
-pyspark_path = "{pyspark_output_path}"
-report_path = "{report_output_path}"
+import json
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
 
 spark = SparkSession.builder.appName("AbInitio_vs_PySpark_Reconcile").getOrCreate()
 
-def load_df(path):
-    return spark.read.option("header", True).parquet(path) if path.endswith(".parquet") else spark.read.option("header", True).csv(path)
+abinitio_path = "{ABINITIO_OUTPUT_GCS}"
+pyspark_path = "{PYSPARK_OUTPUT_GCS}"
+report_path = "{RECONCILE_OUTPUT_GCS}reconcile_report.json"
 
-try:
-    df_ab = load_df(abinitio_path)
-    df_py = load_df(pyspark_path)
+# Read both outputs (assume Parquet)
+df_ab = spark.read.parquet(abinitio_path)
+df_py = spark.read.parquet(pyspark_path)
 
-    # Align schemas (by column name, ignore order)
-    ab_cols = set(df_ab.columns)
-    py_cols = set(df_py.columns)
-    common_cols = list(ab_cols & py_cols)
-    ab_only = list(ab_cols - py_cols)
-    py_only = list(py_cols - ab_cols)
+# Schema comparison
+schema_ab = [(f.name, f.dataType.simpleString()) for f in df_ab.schema.fields]
+schema_py = [(f.name, f.dataType.simpleString()) for f in df_py.schema.fields]
 
-    df_ab = df_ab.select(common_cols)
-    df_py = df_py.select(common_cols)
-
-    # Row counts
-    ab_count = df_ab.count()
-    py_count = df_py.count()
-
-    # exceptAll both ways for mismatches
-    ab_minus_py = df_ab.exceptAll(df_py)
-    py_minus_ab = df_py.exceptAll(df_ab)
-    ab_minus_py_count = ab_minus_py.count()
-    py_minus_ab_count = py_minus_ab.count()
-    mismatch_count = ab_minus_py_count + py_minus_ab_count
-
-    # Match percentage
-    match_pct = 100.0 if ab_count == py_count and mismatch_count == 0 else \
-        100.0 * (max(ab_count, py_count) - mismatch_count) / max(ab_count, py_count, 1)
-
-    # Sample mismatches
-    ab_minus_py_sample = ab_minus_py.limit(5).toPandas().to_dict(orient="records")
-    py_minus_ab_sample = py_minus_ab.limit(5).toPandas().to_dict(orient="records")
-
-    # Status
-    if ab_count == py_count and mismatch_count == 0:
-        status = "MATCH"
-    elif mismatch_count == 0:
-        status = "PARTIAL MATCH (row counts differ, but data matches)"
-    else:
-        status = "NO MATCH"
-
-    report = {{
-        "match_status": status,
-        "row_counts": {{
-            "abinitio": ab_count,
-            "pyspark": py_count,
-            "difference": ab_count - py_count
-        }},
-        "schema_comparison": {{
-            "common_columns": common_cols,
-            "abinitio_only_columns": ab_only,
-            "pyspark_only_columns": py_only
-        }},
-        "data_discrepancies": {{
-            "mismatched_rows": mismatch_count,
-            "abinitio_minus_pyspark_sample": ab_minus_py_sample,
-            "pyspark_minus_abinitio_sample": py_minus_ab_sample
-        }},
-        "match_percentage": match_pct
+schema_diff = []
+if schema_ab != schema_py:
+    ab_fields = set([x[0] for x in schema_ab])
+    py_fields = set([x[0] for x in schema_py])
+    missing_in_py = list(ab_fields - py_fields)
+    missing_in_ab = list(py_fields - ab_fields)
+    schema_diff = {{
+        "missing_in_pyspark": missing_in_py,
+        "missing_in_abinitio": missing_in_ab
     }}
 
-    # Write report as JSON to GCS
-    with open("/tmp/reconcile_report.json", "w") as f:
-        json.dump(report, f, indent=2)
-    # Upload to GCS
-    from google.cloud import storage
-    client = storage.Client()
-    bucket_name, blob_name = report_path.replace("gs://", "").split("/", 1)
-    bucket = client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-    blob.upload_from_filename("/tmp/reconcile_report.json")
+# Row count comparison
+row_count_ab = df_ab.count()
+row_count_py = df_py.count()
+row_count_diff = abs(row_count_ab - row_count_py)
 
-    print(json.dumps(report, indent=2))
-    spark.stop()
-except Exception as e:
-    print("ERROR:", str(e))
-    sys.exit(1)
-"""
+# Align columns for comparison (intersection only)
+common_cols = list(set(df_ab.columns) & set(df_py.columns))
+df_ab_sel = df_ab.select(common_cols)
+df_py_sel = df_py.select(common_cols)
+
+# Data comparison
+diff_ab_py = df_ab_sel.exceptAll(df_py_sel)
+diff_py_ab = df_py_sel.exceptAll(df_ab_sel)
+mismatch_count = diff_ab_py.count() + diff_py_ab.count()
+match_percent = 0.0
+if row_count_ab + row_count_py > 0:
+    match_percent = 100.0 * (1.0 - (mismatch_count / max(row_count_ab, row_count_py)))
+
+# Sample mismatches
+mismatch_samples = {{
+    "in_abinitio_not_in_pyspark": [row.asDict() for row in diff_ab_py.take(5)],
+    "in_pyspark_not_in_abinitio": [row.asDict() for row in diff_py_ab.take(5)]
+}}
+
+# Match status
+if mismatch_count == 0 and not schema_diff:
+    match_status = "MATCH"
+elif mismatch_count == 0 and schema_diff:
+    match_status = "PARTIAL MATCH"
+else:
+    match_status = "NO MATCH"
+
+report = {{
+    "match_status": match_status,
+    "row_counts": {{
+        "abinitio": row_count_ab,
+        "pyspark": row_count_py,
+        "difference": row_count_diff
+    }},
+    "schema_comparison": {{
+        "abinitio": schema_ab,
+        "pyspark": schema_py,
+        "differences": schema_diff
+    }},
+    "data_discrepancies": {{
+        "mismatched_rows": mismatch_count,
+        "match_percent": match_percent,
+        "samples": mismatch_samples
+    }}
+}}
+
+with open("/tmp/reconcile_report.json", "w") as f:
+    json.dump(report, f, indent=2)
+
+# Save to GCS
+spark.sparkContext._jsc.hadoopConfiguration().set("fs.gs.impl", "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem")
+spark.sparkContext._jsc.hadoopConfiguration().set("fs.AbstractFileSystem.gs.impl", "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS")
+spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+spark.read.json("/tmp/reconcile_report.json").write.mode("overwrite").json(report_path)
+    """
     with open(local_path, "w") as f:
         f.write(script)
-    logging.info(f"Generated reconciliation PySpark script at {local_path}")
+    logger.info(f"Reconciliation PySpark script written to {local_path}")
+
+def submit_reconcile_job():
+    """
+    Submits the reconciliation PySpark job to Dataproc.
+    """
+    logger.info("Submitting reconciliation PySpark job to Dataproc...")
+    local_script = f"reconcile_script_{RUN_ID}.py"
+    generate_reconcile_script(local_script)
+    gcs_script_path = f"gs://{GCS_BUCKET}/scripts/{local_script}"
+    upload_to_gcs(local_script, gcs_script_path)
+    job_client = dataproc_v1.JobControllerClient(
+        client_options={"api_endpoint": f"{DATAPROC_REGION}-dataproc.googleapis.com:443"}
+    )
+    job = {
+        "placement": {"cluster_name": DATAPROC_CLUSTER},
+        "pyspark_job": {
+            "main_python_file_uri": gcs_script_path,
+            "args": []
+        }
+    }
+    operation = job_client.submit_job_as_operation(
+        request={"project_id": GCP_PROJECT, "region": DATAPROC_REGION, "job": job}
+    )
+    logger.info("Waiting for reconciliation job to finish...")
+    response = operation.result()
+    logger.info(f"Reconciliation job finished with state: {response.status.state.name}")
+    if response.status.state.name != "DONE":
+        raise RuntimeError(f"Reconciliation job failed: {response.status.details}")
+    # Wait for report in GCS
+    if not wait_for_gcs_file(RECONCILE_OUTPUT_GCS):
+        raise RuntimeError("Reconciliation report not found in GCS after timeout.")
+    logger.info("Reconciliation job execution completed.")
 
 # =========================
-# 4. MAIN ORCHESTRATION LOGIC
+# 4. Download & Print Report
+# =========================
+
+def fetch_and_print_report():
+    """Download the reconciliation report and print summary."""
+    report_gcs = f"{RECONCILE_OUTPUT_GCS}reconcile_report.json/part-00000-*.json"
+    # Find the actual file in GCS
+    storage_client = storage.Client()
+    bucket_name, prefix = RECONCILE_OUTPUT_GCS.replace("gs://", "").split("/", 1)
+    bucket = storage_client.bucket(bucket_name)
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    json_blob = None
+    for b in blobs:
+        if b.name.endswith(".json"):
+            json_blob = b
+            break
+    if not json_blob:
+        logger.error("No JSON report found in reconciliation output.")
+        return
+    local_report = f"reconcile_report_{RUN_ID}.json"
+    json_blob.download_to_filename(local_report)
+    logger.info(f"Downloaded reconciliation report to {local_report}")
+    with open(local_report, "r") as f:
+        report = json.load(f)
+    print(json.dumps(report, indent=2))
+    # Optionally, write a CSV summary as well
+    summary_csv = f"reconcile_summary_{RUN_ID}.csv"
+    with open(summary_csv, "w") as f:
+        f.write("match_status,abinitio_row_count,pyspark_row_count,difference,mismatched_rows,match_percent\n")
+        f.write(f"{report['match_status']},{report['row_counts']['abinitio']},{report['row_counts']['pyspark']},{report['row_counts']['difference']},{report['data_discrepancies']['mismatched_rows']},{report['data_discrepancies']['match_percent']}\n")
+    logger.info(f"Summary CSV written to {summary_csv}")
+
+# =========================
+# Main Orchestration Logic
 # =========================
 
 def main():
     try:
-        # --- 1. Run Ab Initio graph ---
-        abinitio_graph_path = sys.argv[1]  # e.g., "IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1.mp"
-        logging.info("Step 1: Running Ab Initio graph...")
-        run_abinitio_graph(abinitio_graph_path, ABINITIO_OUTPUT_PATH)
-
-        # --- 2. Wait for Ab Initio output on GCS ---
-        wait_for_gcs_output(ABINITIO_OUTPUT_PATH)
-
-        # --- 3. Run PySpark job on Dataproc ---
-        pyspark_code_path = sys.argv[2]  # Path to converted PySpark code file
-        logging.info("Step 2: Running PySpark job on Dataproc...")
-        submit_pyspark_job(pyspark_code_path, PYSPARK_OUTPUT_PATH)
-
-        # --- 4. Wait for PySpark output on GCS ---
-        wait_for_gcs_output(PYSPARK_OUTPUT_PATH)
-
-        # --- 5. Generate and run reconciliation PySpark script ---
-        with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tf:
-            reconcile_script_path = tf.name
-        report_blob_path = f"reconcile_report_{RUN_TIMESTAMP}/report.json"
-        report_gcs_path = f"gs://{GCS_BUCKET}/{report_blob_path}"
-        generate_reconcile_script(
-            reconcile_script_path,
-            ABINITIO_OUTPUT_PATH,
-            PYSPARK_OUTPUT_PATH,
-            report_gcs_path
-        )
-        logging.info("Step 3: Submitting reconciliation PySpark job...")
-        submit_pyspark_job(reconcile_script_path, "", job_args=[])
-
-        # --- 6. Wait for report to appear in GCS ---
-        wait_for_gcs_output(report_gcs_path)
-
-        # --- 7. Download and print the report ---
-        client = storage.Client()
-        bucket_name, blob_name = report_gcs_path.replace("gs://", "").split("/", 1)
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        local_report = f"/tmp/reconcile_report_{RUN_TIMESTAMP}.json"
-        blob.download_to_filename(local_report)
-        with open(local_report) as f:
-            report = json.load(f)
-        logging.info("===== FINAL RECONCILIATION REPORT =====")
-        print(json.dumps(report, indent=2))
-
+        check_env_vars()
+        logger.info(f"Starting migration validation run: {RUN_ID}")
+        run_abinitio_graph()
+        submit_pyspark_job()
+        submit_reconcile_job()
+        fetch_and_print_report()
+        logger.info("Migration validation completed successfully.")
     except Exception as e:
-        logging.error(f"Orchestration failed: {str(e)}")
+        logger.error(f"Migration validation failed: {str(e)}")
         sys.exit(1)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python orchestrate_abinitio_pyspark_validation.py <abinitio_graph_path> <converted_pyspark_code_path>")
-        sys.exit(1)
     main()
 
-"""
-========================
-API Cost for this call: 0.00043752 USD
-========================
-"""
-
-# =========================
-# END OF SCRIPT
-# =========================
-```
-
-**Instructions:**
-- Save this script as `orchestrate_abinitio_pyspark_validation.py`.
-- Run with:
-  ```
-  python orchestrate_abinitio_pyspark_validation.py IODS_CONS_CSV_DNTL_CLMDTL_HX_BR1.mp converted_pyspark_code.py
-  ```
-- Ensure all required environment variables are set for GCP and Ab Initio connectivity.
-- The script will:
-    - SSH to the Ab Initio host and execute the graph, writing output to GCS.
-    - Submit the PySpark job to Dataproc, writing output to GCS.
-    - Launch a reconciliation PySpark job to compare outputs and write a JSON report to GCS.
-    - Download and print the reconciliation report.
-- All credentials/configuration are handled via environment variables.
-- All steps are logged and robust error handling is implemented.
-- The script is CI/CD ready and can be extended for more advanced orchestration.
-
-**API Cost for this call:** 0.00043752 USD
+# ================================================================
+# Notes:
+# - All credentials/configuration are handled via environment variables.
+# - All GCS paths are timestamped for traceability.
+# - All subprocesses and GCP API calls are logged.
+# - The script is robust to schema, data, and null value differences.
+# - For large datasets, adjust Dataproc cluster resources as needed.
+# - This script can be invoked from CI/CD with:
+#     python migration_validation.py <AbInitioGraphFile> <ConvertedPySparkScript>
+# - API Cost for this orchestration: 0.00043752 USD
+# ================================================================
