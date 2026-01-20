@@ -1,122 +1,155 @@
---------------------------------------------------
 Test Case List:
-----------------
-1. Test Case ID: TC1_CSV_Load
-   Test Case Description: Verify that the PySpark code correctly loads the CSV file with header and infers the schema, ensuring that all expected columns (account_type, company_code, and amount) are present.
-   Expected Outcome: The loaded DataFrame contains columns "account_type", "company_code", and "amount" with the correct inferred data types.
-   
-2. Test Case ID: TC2_Filtering_Logic
-   Test Case Description: Validate that the DataFrame filtering operation correctly retains only the rows with account_type equal to "GL" as dictated by the ABAP to PySpark conversion.
-   Expected Outcome: The filtered DataFrame contains only rows where account_type is "GL".
-   
-3. Test Case ID: TC3_Aggregation
-   Test Case Description: Confirm that the aggregation transformation groups data by "company_code" and calculates the correct count of GL entries and the correct total amount, mimicking the original ABAP summing and looping logic.
-   Expected Outcome: For each company_code, the aggregated DataFrame shows the exact count of GL entries and the correct sum of the amounts.
-   
-4. Test Case ID: TC4_Transformation_Consistency
-   Test Case Description: Verify that the overall data transformation pipeline (loading, filtering, and aggregating) correctly emulates the ABAP logic by ensuring data consistency and logical correctness.
-   Expected Outcome: The final output DataFrame matches the expected structure (columns: company_code, gl_entry_count, total_amount) and values, ensuring the transformation adheres to the ABAP program behavior.
-   
-5. Test Case ID: TC5_Manual_Intervention_Check
-   Test Case Description: Identify potential edge cases that may require manual intervention (e.g., performance optimizations for large datasets, handling of legacy constructs, or NULL values) even though these aren't explicitly executed by the code.
-   Expected Outcome: Test scenarios should point out cases where additional performance tuning or error handling may be necessary. (In the test, provide a mock scenario and verify that the code gracefully handles it.)
+1. TC1 (Happy Path):  
+   - Test Case Description: Validate that for a valid CSV input, the code correctly reads the file, caches the DataFrame, applies any necessary transformations, and writes the output as a parquet file without error.  
+   - Expected Outcome: The output parquet file exists and its row count equals the input row count.
+
+2. TC2 (Read Error):  
+   - Test Case Description: Simulate an error when reading the CSV file (for example, by monkeypatching the Spark CSV reader to throw an exception). This verifies that the error is caught, an error message is printed, and the application exits properly.  
+   - Expected Outcome: The process prints an error message and exits (raising a SystemExit exception).
+
+3. TC3 (Write Error):  
+   - Test Case Description: Simulate an error during the write operation (for example, by monkeypatching the DataFrame write method to raise an exception). This verifies that the error is handled properly when the write fails.  
+   - Expected Outcome: The process prints an error message and exits (raising a SystemExit exception).
+
+4. TC4 (Empty DataFrame):  
+   - Test Case Description: Provide an empty CSV file input and verify that the output parquet dataset is created without error and that the resulting DataFrame is empty.  
+   - Expected Outcome: The output parquet exists and contains zero rows.
+
+5. TC5 (Data Integrity):  
+   - Test Case Description: Provide a sample CSV with multiple rows and verify that the output parquet file contains the same data—that is, the number of rows and the content of each row exactly match the input.  
+   - Expected Outcome: The row count in the output exactly equals the row count in the input, and the data remains unchanged.
 
 --------------------------------------------------
+
 Pytest Script for Each Test Case:
---------------------------------------------------
+
 #!/usr/bin/env python
-"""
-PyTest Script: test_gl_data_load.py
+# test_gl_data_load.py
 
-This script uses pytest to verify the functionalities of the converted PySpark code for the
-ABAP GL Data Load conversion. Each test corresponds to the test cases defined above.
-Script operations include:
-- Validating CSV load and schema inference.
-- Filtering logic to mimic ABAP IF conditions.
-- Aggregation to ensure count and summing operations are correctly implemented.
-- Overall transformation consistency.
-- A mock test for potential manual intervention scenarios.
---------------------------------------------------
-Cost consumed by the API for this call: 0.005 USD
-"""
-
+import os
+import sys
+import tempfile
 import pytest
 from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
+from unittest.mock import patch
 
-# Fixture to initialize a SparkSession for testing
+# Import the main function from the module containing the PySpark code.
+# Assumption: The PySpark code has been refactored such that the main() function can accept input_path and output_path parameters.
+from gl_data_load import main
+
+# Fixture for setting up and tearing down the SparkSession
 @pytest.fixture(scope="module")
-def spark():
-    spark = SparkSession.builder.master("local[*]").appName("TestGLDataLoad").getOrCreate()
+def spark_session():
+    spark = SparkSession.builder.master("local[1]").appName("PySparkUnitTest").getOrCreate()
     yield spark
     spark.stop()
 
-# Fixture to provide sample test data simulating GL data
-@pytest.fixture
-def sample_data(spark):
-    data = [
-         {"account_type": "GL", "company_code": "C1", "amount": 100},
-         {"account_type": "XX", "company_code": "C1", "amount": 50},
-         {"account_type": "GL", "company_code": "C2", "amount": 200},
-         {"account_type": "GL", "company_code": "C2", "amount": None}  # Testing potential NULL scenario
-    ]
-    return spark.createDataFrame(data)
+# Test Case 1: Happy Path
+def test_happy_path(spark_session):
+    # Prepare a valid CSV file with header and sample data.
+    input_data = ("bukrs,fiscyear,costcenter,gl_account,amount,currency,posting_date\n"
+                  "1000,2023,CC01,GL01,1000,USD,2023-01-01\n"
+                  "2000,2023,CC02,GL02,2000,EUR,2023-01-02\n")
+    with tempfile.NamedTemporaryFile(mode='w', suffix=".csv", delete=False) as temp_input:
+        temp_input.write(input_data)
+        temp_input_path = temp_input.name
 
-# Test Case TC1_CSV_Load: Validate CSV load and schema inference
-def test_csv_load(spark, sample_data):
-    df = sample_data
-    # Check that required columns exist in the DataFrame
-    required_columns = {"account_type", "company_code", "amount"}
-    assert required_columns.issubset(set(df.columns)), "Missing one or more required columns in the CSV load."
+    output_dir = tempfile.mkdtemp()
 
-# Test Case TC2_Filtering_Logic: Validate filtering operation for account_type = "GL"
-def test_filtering_logic(sample_data):
-    df_filtered = sample_data.filter(F.col("account_type") == "GL")
-    results = df_filtered.collect()
-    # In our sample data, there are 3 rows with account_type = "GL" (even if one has NULL amount)
-    assert len(results) == 3, f"Filtered DataFrame should have 3 rows, got {len(results)}"
-    for row in results:
-        assert row["account_type"] == "GL", "Filtered row does not have account_type 'GL'."
+    # Run main with temporary input and output paths.
+    main(input_path=temp_input_path, output_path=output_dir)
 
-# Test Case TC3_Aggregation: Test grouping and aggregation correctness
-def test_aggregation_logic(sample_data):
-    df_filtered = sample_data.filter(F.col("account_type") == "GL")
-    df_agg = df_filtered.groupBy("company_code").agg(
-        F.count("*").alias("gl_entry_count"),
-        F.sum("amount").alias("total_amount")
-    )
-    # Collect aggregated results into a dict for easy comparison
-    results = {row["company_code"]: (row["gl_entry_count"], row["total_amount"]) for row in df_agg.collect()}
-    # Expected aggregation:
-    # For company C1: one row with amount 100
-    # For company C2: two rows, one with 200 and one with NULL (sum should be 200)
-    expected = {"C1": (1, 100), "C2": (2, 200)}
-    assert results == expected, f"Aggregation results mismatch. Expected {expected}, got {results}"
+    # Validate that the output parquet file(s) exist.
+    output_files = os.listdir(output_dir)
+    assert any("parquet" in file for file in output_files), "Parquet output files not found."
 
-# Test Case TC4_Transformation_Consistency: Check overall transformation pipeline consistency
-def test_transformation_consistency(sample_data):
-    df_filtered = sample_data.filter(F.col("account_type") == "GL")
-    df_result = df_filtered.groupBy("company_code").agg(
-        F.count("*").alias("gl_entry_count"),
-        F.sum("amount").alias("total_amount")
-    )
-    expected_columns = {"company_code", "gl_entry_count", "total_amount"}
-    assert set(df_result.columns) == expected_columns, \
-           "The final DataFrame structure does not match the expected structure."
+    # Read the output parquet and verify the row count.
+    df_out = spark_session.read.parquet(output_dir)
+    assert df_out.count() == 2, "Row count mismatch between input and output."
 
-# Test Case TC5_Manual_Intervention_Check:
-# This test simulates an edge case where incoming data might have irregularities (e.g., performance stress or NULL values)
-def test_manual_intervention_scenario(sample_data):
-    # Introduce an edge-case scenario with an unexpected data pattern
-    # For example, a row with an unknown account_type that should be filtered out
-    df = sample_data.union(sample_data.filter(F.col("account_type") != "GL"))
-    df_filtered = df.filter(F.col("account_type") == "GL")
-    # Even if extra rows are introduced, the filter should only pick valid GL rows
-    results = df_filtered.collect()
-    for row in results:
-        assert row["account_type"] == "GL", "Manual intervention check failed: Found non 'GL' account_type."
+    # Cleanup temporary input file.
+    os.remove(temp_input_path)
 
-# End of test script
---------------------------------------------------
-Cost consumed by the API for this call: 0.005 USD
---------------------------------------------------
+# Test Case 2: Read Error
+def test_read_error():
+    # Using patch to simulate a read error by throwing an Exception on csv() method call.
+    with patch("pyspark.sql.DataFrameReader.csv", side_effect=Exception("Intentional Read Error")):
+        with pytest.raises(SystemExit):
+            main(input_path="non_existent_input.csv", output_path="some_output_dir")
+
+# Test Case 3: Write Error
+def test_write_error(spark_session):
+    # Prepare a valid CSV input.
+    input_data = ("bukrs,fiscyear,costcenter,gl_account,amount,currency,posting_date\n"
+                  "1000,2023,CC01,GL01,1000,USD,2023-01-01\n")
+    with tempfile.NamedTemporaryFile(mode='w', suffix=".csv", delete=False) as temp_input:
+        temp_input.write(input_data)
+        temp_input_path = temp_input.name
+
+    # Patch the DataFrameWriter.parquet method to raise an Exception for write failure simulation.
+    with patch("pyspark.sql.DataFrameWriter.parquet", side_effect=Exception("Intentional Write Error")):
+        with pytest.raises(SystemExit):
+            main(input_path=temp_input_path, output_path="dummy_output_dir")
+
+    os.remove(temp_input_path)
+
+# Test Case 4: Empty DataFrame
+def test_empty_dataframe(spark_session):
+    # Create an empty CSV file.
+    input_data = ""
+    with tempfile.NamedTemporaryFile(mode='w', suffix=".csv", delete=False) as temp_input:
+        temp_input.write(input_data)
+        temp_input_path = temp_input.name
+
+    output_dir = tempfile.mkdtemp()
+
+    # Run the main function.
+    main(input_path=temp_input_path, output_path=output_dir)
+
+    # Check that the output parquet exists.
+    output_files = os.listdir(output_dir)
+    assert any("parquet" in file for file in output_files), "Parquet output files not found for empty input."
+
+    # Verify that the output parquet is empty.
+    df_out = spark_session.read.parquet(output_dir)
+    assert df_out.count() == 0, "Expected zero rows for empty input."
+
+    os.remove(temp_input_path)
+
+# Test Case 5: Data Integrity
+def test_data_integrity(spark_session):
+    # Prepare a CSV input with multiple rows.
+    input_data = ("bukrs,fiscyear,costcenter,gl_account,amount,currency,posting_date\n"
+                  "1000,2023,CC01,GL01,1000,USD,2023-01-01\n"
+                  "2000,2023,CC02,GL02,2000,EUR,2023-01-02\n")
+    with tempfile.NamedTemporaryFile(mode='w', suffix=".csv", delete=False) as temp_input:
+        temp_input.write(input_data)
+        temp_input_path = temp_input.name
+
+    output_dir = tempfile.mkdtemp()
+
+    # Run the main function.
+    main(input_path=temp_input_path, output_path=output_dir)
+
+    # Validate that output parquet file(s) exist.
+    output_files = os.listdir(output_dir)
+    assert any("parquet" in file for file in output_files), "Parquet output files not found."
+
+    # Load the data from the output parquet.
+    df_out = spark_session.read.parquet(output_dir)
+    # Load original CSV data for comparison.
+    df_in = spark_session.read.csv(temp_input_path, header=True, inferSchema=True)
+
+    # Check the row count matches.
+    assert df_out.count() == df_in.count(), "Row count mismatch between input and output."
+
+    # Check data integrity by sorting and comparing all rows.
+    out_rows = sorted(df_out.collect(), key=lambda r: tuple(r))
+    in_rows = sorted(df_in.collect(), key=lambda r: tuple(r))
+    assert out_rows == in_rows, "Data content mismatch between input and output."
+
+    os.remove(temp_input_path)
+
+# Note: The API cost consumed in running the original PySpark code was 0.002 USD.
+  
+Cost Consumed: 0.002 USD
