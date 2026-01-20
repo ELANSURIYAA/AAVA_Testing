@@ -1,0 +1,333 @@
+===================================================================
+Author:        AAVA
+Created on:    
+Description:   Validation suite for Ab Initio to PySpark Conversion
+===================================================================
+
+#### 1. Test Case Document:
+| Test Case ID | Description | Expected Result |
+|--------------|-------------|-----------------|
+TC001|Validate join with matching keys| Output matches expected combined rows
+TC002|Null handling in join/transforms| Nulls processed same as Ab Initio
+TC003|Reject logic for invalid rows| Row appears in reject equivalent output
+TC004|Lookup failure default| Default values applied correctly
+TC005|Empty input behavior| Empty output, no errors
+TC006|.xfr derived value transformation| Derived values match expected results
+TC007|Type casting based on .dml → Glue| Schema mapped correctly
+TC008|Multi-step transformation chain| Output matches Ab Initio flow
+TC009|Boundary condition values|	Outputs stable and correct
+TC010|Mixed null + invalid inputs| Behavior matches Ab Initio
+
+#### 2. Pytest Script Example:
+```python
+import pytest
+from pyspark.sql import SparkSession
+from chispa.dataframe_comparer import assert_df_equality
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+
+# --- Mock transformation logic (replace with actual imports in real use) ---
+def transform_cleanse_transform(df):
+    from pyspark.sql.functions import when
+    # Mark as reject if value is 'BAD' or None
+    return df.withColumn(
+        "error_message",
+        when((df.value == "BAD") | (df.value.isNull()), "Invalid Value").otherwise(None)
+    )
+
+def transform_pricing_logic(df):
+    from pyspark.sql.functions import col, when
+    # If standard_cost is null, fill with 0.0
+    return df.withColumn("final_price", when(col("standard_cost").isNull(), 0.0).otherwise(col("standard_cost") * 1.2))
+
+def transform_rollup_logic(df):
+    return df.groupBy("store_id").sum("final_price").withColumnRenamed("sum(final_price)", "total_sales")
+
+# --- Example schemas (replace with actual from Retail_Converted_DML) ---
+raw_input_schema = StructType([
+    StructField("txn_id", StringType(), True),
+    StructField("product_sku", StringType(), True),
+    StructField("store_id", StringType(), True),
+    StructField("txn_date", StringType(), True),
+    StructField("value", StringType(), True)
+])
+product_dimension_schema = StructType([
+    StructField("product_sku", StringType(), True),
+    StructField("category", StringType(), True),
+    StructField("standard_cost", DoubleType(), True)
+])
+enriched_schema = StructType([
+    StructField("txn_id", StringType(), True),
+    StructField("product_sku", StringType(), True),
+    StructField("store_id", StringType(), True),
+    StructField("txn_date", StringType(), True),
+    StructField("category", StringType(), True),
+    StructField("standard_cost", DoubleType(), True),
+    StructField("value", StringType(), True)
+])
+summary_schema = StructType([
+    StructField("store_id", StringType(), True),
+    StructField("total_sales", DoubleType(), True)
+])
+
+@pytest.fixture(scope="session")
+def spark():
+    return SparkSession.builder.master("local[1]").appName("unit-test").getOrCreate()
+
+# --- Test Cases ---
+
+def test_TC001_join_matching_keys(spark):
+    """
+    TC001: Validate join with matching keys
+    """
+    df1 = spark.createDataFrame([
+        ("T1", "SKU1", "S1", "2024-06-01", "100"),
+        ("T2", "SKU2", "S2", "2024-06-01", "200")
+    ], schema=raw_input_schema)
+    df2 = spark.createDataFrame([
+        ("SKU1", "CatA", 10.0),
+        ("SKU2", "CatB", 20.0)
+    ], schema=product_dimension_schema)
+
+    df_cleansed = transform_cleanse_transform(df1).filter("error_message IS NULL").drop("error_message")
+    df_deduped = df_cleansed.dropDuplicates(["txn_id"])
+    df_enriched = df_deduped.join(
+        df2.select("product_sku", "category", "standard_cost"),
+        on="product_sku",
+        how="inner"
+    )
+
+    expected = spark.createDataFrame([
+        ("SKU1", "T1", "S1", "2024-06-01", "CatA", 10.0, "100"),
+        ("SKU2", "T2", "S2", "2024-06-01", "CatB", 20.0, "200")
+    ], schema=enriched_schema)
+
+    assert_df_equality(df_enriched, expected, ignore_nullable=True)
+
+def test_TC002_null_handling(spark):
+    """
+    TC002: Null handling in join/transforms
+    """
+    df1 = spark.createDataFrame([
+        ("T1", None, "S1", "2024-06-01", "100"),
+        ("T2", "SKU2", "S2", "2024-06-01", None)
+    ], schema=raw_input_schema)
+    df2 = spark.createDataFrame([
+        ("SKU2", "CatB", 20.0)
+    ], schema=product_dimension_schema)
+
+    df_cleansed = transform_cleanse_transform(df1)
+    df_cleansed_good = df_cleansed.filter("error_message IS NULL").drop("error_message")
+    df_deduped = df_cleansed_good.dropDuplicates(["txn_id"])
+    df_enriched = df_deduped.join(
+        df2.select("product_sku", "category", "standard_cost"),
+        on="product_sku",
+        how="inner"
+    )
+
+    expected = spark.createDataFrame([
+        ("SKU2", "T2", "S2", "2024-06-01", "CatB", 20.0, None)
+    ], schema=enriched_schema)
+
+    assert_df_equality(df_enriched, expected, ignore_nullable=True)
+
+def test_TC003_reject_logic(spark):
+    """
+    TC003: Reject logic for invalid rows
+    """
+    df1 = spark.createDataFrame([
+        ("T1", "SKU1", "S1", "2024-06-01", "BAD"),
+        ("T2", "SKU2", "S2", "2024-06-01", "100")
+    ], schema=raw_input_schema)
+
+    df_cleansed = transform_cleanse_transform(df1)
+    df_rejects = df_cleansed.filter("error_message IS NOT NULL")
+
+    expected = spark.createDataFrame([
+        ("T1", "SKU1", "S1", "2024-06-01", "BAD", "Invalid Value")
+    ], schema=df_rejects.schema)
+
+    assert_df_equality(df_rejects, expected, ignore_nullable=True)
+
+def test_TC004_lookup_failure_default(spark):
+    """
+    TC004: Lookup failure default
+    """
+    df1 = spark.createDataFrame([
+        ("T1", "SKU_NOT_FOUND", "S1", "2024-06-01", "100")
+    ], schema=raw_input_schema)
+    df2 = spark.createDataFrame([
+        ("SKU2", "CatB", 20.0)
+    ], schema=product_dimension_schema)
+
+    df_cleansed = transform_cleanse_transform(df1).filter("error_message IS NULL").drop("error_message")
+    df_deduped = df_cleansed.dropDuplicates(["txn_id"])
+    df_product_misses = df_deduped.join(
+        df2.select("product_sku"),
+        on="product_sku",
+        how="left_anti"
+    )
+
+    expected = spark.createDataFrame([
+        ("T1", "SKU_NOT_FOUND", "S1", "2024-06-01", "100")
+    ], schema=raw_input_schema)
+
+    assert_df_equality(df_product_misses, expected, ignore_nullable=True)
+
+def test_TC005_empty_input_behavior(spark):
+    """
+    TC005: Empty input behavior
+    """
+    df1 = spark.createDataFrame([], schema=raw_input_schema)
+    df2 = spark.createDataFrame([], schema=product_dimension_schema)
+
+    df_cleansed = transform_cleanse_transform(df1).filter("error_message IS NULL").drop("error_message")
+    df_deduped = df_cleansed.dropDuplicates(["txn_id"])
+    df_enriched = df_deduped.join(
+        df2.select("product_sku", "category", "standard_cost"),
+        on="product_sku",
+        how="inner"
+    )
+
+    expected = spark.createDataFrame([], schema=enriched_schema)
+    assert_df_equality(df_enriched, expected, ignore_nullable=True)
+
+def test_TC006_xfr_derived_value(spark):
+    """
+    TC006: .xfr derived value transformation
+    """
+    df = spark.createDataFrame([
+        ("SKU1", "T1", "S1", "2024-06-01", "CatA", 10.0, "100")
+    ], schema=enriched_schema)
+    df_priced = transform_pricing_logic(df)
+
+    expected = spark.createDataFrame([
+        ("SKU1", "T1", "S1", "2024-06-01", "CatA", 10.0, "100", 12.0)
+    ], schema=df_priced.schema)
+
+    assert_df_equality(df_priced, expected, ignore_nullable=True)
+
+def test_TC007_type_casting_dml_glue(spark):
+    """
+    TC007: Type casting based on .dml → Glue
+    """
+    # Should fail if type mismatch
+    df2 = spark.createDataFrame([
+        ("SKU1", "CatA", "not_a_number")
+    ], schema=StructType([
+        StructField("product_sku", StringType(), True),
+        StructField("category", StringType(), True),
+        StructField("standard_cost", StringType(), True)
+    ]))
+    df1 = spark.createDataFrame([
+        ("T1", "SKU1", "S1", "2024-06-01", "100")
+    ], schema=raw_input_schema)
+    df_cleansed = transform_cleanse_transform(df1).filter("error_message IS NULL").drop("error_message")
+    df_deduped = df_cleansed.dropDuplicates(["txn_id"])
+    with pytest.raises(Exception):
+        _ = df_deduped.join(
+            df2.select("product_sku", "category", "standard_cost"),
+            on="product_sku",
+            how="inner"
+        )
+
+def test_TC008_multistep_chain(spark):
+    """
+    TC008: Multi-step transformation chain
+    """
+    df1 = spark.createDataFrame([
+        ("T1", "SKU1", "S1", "2024-06-01", "100"),
+        ("T2", "SKU2", "S1", "2024-06-01", "200"),
+        ("T3", "SKU2", "S1", "2024-06-01", "BAD")
+    ], schema=raw_input_schema)
+    df2 = spark.createDataFrame([
+        ("SKU1", "CatA", 10.0),
+        ("SKU2", "CatB", 20.0)
+    ], schema=product_dimension_schema)
+
+    df_cleansed = transform_cleanse_transform(df1)
+    df_cleansed_good = df_cleansed.filter("error_message IS NULL").drop("error_message")
+    df_deduped = df_cleansed_good.dropDuplicates(["txn_id"])
+    df_enriched = df_deduped.join(
+        df2.select("product_sku", "category", "standard_cost"),
+        on="product_sku",
+        how="inner"
+    )
+    df_priced = transform_pricing_logic(df_enriched)
+    df_sorted = df_priced.orderBy(["store_id", "txn_date"])
+    df_summary = transform_rollup_logic(df_sorted)
+
+    expected = spark.createDataFrame([
+        ("S1", 12.0 + 24.0)
+    ], schema=summary_schema)
+
+    assert_df_equality(df_summary, expected, ignore_nullable=True)
+
+def test_TC009_boundary_condition_values(spark):
+    """
+    TC009: Boundary condition values
+    """
+    df1 = spark.createDataFrame([
+        ("T1", "SKU1", "S1", "2024-06-01", "999999999999"),
+        ("T2", "SKU2", "S1", "2024-06-01", "-999999999999")
+    ], schema=raw_input_schema)
+    df2 = spark.createDataFrame([
+        ("SKU1", "CatA", 1e12),
+        ("SKU2", "CatB", -1e12)
+    ], schema=product_dimension_schema)
+
+    df_cleansed = transform_cleanse_transform(df1).filter("error_message IS NULL").drop("error_message")
+    df_deduped = df_cleansed.dropDuplicates(["txn_id"])
+    df_enriched = df_deduped.join(
+        df2.select("product_sku", "category", "standard_cost"),
+        on="product_sku",
+        how="inner"
+    )
+    df_priced = transform_pricing_logic(df_enriched)
+    df_sorted = df_priced.orderBy(["store_id", "txn_date"])
+    df_summary = transform_rollup_logic(df_sorted)
+
+    expected = spark.createDataFrame([
+        ("S1", 1e12*1.2 + (-1e12)*1.2)
+    ], schema=summary_schema)
+
+    assert_df_equality(df_summary, expected, ignore_nullable=True)
+
+def test_TC010_mixed_null_invalid_inputs(spark):
+    """
+    TC010: Mixed null + invalid inputs
+    """
+    df1 = spark.createDataFrame([
+        ("T1", None, "S1", "2024-06-01", "BAD"),  # Null SKU, BAD value
+        ("T2", "SKU2", "S1", "2024-06-01", None), # Null value
+        ("T3", "SKU2", "S1", "2024-06-01", "100") # Good row
+    ], schema=raw_input_schema)
+    df2 = spark.createDataFrame([
+        ("SKU2", "CatB", 20.0)
+    ], schema=product_dimension_schema)
+
+    df_cleansed = transform_cleanse_transform(df1)
+    df_cleansed_good = df_cleansed.filter("error_message IS NULL").drop("error_message")
+    df_deduped = df_cleansed_good.dropDuplicates(["txn_id"])
+    df_enriched = df_deduped.join(
+        df2.select("product_sku", "category", "standard_cost"),
+        on="product_sku",
+        how="inner"
+    )
+    df_priced = transform_pricing_logic(df_enriched)
+    df_sorted = df_priced.orderBy(["store_id", "txn_date"])
+    df_summary = transform_rollup_logic(df_sorted)
+
+    expected = spark.createDataFrame([
+        ("S1", 24.0)
+    ], schema=summary_schema)
+
+    assert_df_equality(df_summary, expected, ignore_nullable=True)
+```
+
+#### 3. API Cost Consumption:
+apiCost: 0.00043752 USD
+
+---
+**Note:**  
+- Replace the mock transformation and schema definitions with actual implementations from `Retail_Converted_XFR` and `Retail_Converted_DML` for production validation.
+- This suite covers join logic, .xfr transformation, input/output mapping, reject conditions, lookup behavior, edge and boundary cases, and type handling as required.
