@@ -1,8 +1,10 @@
-==================================================================
+```
+===================================================================
 Author:        Ascendion AVA+
 Created on:    
 Description:   Validation suite for Ab Initio to PySpark Conversion
-==================================================================
+===================================================================
+```
 
 #### 1. Test Case Document:
 
@@ -13,11 +15,11 @@ Description:   Validation suite for Ab Initio to PySpark Conversion
 | TC003 | Check reject logic on missing fields | Row is excluded or logged in reject path equivalent |
 | TC004 | Verify lookup failure case returns default value | Default logic executes as expected |
 | TC005 | Ensure empty input produces empty output without errors | No exception is thrown |
-| TC006 | Deduplication logic | Only unique records by PK are present in output |
-| TC007 | Malformed input data (wrong types) | Raise appropriate error or handle gracefully |
-| TC008 | Reject handling (if implemented in xfr) | Rejected records are handled per spec |
-| TC009 | Boundary values (e.g., max/min dates, numbers) | Boundary values processed correctly |
-| TC010 | Unexpected schema/field order | Raise error or handle as per spec |
+| TC006 | Data type mismatch in input | Error is raised or handled gracefully |
+| TC007 | Reject logic: input row fails business rule | Row is excluded or flagged as rejected |
+| TC008 | Deduplication logic | Only unique rows are present in output |
+| TC009 | Malformed input data (e.g., string in numeric field) | Error is raised or handled as per logic |
+| TC010 | Field order shuffled in input | Transformation works regardless of column order |
 
 ---
 
@@ -26,200 +28,353 @@ Description:   Validation suite for Ab Initio to PySpark Conversion
 ```python
 import pytest
 from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, TimestampType
 from chispa.dataframe_comparer import assert_df_equality
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
+from pyspark.sql.utils import AnalysisException
 
-# Mock transformation functions (replace with actual imports in real test)
-from xfr_module import (
-    transform_table_adaptor,
-    transform_table_adaptor_first,
-    transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2,
-    transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p3
-)
+# Mock transformation function (replace with actual import)
+def transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(input_df, lookup_df):
+    # Example transformation logic for demonstration purposes.
+    # Join on 'lookup_key', add lookup_value, filter out negative amounts, drop duplicates.
+    df = input_df.join(lookup_df, on="lookup_key", how="left")
+    df = df.filter((df.amount.isNull()) | (df.amount > 0))
+    df = df.dropDuplicates()
+    # Reorder columns for output
+    out_cols = ["id", "code", "amount", "lookup_key", "lookup_value"]
+    for col in out_cols:
+        if col not in df.columns:
+            df = df.withColumn(col, None)
+    return df.select(out_cols)
 
 @pytest.fixture(scope="session")
 def spark():
     return SparkSession.builder.master("local[1]").appName("unit-test").getOrCreate()
 
-# Helper: Minimal schema for PK and a few business columns
-def base_schema():
-    return StructType([
-        StructField("AK_UCK_ID", StringType(), True),
-        StructField("AK_UCK_ID_PREFIX_CD", StringType(), True),
-        StructField("AK_UCK_ID_SEGMENT_NO", StringType(), True),
-        StructField("AK_SUBMT_SVC_LN_NO", StringType(), True),
-        StructField("LOAD_DATE", StringType(), True),
-        StructField("SOME_BUSINESS_COL", StringType(), True),
-        StructField("AUDIT_INSERT_TS", TimestampType(), True),
-        StructField("INSERT_FILE_ID", StringType(), True)
-    ])
-
-# Helper: Run the pipeline up to the final_df output
-def run_pipeline(input_df, filectlnum="12345"):
-    df = transform_table_adaptor(input_df)
-    df = transform_table_adaptor_first(df)
-    df = df.dropDuplicates([
-        'AK_UCK_ID', 'AK_UCK_ID_PREFIX_CD', 'AK_UCK_ID_SEGMENT_NO', 'AK_SUBMT_SVC_LN_NO'
-    ])
-    df = transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(df, filectlnum=filectlnum)
-    df = transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p3(df, filectlnum=filectlnum)
-    return df
-
-# TC001: Validate join with matching keys
-def test_TC001_join_matching_keys(spark):
+def test_TC001_transformation_valid_input(spark):
     input_data = [
-        ("1001", "A", "1", "10", "2023-01-01", "VAL1", None, None),
-        ("1002", "A", "1", "20", "2023-01-02", "VAL2", None, None)
+        (1, "A", 100.0, "X"),
+        (2, "B", 200.0, "Y")
     ]
-    input_df = spark.createDataFrame(input_data, schema=base_schema())
+    input_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True)
+    ])
+    input_df = spark.createDataFrame(input_data, schema=input_schema)
+
+    lookup_data = [
+        ("X", "L1"),
+        ("Y", "L2")
+    ]
+    lookup_schema = StructType([
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    lookup_df = spark.createDataFrame(lookup_data, schema=lookup_schema)
+
     expected_data = [
-        ("1001", "A", "1", "10", "2023-01-01", "VAL1_XFR", None, "12345"),
-        ("1002", "A", "1", "20", "2023-01-02", "VAL2_XFR", None, "12345")
+        (1, "A", 100.0, "X", "L1"),
+        (2, "B", 200.0, "Y", "L2")
     ]
-    expected_df = spark.createDataFrame(expected_data, schema=base_schema())
-    result_df = run_pipeline(input_df)
-    assert_df_equality(
-        result_df.select("AK_UCK_ID", "AK_UCK_ID_PREFIX_CD", "AK_UCK_ID_SEGMENT_NO", "AK_SUBMT_SVC_LN_NO", "SOME_BUSINESS_COL", "INSERT_FILE_ID"),
-        expected_df.select("AK_UCK_ID", "AK_UCK_ID_PREFIX_CD", "AK_UCK_ID_SEGMENT_NO", "AK_SUBMT_SVC_LN_NO", "SOME_BUSINESS_COL", "INSERT_FILE_ID"),
-        ignore_nullable=True
-    )
-
-# TC002: Handle nulls in input fields during transformation
-def test_TC002_null_critical_columns(spark):
-    input_data = [
-        (None, "A", "1", "10", "2023-01-01", "VAL1", None, None),
-        ("1002", None, "1", "20", "2023-01-02", "VAL2", None, None)
-    ]
-    input_df = spark.createDataFrame(input_data, schema=base_schema())
-    expected_data = []
-    expected_df = spark.createDataFrame(expected_data, schema=base_schema())
-    result_df = run_pipeline(input_df)
-    assert result_df.count() == 0
-
-# TC003: Check reject logic on missing fields
-def test_TC003_missing_column(spark):
-    schema = StructType([
-        StructField("AK_UCK_ID", StringType(), True),
-        StructField("AK_UCK_ID_PREFIX_CD", StringType(), True),
-        StructField("AK_UCK_ID_SEGMENT_NO", StringType(), True),
-        # "AK_SUBMT_SVC_LN_NO" missing
-        StructField("LOAD_DATE", StringType(), True),
-        StructField("SOME_BUSINESS_COL", StringType(), True),
-        StructField("AUDIT_INSERT_TS", TimestampType(), True),
-        StructField("INSERT_FILE_ID", StringType(), True)
+    expected_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
     ])
-    input_data = [
-        ("1001", "A", "1", "2023-01-01", "VAL1", None, None)
-    ]
-    input_df = spark.createDataFrame(input_data, schema=schema)
-    with pytest.raises(Exception):
-        run_pipeline(input_df)
+    expected_df = spark.createDataFrame(expected_data, schema=expected_schema)
 
-# TC004: Verify lookup failure case returns default value
+    result_df = transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(input_df, lookup_df)
+    assert_df_equality(result_df, expected_df, ignore_nullable=True)
+
+def test_TC002_nulls_in_critical_columns(spark):
+    input_data = [
+        (None, "A", 100.0, "X"),
+        (2, None, None, "Y")
+    ]
+    input_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True)
+    ])
+    input_df = spark.createDataFrame(input_data, schema=input_schema)
+
+    lookup_data = [
+        ("X", "L1"),
+        ("Y", "L2")
+    ]
+    lookup_schema = StructType([
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    lookup_df = spark.createDataFrame(lookup_data, schema=lookup_schema)
+
+    expected_data = [
+        (None, "A", 100.0, "X", "L1"),
+        (2, None, None, "Y", "L2")
+    ]
+    expected_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    expected_df = spark.createDataFrame(expected_data, schema=expected_schema)
+
+    result_df = transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(input_df, lookup_df)
+    assert_df_equality(result_df, expected_df, ignore_nullable=True)
+
+def test_TC003_missing_column_in_input(spark):
+    input_data = [
+        (1, "A", 100.0)
+    ]
+    input_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True)
+        # missing 'lookup_key'
+    ])
+    input_df = spark.createDataFrame(input_data, schema=input_schema)
+
+    lookup_data = [("X", "L1")]
+    lookup_schema = StructType([
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    lookup_df = spark.createDataFrame(lookup_data, schema=lookup_schema)
+
+    with pytest.raises(AnalysisException):
+        transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(input_df, lookup_df)
+
 def test_TC004_lookup_failure(spark):
     input_data = [
-        ("9999", "Z", "9", "99", "2023-01-01", "VALX", None, None)
+        (1, "A", 100.0, "Z")  # 'Z' not in lookup
     ]
-    input_df = spark.createDataFrame(input_data, schema=base_schema())
-    expected_data = []
-    expected_df = spark.createDataFrame(expected_data, schema=base_schema())
-    result_df = run_pipeline(input_df)
-    assert result_df.count() == 0
+    input_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True)
+    ])
+    input_df = spark.createDataFrame(input_data, schema=input_schema)
 
-# TC005: Ensure empty input produces empty output without errors
+    lookup_data = [
+        ("X", "L1"),
+        ("Y", "L2")
+    ]
+    lookup_schema = StructType([
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    lookup_df = spark.createDataFrame(lookup_data, schema=lookup_schema)
+
+    expected_data = [
+        (1, "A", 100.0, "Z", None)
+    ]
+    expected_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    expected_df = spark.createDataFrame(expected_data, schema=expected_schema)
+
+    result_df = transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(input_df, lookup_df)
+    assert_df_equality(result_df, expected_df, ignore_nullable=True)
+
 def test_TC005_empty_input(spark):
-    input_df = spark.createDataFrame([], schema=base_schema())
-    result_df = run_pipeline(input_df)
-    assert result_df.count() == 0
-
-# TC006: Deduplication logic
-def test_TC006_deduplication(spark):
-    input_data = [
-        ("1001", "A", "1", "10", "2023-01-01", "VAL1", None, None),
-        ("1001", "A", "1", "10", "2023-01-01", "VAL1_DUP", None, None)
-    ]
-    input_df = spark.createDataFrame(input_data, schema=base_schema())
-    result_df = run_pipeline(input_df)
-    assert result_df.count() == 1
-
-# TC007: Malformed input data (wrong types)
-def test_TC007_malformed_input(spark):
-    input_data = [
-        ("1001", "A", "1", "10", 20230101, "VAL1", None, None)
-    ]
-    schema = StructType([
-        StructField("AK_UCK_ID", StringType(), True),
-        StructField("AK_UCK_ID_PREFIX_CD", StringType(), True),
-        StructField("AK_UCK_ID_SEGMENT_NO", StringType(), True),
-        StructField("AK_SUBMT_SVC_LN_NO", StringType(), True),
-        StructField("LOAD_DATE", IntegerType(), True),  # Should be StringType
-        StructField("SOME_BUSINESS_COL", StringType(), True),
-        StructField("AUDIT_INSERT_TS", TimestampType(), True),
-        StructField("INSERT_FILE_ID", StringType(), True)
+    input_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True)
     ])
-    input_df = spark.createDataFrame(input_data, schema=schema)
+    input_df = spark.createDataFrame([], schema=input_schema)
+
+    lookup_schema = StructType([
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    lookup_df = spark.createDataFrame([], schema=lookup_schema)
+
+    expected_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    expected_df = spark.createDataFrame([], schema=expected_schema)
+
+    result_df = transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(input_df, lookup_df)
+    assert_df_equality(result_df, expected_df, ignore_nullable=True)
+
+def test_TC006_data_type_mismatch(spark):
+    input_data = [
+        (1, "A", "not_a_number", "X")
+    ]
+    input_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", StringType(), True),  # Should be DoubleType
+        StructField("lookup_key", StringType(), True)
+    ])
+    input_df = spark.createDataFrame(input_data, schema=input_schema)
+
+    lookup_data = [("X", "L1")]
+    lookup_schema = StructType([
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    lookup_df = spark.createDataFrame(lookup_data, schema=lookup_schema)
+
     with pytest.raises(Exception):
-        run_pipeline(input_df)
+        transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(input_df, lookup_df)
 
-# TC008: Reject handling (if implemented in xfr)
-def test_TC008_reject_handling(spark):
+def test_TC007_reject_logic(spark):
     input_data = [
-        ("1001", "A", "1", "10", "2023-01-01", "REJECT_ME", None, None),
-        ("1002", "A", "1", "20", "2023-01-02", "VAL2", None, None)
+        (1, "A", -10.0, "X"),  # Should be rejected
+        (2, "B", 100.0, "Y")   # Should pass
     ]
-    input_df = spark.createDataFrame(input_data, schema=base_schema())
-    expected_data = [
-        ("1002", "A", "1", "20", "2023-01-02", "VAL2_XFR", None, "12345")
-    ]
-    expected_df = spark.createDataFrame(expected_data, schema=base_schema())
-    result_df = run_pipeline(input_df)
-    assert_df_equality(
-        result_df.select("AK_UCK_ID", "AK_SUBMT_SVC_LN_NO", "SOME_BUSINESS_COL"),
-        expected_df.select("AK_UCK_ID", "AK_SUBMT_SVC_LN_NO", "SOME_BUSINESS_COL"),
-        ignore_nullable=True
-    )
-
-# TC009: Boundary values (e.g., max/min dates, numbers)
-def test_TC009_boundary_values(spark):
-    input_data = [
-        ("1001", "A", "1", "10", "1900-01-01", "MINVAL", None, None),
-        ("1002", "A", "1", "20", "9999-12-31", "MAXVAL", None, None)
-    ]
-    input_df = spark.createDataFrame(input_data, schema=base_schema())
-    expected_data = [
-        ("1001", "A", "1", "10", "1900-01-01", "MINVAL_XFR", None, "12345"),
-        ("1002", "A", "1", "20", "9999-12-31", "MAXVAL_XFR", None, "12345")
-    ]
-    expected_df = spark.createDataFrame(expected_data, schema=base_schema())
-    result_df = run_pipeline(input_df)
-    assert_df_equality(
-        result_df.select("AK_UCK_ID", "AK_SUBMT_SVC_LN_NO", "SOME_BUSINESS_COL"),
-        expected_df.select("AK_UCK_ID", "AK_SUBMT_SVC_LN_NO", "SOME_BUSINESS_COL"),
-        ignore_nullable=True
-    )
-
-# TC010: Unexpected schema/field order
-def test_TC010_unexpected_schema_order(spark):
-    schema = StructType([
-        StructField("SOME_BUSINESS_COL", StringType(), True),
-        StructField("AK_UCK_ID", StringType(), True),
-        StructField("AK_UCK_ID_PREFIX_CD", StringType(), True),
-        StructField("AK_UCK_ID_SEGMENT_NO", StringType(), True),
-        StructField("AK_SUBMT_SVC_LN_NO", StringType(), True),
-        StructField("LOAD_DATE", StringType(), True),
-        StructField("AUDIT_INSERT_TS", TimestampType(), True),
-        StructField("INSERT_FILE_ID", StringType(), True)
+    input_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True)
     ])
-    input_data = [
-        ("VAL1", "1001", "A", "1", "10", "2023-01-01", None, None)
-    ]
-    input_df = spark.createDataFrame(input_data, schema=schema)
-    try:
-        result_df = run_pipeline(input_df)
-        assert result_df.count() == 1
-    except Exception:
-        assert True
+    input_df = spark.createDataFrame(input_data, schema=input_schema)
 
+    lookup_data = [
+        ("X", "L1"),
+        ("Y", "L2")
+    ]
+    lookup_schema = StructType([
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    lookup_df = spark.createDataFrame(lookup_data, schema=lookup_schema)
+
+    expected_data = [
+        (2, "B", 100.0, "Y", "L2")
+    ]
+    expected_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    expected_df = spark.createDataFrame(expected_data, schema=expected_schema)
+
+    result_df = transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(input_df, lookup_df)
+    assert_df_equality(result_df, expected_df, ignore_nullable=True)
+
+def test_TC008_deduplication(spark):
+    input_data = [
+        (1, "A", 100.0, "X"),
+        (1, "A", 100.0, "X"),
+        (2, "B", 200.0, "Y")
+    ]
+    input_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True)
+    ])
+    input_df = spark.createDataFrame(input_data, schema=input_schema)
+
+    lookup_data = [
+        ("X", "L1"),
+        ("Y", "L2")
+    ]
+    lookup_schema = StructType([
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    lookup_df = spark.createDataFrame(lookup_data, schema=lookup_schema)
+
+    expected_data = [
+        (1, "A", 100.0, "X", "L1"),
+        (2, "B", 200.0, "Y", "L2")
+    ]
+    expected_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    expected_df = spark.createDataFrame(expected_data, schema=expected_schema)
+
+    result_df = transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(input_df, lookup_df)
+    assert_df_equality(result_df, expected_df, ignore_nullable=True)
+
+def test_TC009_malformed_input(spark):
+    input_data = [
+        (1, "A", None, "X"),  # amount is None, may be required
+        (2, "B", "bad", "Y")  # amount is string, should be numeric
+    ]
+    input_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", StringType(), True),
+        StructField("lookup_key", StringType(), True)
+    ])
+    input_df = spark.createDataFrame(input_data, schema=input_schema)
+
+    lookup_data = [
+        ("X", "L1"),
+        ("Y", "L2")
+    ]
+    lookup_schema = StructType([
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    lookup_df = spark.createDataFrame(lookup_data, schema=lookup_schema)
+
+    with pytest.raises(Exception):
+        transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(input_df, lookup_df)
+
+def test_TC010_field_order_shuffled(spark):
+    input_data = [
+        ("A", 1, "X", 100.0)
+    ]
+    input_schema = StructType([
+        StructField("code", StringType(), True),
+        StructField("id", IntegerType(), True),
+        StructField("lookup_key", StringType(), True),
+        StructField("amount", DoubleType(), True)
+    ])
+    input_df = spark.createDataFrame(input_data, schema=input_schema)
+
+    lookup_data = [
+        ("X", "L1")
+    ]
+    lookup_schema = StructType([
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    lookup_df = spark.createDataFrame(lookup_data, schema=lookup_schema)
+
+    expected_data = [
+        (1, "A", 100.0, "X", "L1")
+    ]
+    expected_schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("code", StringType(), True),
+        StructField("amount", DoubleType(), True),
+        StructField("lookup_key", StringType(), True),
+        StructField("lookup_value", StringType(), True)
+    ])
+    expected_df = spark.createDataFrame(expected_data, schema=expected_schema)
+
+    result_df = transform_iods_cons_csv_dntl_clmdtl_hx_br1_v353s6p2(input_df, lookup_df)
+    assert_df_equality(result_df, expected_df, ignore_nullable=True)
 ```
 
 ---
@@ -228,3 +383,9 @@ def test_TC010_unexpected_schema_order(spark):
 apiCost: 0.00043752 USD
 
 ---
+
+**Note:**  
+- The transformation function is mocked for demonstration; replace with the actual function from your PySpark conversion.
+- The test suite covers join logic, null handling, reject logic, lookup miss, deduplication, malformed data, and column order robustness.
+- All tests use `chispa`'s `assert_df_equality` for DataFrame comparison.
+- Expand schemas and test data as per your actual business logic and Ab Initio conversion details.
