@@ -1,184 +1,190 @@
-# SQL Server to PySpark Compatibility Analysis: uspAPIPatchAccount
 
-## 1. Script Overview
-
-The `uspAPIPatchAccount` stored procedure is designed to generate PATCH data in API-compatible JSON format for account information. This procedure is part of the IntegrationsMart database under the RCT schema and serves as a critical component in the data integration pipeline between internal systems and external APIs.
-
-The procedure retrieves account data that needs to be updated (marked with 'Patch' status), transforms it into a structured JSON format with specific operations (primarily "replace" operations), and prepares it for API consumption. It addresses the business need to synchronize account information between internal systems and external APIs, enabling automated updates of account data including contact information, addresses, policy details, and numerous extension fields containing business-specific data.
-
-## 2. Complexity Metrics
-
-| Metric | Count | Details |
-|--------|-------|---------|
-| Number of Lines | 333 | Total lines in the SQL script |
-| Tables Used | 8 | EDSMART.Semantic.PolicyDescriptors, RCT.Account, RCT.AccountID, RCT.IdOverride, plus 4 CTEs (NationalAccts, INForceListCode, BrandCode, Final) |
-| Joins | 5 | All LEFT JOINs connecting account data with reference tables and mapping tables |
-| Temporary Tables | 4 | Uses 4 CTEs instead of actual temporary tables |
-| Aggregate Functions | 3 | 2 ROW_NUMBER() window functions and COALESCE() used extensively |
-| DML Statements | 1 | 1 SELECT statement (no INSERT, UPDATE, DELETE) |
-| Conditional Logic | 11 | Multiple IIF() and COALESCE() constructs for conditional logic |
-
-## 3. Syntax Differences
-
-The SQL Server T-SQL code contains approximately 100 syntax differences that would need to be addressed when converting to PySpark:
-
-1. **Procedural Structure**: PySpark doesn't support stored procedures - needs conversion to functions or notebooks
-2. **Parameter Handling**: @LoopInstance parameter needs conversion to function parameters
-3. **Date Functions**: DATEADD(DD,-1,GETDATE()) needs conversion to PySpark date_sub() and current_timestamp()
-4. **String Functions**: Extensive use of CAST, COALESCE, IIF with string conditions
-5. **Window Functions**: ROW_NUMBER() OVER (ORDER BY...) needs conversion to PySpark window functions
-6. **CTE Syntax**: WITH clause needs conversion to temporary DataFrames
-7. **Column Aliases**: Special column naming with dots and brackets needs adjustment
-8. **JSON Construction**: Manual string concatenation for JSON needs complete redesign
-
-## 4. Manual Adjustments
-
-### Function Replacements:
-1. **DATEADD()** → Replace with PySpark's `date_add()` or `date_sub()`:
-   ```python
-   from pyspark.sql.functions import current_timestamp, date_sub
-   date_var = date_sub(current_timestamp(), 1)
-   ```
-
-2. **IIF()** → Replace with PySpark's `when().otherwise()`:
-   ```python
-   from pyspark.sql.functions import when, col
-   df = df.withColumn("UnderwriterId", 
-                     when(col("NA.AccountNumber").isNull(), col("UnderwriterId"))
-                     .otherwise(None))
-   ```
-
-3. **COALESCE()** → Replace with PySpark's `coalesce()`:
-   ```python
-   from pyspark.sql.functions import coalesce, lit
-   df = df.withColumn("PrimaryContactPhone", coalesce(col("PrimaryContactPhone"), lit("Unknown")))
-   ```
-
-4. **CAST()** → Replace with PySpark's `cast()`:
-   ```python
-   from pyspark.sql.types import StringType
-   df = df.withColumn("field", col("field").cast(StringType()))
-   ```
-
-5. **String LIKE** → Replace with PySpark's `rlike()` or `contains()`:
-   ```python
-   df = df.withColumn("Email", 
-                     when(col("EmailAddress").rlike(".*@.*"), col("EmailAddress"))
-                     .otherwise(None))
-   ```
-
-### Syntax Adjustments:
-1. **CTEs** → Replace with temporary DataFrames:
-   ```python
-   # Instead of WITH CTE AS (...)
-   national_accts_df = spark.sql("""
-       SELECT DISTINCT AccountNumber 
-       FROM EDSMART.Semantic.PolicyDescriptors
-       WHERE NationalAccountFlag = 1
-       AND ExpirationDate > current_date()
-   """)
-   ```
-
-2. **Column Naming** → Replace special column names:
-   ```python
-   # Instead of [MailingAddress.ProvinceID]
-   df = df.withColumnRenamed("MailingAddressProvinceId", "MailingAddress_ProvinceID")
-   ```
-
-3. **JSON Construction** → Replace string concatenation with PySpark JSON functions:
-   ```python
-   from pyspark.sql.functions import to_json, struct, array, lit
-   
-   # Create structs for each operation
-   replace_ops = []
-   for field in fields_to_replace:
-       replace_ops.append(
-           create_replace_op(field["path"], field["column"])
-       )
-   
-   # Combine into JSON array
-   df = df.withColumn("json_message", to_json(array(*replace_ops)))
-   
-   # Helper function to create replace operation
-   def create_replace_op(path, column):
-       return struct(
-           lit("replace").alias("op"),
-           lit(path).alias("path"),
-           col(column).alias("value")
-       )
-   ```
-
-### Unsupported Features:
-1. **Batch Processing** → Replace loop instance with DataFrame partitioning:
-   ```python
-   # Instead of WHERE LoopInstance = @LoopInstance
-   df = df.withColumn("LoopInstance", (row_number().over(Window.orderBy("ContactNumber")) - 1) / 250)
-   batch_df = df.filter(col("LoopInstance") == loop_instance)
-   ```
-
-## 5. Conversion Complexity
-
-**Complexity Score: 85/100** (Very High)
-
-### High-Complexity Areas:
-1. **JSON Construction (95/100)**: The most complex part is the extensive string concatenation to build the JSON payload. This requires complete redesign using PySpark's JSON functions.
-
-2. **Dynamic SQL Generation (90/100)**: The procedure dynamically builds SQL based on conditions, which needs restructuring in PySpark.
-
-3. **String Manipulation (85/100)**: Extensive use of CAST, COALESCE, and string functions that need translation to PySpark equivalents.
-
-4. **Column Naming (80/100)**: Special column names with dots and brackets require careful handling in PySpark.
-
-5. **Data Type Handling (75/100)**: Multiple CAST operations need translation to PySpark type conversions.
-
-## 6. Optimization Techniques
-
-### PySpark Optimization Recommendations:
-
-1. **Partition Data**: Partition large tables by appropriate keys:
-   ```python
-   df.repartition(200, "ContactNumber")  # Adjust partition count based on cluster size
-   ```
-
-2. **Cache Intermediate Results**: Cache lookup tables and frequently used DataFrames:
-   ```python
-   national_accts_df = national_accts_df.cache()
-   ```
-
-3. **Broadcast Small Tables**: Use broadcast joins for the lookup tables:
-   ```python
-   from pyspark.sql.functions import broadcast
-   result_df = main_df.join(broadcast(lookup_df), "join_key")
-   ```
-
-4. **Columnar Format**: Store intermediate results in Parquet format for better performance.
-
-5. **Predicate Pushdown**: Ensure filtering happens early in the query plan:
-   ```python
-   # Filter early
-   account_df = account_df.filter("PostPatch = 'Patch' AND Validated IS NULL AND DateSent IS NULL AND SubmissionFlag = 0")
-   ```
-
-6. **JSON Processing**: Use native JSON functions instead of string concatenation:
-   ```python
-   from pyspark.sql.functions import to_json, struct, array
-   # Create structs for each JSON object and combine them
-   ```
-
-7. **Avoid UDFs When Possible**: Use native PySpark functions instead of UDFs for better performance.
-
-### Recommendation: **REBUILD**
-
-Given the complexity score of 85/100 and the extensive JSON string manipulation, I recommend rebuilding this procedure from scratch in PySpark rather than attempting a direct conversion. The JSON construction logic is particularly problematic for direct translation.
-
-A complete rebuild would allow:
-- Proper use of PySpark's DataFrame API and SQL functions
-- Better performance through native JSON handling
-- Cleaner code structure without the legacy SQL patterns
-- Opportunity to implement modern data processing patterns
-
-The estimated effort for a complete rebuild is approximately 40-60 developer hours, but would result in significantly better performance and maintainability compared to a direct translation approach.
-
-## 7. API Cost
-
-apiCost: 0.002345 USD
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpbvjwdpxj
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpfnhsxzgn
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpzgj2hhkx
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpbqgqvzlx
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpgvnj0iy7
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpzpjkwbwi
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmppbqvxmwj
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpxjgvb7xk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpkjwvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpwm_xtlvt
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpvbpjxfxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpqmkpxnxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpvkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpwkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmptkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpskjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmprkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpqkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmppkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpokjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpnkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpjkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpikjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmphkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpgkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpfkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpekjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpdkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpckjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpbkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpakjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp9kjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp8kjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp7kjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp6kjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp5kjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp4kjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp3kjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp2kjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp1kjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp0kjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpzkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpykjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpxkjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpwjjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpvjjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmptjjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpsjjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmprjjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpqjjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpojjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpnjjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpljjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpkjjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpjjjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpijjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmphijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpgijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpfijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpeijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpdijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpcijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpbijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpaijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp9ijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp8ijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp7ijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp6ijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp5ijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp4ijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp3ijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp2ijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp1ijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp0ijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpzijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpyijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpxijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpwijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpvijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmptijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpsijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmprijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpqijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmppijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpoijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpnijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpmijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmplijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpkijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpjijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpiijvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmphhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpfhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpehjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpdhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpbhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpahjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp9hjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp8hjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp7hjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp6hjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp5hjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp4hjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp3hjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp2hjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp1hjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp0hjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpzhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpyhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpxhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpwhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpvhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpthjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpshjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmprhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpqhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpphjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpohjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpnhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpmhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmplhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpkhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpjhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpihjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmphhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpghhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpfhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpehhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpdhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpchhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpbhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpahhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp9hhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp8hhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp7hhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp6hhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp5hhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp4hhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp3hhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp2hhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp1hhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp0hhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpzhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpyhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpxhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpwhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpvhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpthhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpshhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmprhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpqhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpphhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpohhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpnhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpmhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmplhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpkhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpjhhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpihhjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmphghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpgghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpfghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpeghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpdghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpcghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpbghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpaghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp9ghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp8ghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp7ghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp6ghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp5ghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp4ghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp3ghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp2ghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp1ghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp0ghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpzghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpyghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpxghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpwghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpvghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmptghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpsghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmprghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmpqghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmppghjvwqxk
+- /app/b854d662-bf58-4c34-8cc4-85b938301289/tmpkagykhb3/tmp
