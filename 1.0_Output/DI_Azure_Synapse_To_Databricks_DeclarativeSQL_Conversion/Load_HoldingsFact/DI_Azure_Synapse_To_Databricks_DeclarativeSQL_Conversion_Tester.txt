@@ -1,78 +1,75 @@
-```
 =============================================
 Author:        AAVA
-Created on:   
-Description:   Loads the FACT_EXECUTIVE_SUMMARY table with summarized holding metrics from staging data.
+Created on : 
+Description:   Loads the FACT_EXECUTIVE_SUMMARY table with summarized holding metrics from staging, applying business rules and data quality checks.
 =============================================
 
 Test Case List:
-| Test Case ID | Test Case Description                                                                 | Expected Outcome                                                                                     |
-|--------------|--------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
-| TC01         | Validate correct mapping and insertion of all fields from staging to fact table       | All fields in FACT_EXECUTIVE_SUMMARY match expected values from STG_HOLDING_METRICS and dimensions   |
-| TC02         | Ensure income_amount is set to 0 when NULL in staging                                | income_amount is 0 for records where staging income_amount is NULL                                   |
-| TC03         | Ensure income_amount is set to 0 when negative in staging                            | income_amount is 0 for records where staging income_amount < 0                                       |
-| TC04         | Validate correct INNER JOIN logic with all dimension tables                          | Only records with matching keys in all dimension tables are inserted                                 |
-| TC05         | Validate no duplicate records inserted                                               | No duplicate records in FACT_EXECUTIVE_SUMMARY for same key combination                             |
-| TC06         | Validate null handling for all fields                                                | Nulls in staging are correctly handled in target (except income_amount business rule)                |
-| TC07         | Validate data type mapping for DECIMAL, DATE, etc.                                   | Data types in FACT_EXECUTIVE_SUMMARY match expected Databricks types                                 |
-| TC08         | Validate temporary view cleanup                                                      | Temporary view staging_metrics does not exist after procedure execution                              |
-| TC09         | Validate performance for large dataset (manual review)                               | Procedure completes within acceptable time and resource usage                                         |
-| TC10         | Validate string and date/time format consistency                                     | String and date/time fields are correctly formatted in FACT_EXECUTIVE_SUMMARY                        |
 
-Pytest Script for Each Test Case
+| Test Case ID | Test Case Description                                                                 | Expected Outcome                                                                                   |
+|--------------|--------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: All staging and dimension data present and valid                         | All records inserted into FACT_EXECUTIVE_SUMMARY with correct transformations and joins           |
+| TC02         | Edge: income_amount is NULL in staging                                               | income_amount is set to 0 in FACT_EXECUTIVE_SUMMARY                                               |
+| TC03         | Edge: income_amount is negative in staging                                           | income_amount is set to 0 in FACT_EXECUTIVE_SUMMARY                                               |
+| TC04         | Edge: Empty staging table                                                            | No records inserted into FACT_EXECUTIVE_SUMMARY                                                   |
+| TC05         | Edge: Staging record with missing join in DIM_DATE                                   | Record is not inserted into FACT_EXECUTIVE_SUMMARY                                                |
+| TC06         | Edge: Staging record with missing join in DIM_INSTITUTION                            | Record is not inserted into FACT_EXECUTIVE_SUMMARY                                                |
+| TC07         | Edge: Staging record with missing join in DIM_CORPORATION                            | Record is not inserted into FACT_EXECUTIVE_SUMMARY                                                |
+| TC08         | Edge: Staging record with missing join in DIM_PRODUCT                                | Record is not inserted into FACT_EXECUTIVE_SUMMARY                                                |
+| TC09         | Error: Staging table missing required column (e.g., income_amount)                   | Query fails with appropriate error                                                                 |
+| TC10         | Error: Staging table has unexpected data type for a numeric column                   | Query fails with appropriate error                                                                 |
+| TC11         | Edge: All numeric columns are NULL except keys                                       | All corresponding columns in FACT_EXECUTIVE_SUMMARY are NULL except income_amount (should be 0)   |
+| TC12         | Edge: Large dataset (performance/sanity)                                             | All valid records inserted, performance within reasonable bounds                                   |
+
+---
+
+Pytest Script (test_load_fact_executive_summary.py):
 
 ```python
 import pytest
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, when
+from pyspark.sql.types import (StructType, StructField, IntegerType, FloatType, StringType)
+from pyspark.sql.utils import AnalysisException
 
+# Helper function to create Spark session for testing
 @pytest.fixture(scope="module")
 def spark():
-    return SparkSession.builder.master("local[1]").appName("test").getOrCreate()
+    spark = SparkSession.builder.master("local[1]").appName("unit-test").getOrCreate()
+    yield spark
+    spark.stop()
 
-@pytest.fixture(scope="module")
-def setup_tables(spark):
-    # Sample data for staging and dimensions
-    stg_data = [
-        (20230101, 1, 10, 100, 120.0, 1, 30.0, 2, 60.0, 3, 90.0, 4, 10.0, 1, 5.0, 1, 1000.0, 2, 200.0, 3),
-        (20230102, 2, 20, 200, 0.0, 0, 0.0, 0, 0.0, 0, 0.0, 0, 0.0, 0, 0.0, 0, None, 0, 0.0, 0),
-        (20230103, 3, 30, 300, 1.0, 1, 1.0, 1, 1.0, 1, 1.0, 1, 1.0, 1, 1.0, 1, -500.0, 1, 1.0, 1)
-    ]
-    stg_cols = ["date_value", "institution_id", "corporation_id", "product_id", "a120_amount", "a120_count", "a30_to_59_amount", "a30_to_59_count", "a60_to_89_amount", "a60_to_89_count", "a90_to_119_amount", "a90_to_119_count", "charge_off_amount", "charge_off_count", "fraud_amount", "fraud_count", "income_amount", "number_of_accounts", "purchases_amount", "purchases_count"]
-    stg_df = spark.createDataFrame(stg_data, stg_cols)
-    stg_df.createOrReplaceTempView("STG_HOLDING_METRICS")
+# Helper function to create DataFrames for dimension tables
+def create_dim_tables(spark):
+    dim_date = spark.createDataFrame([
+        (20230101,), (20230102,)
+    ], ["date_key"])
+    dim_institution = spark.createDataFrame([
+        (1,), (2,)
+    ], ["institution_id"])
+    dim_corporation = spark.createDataFrame([
+        (10,), (20,)
+    ], ["corporation_id"])
+    dim_product = spark.createDataFrame([
+        (100,), (200,)
+    ], ["product_id"])
+    return dim_date, dim_institution, dim_corporation, dim_product
 
-    dim_date = [(20230101,),(20230102,),(20230103,)]
-    spark.createDataFrame(dim_date, ["date_key"]).createOrReplaceTempView("DIM_DATE")
-    dim_inst = [(1,),(2,),(3,)]
-    spark.createDataFrame(dim_inst, ["institution_id"]).createOrReplaceTempView("DIM_INSTITUTION")
-    dim_corp = [(10,),(20,),(30,)]
-    spark.createDataFrame(dim_corp, ["corporation_id"]).createOrReplaceTempView("DIM_CORPORATION")
-    dim_prod = [(100,),(200,),(300,)]
-    spark.createDataFrame(dim_prod, ["product_id"]).createOrReplaceTempView("DIM_PRODUCT")
+# Helper function to register DataFrames as temp views
+def register_tables(spark, dim_date, dim_institution, dim_corporation, dim_product, stg):
+    dim_date.createOrReplaceTempView("DIM_DATE")
+    dim_institution.createOrReplaceTempView("DIM_INSTITUTION")
+    dim_corporation.createOrReplaceTempView("DIM_CORPORATION")
+    dim_product.createOrReplaceTempView("DIM_PRODUCT")
+    stg.createOrReplaceTempView("STG_HOLDING_METRICS")
 
-    # Empty target table
-    fact_schema = stg_df.schema
-    spark.createDataFrame([], fact_schema).createOrReplaceTempView("FACT_EXECUTIVE_SUMMARY")
-
-    yield
-
-    # Cleanup
-    spark.catalog.dropTempView("STG_HOLDING_METRICS")
-    spark.catalog.dropTempView("DIM_DATE")
-    spark.catalog.dropTempView("DIM_INSTITUTION")
-    spark.catalog.dropTempView("DIM_CORPORATION")
-    spark.catalog.dropTempView("DIM_PRODUCT")
-    spark.catalog.dropTempView("FACT_EXECUTIVE_SUMMARY")
-
-def run_databricks_logic(spark):
-    # Simulate the Databricks logic
+# Helper function to run the Databricks SQL logic
+def run_fact_load(spark):
     spark.sql("""
         CREATE OR REPLACE TEMP VIEW staging_metrics AS
         SELECT * FROM STG_HOLDING_METRICS
     """)
     spark.sql("""
-        INSERT INTO FACT_EXECUTIVE_SUMMARY
+        CREATE OR REPLACE TEMP VIEW FACT_EXECUTIVE_SUMMARY AS
         SELECT 
             dt.date_key,
             inst.institution_id,
@@ -90,7 +87,10 @@ def run_databricks_logic(spark):
             stg.charge_off_count,
             stg.fraud_amount,
             stg.fraud_count,
-            CASE WHEN stg.income_amount IS NULL OR stg.income_amount < 0 THEN 0 ELSE stg.income_amount END AS income_amount,
+            CASE 
+                WHEN stg.income_amount IS NULL OR stg.income_amount < 0 THEN 0
+                ELSE stg.income_amount
+            END AS income_amount,
             stg.number_of_accounts,
             stg.purchases_amount,
             stg.purchases_count
@@ -100,69 +100,117 @@ def run_databricks_logic(spark):
         INNER JOIN DIM_CORPORATION corp ON corp.corporation_id = stg.corporation_id
         INNER JOIN DIM_PRODUCT prod ON prod.product_id = stg.product_id
     """)
-    spark.catalog.dropTempView("staging_metrics")
 
-def get_fact_df(spark):
+# Helper to fetch results from FACT_EXECUTIVE_SUMMARY
+def fetch_fact(spark):
     return spark.sql("SELECT * FROM FACT_EXECUTIVE_SUMMARY")
 
-def get_stg_df(spark):
-    return spark.sql("SELECT * FROM STG_HOLDING_METRICS")
+# TC01: Happy path
+def test_happy_path(spark):
+    stg = spark.createDataFrame([
+        (20230101, 1, 10, 100, 120.0, 1, 30.0, 2, 60.0, 3, 90.0, 4, 5.0, 6, 7.0, 8, 1000.0, 10, 500.0, 5)
+    ], ["date_value", "institution_id", "corporation_id", "product_id", "a120_amount", "a120_count",
+        "a30_to_59_amount", "a30_to_59_count", "a60_to_89_amount", "a60_to_89_count",
+        "a90_to_119_amount", "a90_to_119_count", "charge_off_amount", "charge_off_count",
+        "fraud_amount", "fraud_count", "income_amount", "number_of_accounts", "purchases_amount", "purchases_count"])
+    dim_date, dim_institution, dim_corporation, dim_product = create_dim_tables(spark)
+    register_tables(spark, dim_date, dim_institution, dim_corporation, dim_product, stg)
+    run_fact_load(spark)
+    df = fetch_fact(spark)
+    assert df.count() == 1
+    row = df.collect()[0]
+    assert row.income_amount == 1000.0
 
-def test_TC01_field_mapping(spark, setup_tables):
-    run_databricks_logic(spark)
-    fact = get_fact_df(spark).collect()
-    assert len(fact) == 3
-    # Check mapping for first row
-    assert fact[0].a120_amount == 120.0
-    assert fact[0].a120_count == 1
+# TC02: income_amount is NULL
+def test_income_amount_null(spark):
+    stg = spark.createDataFrame([
+        (20230101, 1, 10, 100, 120.0, 1, 30.0, 2, 60.0, 3, 90.0, 4, 5.0, 6, 7.0, 8, None, 10, 500.0, 5)
+    ], ["date_value", "institution_id", "corporation_id", "product_id", "a120_amount", "a120_count",
+        "a30_to_59_amount", "a30_to_59_count", "a60_to_89_amount", "a60_to_89_count",
+        "a90_to_119_amount", "a90_to_119_count", "charge_off_amount", "charge_off_count",
+        "fraud_amount", "fraud_count", "income_amount", "number_of_accounts", "purchases_amount", "purchases_count"])
+    dim_date, dim_institution, dim_corporation, dim_product = create_dim_tables(spark)
+    register_tables(spark, dim_date, dim_institution, dim_corporation, dim_product, stg)
+    run_fact_load(spark)
+    df = fetch_fact(spark)
+    assert df.collect()[0].income_amount == 0
 
-def test_TC02_income_null_to_zero(spark, setup_tables):
-    run_databricks_logic(spark)
-    fact = get_fact_df(spark).collect()
-    assert fact[1].income_amount == 0
+# TC03: income_amount is negative
+def test_income_amount_negative(spark):
+    stg = spark.createDataFrame([
+        (20230101, 1, 10, 100, 120.0, 1, 30.0, 2, 60.0, 3, 90.0, 4, 5.0, 6, 7.0, 8, -500.0, 10, 500.0, 5)
+    ], ["date_value", "institution_id", "corporation_id", "product_id", "a120_amount", "a120_count",
+        "a30_to_59_amount", "a30_to_59_count", "a60_to_89_amount", "a60_to_89_count",
+        "a90_to_119_amount", "a90_to_119_count", "charge_off_amount", "charge_off_count",
+        "fraud_amount", "fraud_count", "income_amount", "number_of_accounts", "purchases_amount", "purchases_count"])
+    dim_date, dim_institution, dim_corporation, dim_product = create_dim_tables(spark)
+    register_tables(spark, dim_date, dim_institution, dim_corporation, dim_product, stg)
+    run_fact_load(spark)
+    df = fetch_fact(spark)
+    assert df.collect()[0].income_amount == 0
 
-def test_TC03_income_negative_to_zero(spark, setup_tables):
-    run_databricks_logic(spark)
-    fact = get_fact_df(spark).collect()
-    assert fact[2].income_amount == 0
+# TC04: Empty staging table
+def test_empty_staging(spark):
+    stg = spark.createDataFrame([], StructType([
+        StructField("date_value", IntegerType(), True),
+        StructField("institution_id", IntegerType(), True),
+        StructField("corporation_id", IntegerType(), True),
+        StructField("product_id", IntegerType(), True),
+        StructField("a120_amount", FloatType(), True),
+        StructField("a120_count", IntegerType(), True),
+        StructField("a30_to_59_amount", FloatType(), True),
+        StructField("a30_to_59_count", IntegerType(), True),
+        StructField("a60_to_89_amount", FloatType(), True),
+        StructField("a60_to_89_count", IntegerType(), True),
+        StructField("a90_to_119_amount", FloatType(), True),
+        StructField("a90_to_119_count", IntegerType(), True),
+        StructField("charge_off_amount", FloatType(), True),
+        StructField("charge_off_count", IntegerType(), True),
+        StructField("fraud_amount", FloatType(), True),
+        StructField("fraud_count", IntegerType(), True),
+        StructField("income_amount", FloatType(), True),
+        StructField("number_of_accounts", IntegerType(), True),
+        StructField("purchases_amount", FloatType(), True),
+        StructField("purchases_count", IntegerType(), True),
+    ]))
+    dim_date, dim_institution, dim_corporation, dim_product = create_dim_tables(spark)
+    register_tables(spark, dim_date, dim_institution, dim_corporation, dim_product, stg)
+    run_fact_load(spark)
+    df = fetch_fact(spark)
+    assert df.count() == 0
 
-def test_TC04_inner_join_logic(spark, setup_tables):
-    run_databricks_logic(spark)
-    fact = get_fact_df(spark)
-    assert fact.count() == 3  # All staging rows have matching dimension keys
+# TC05: Missing join in DIM_DATE
+def test_missing_dim_date(spark):
+    stg = spark.createDataFrame([
+        (99999999, 1, 10, 100, 120.0, 1, 30.0, 2, 60.0, 3, 90.0, 4, 5.0, 6, 7.0, 8, 1000.0, 10, 500.0, 5)
+    ], ["date_value", "institution_id", "corporation_id", "product_id", "a120_amount", "a120_count",
+        "a30_to_59_amount", "a30_to_59_count", "a60_to_89_amount", "a60_to_89_count",
+        "a90_to_119_amount", "a90_to_119_count", "charge_off_amount", "charge_off_count",
+        "fraud_amount", "fraud_count", "income_amount", "number_of_accounts", "purchases_amount", "purchases_count"])
+    dim_date, dim_institution, dim_corporation, dim_product = create_dim_tables(spark)
+    register_tables(spark, dim_date, dim_institution, dim_corporation, dim_product, stg)
+    run_fact_load(spark)
+    df = fetch_fact(spark)
+    assert df.count() == 0
 
-def test_TC05_no_duplicates(spark, setup_tables):
-    run_databricks_logic(spark)
-    fact = get_fact_df(spark)
-    keys = fact.select("date_key", "institution_id", "corporation_id", "product_id").collect()
-    assert len(keys) == len(set(tuple(row) for row in keys))
+# TC06: Missing join in DIM_INSTITUTION
+def test_missing_dim_institution(spark):
+    stg = spark.createDataFrame([
+        (20230101, 999, 10, 100, 120.0, 1, 30.0, 2, 60.0, 3, 90.0, 4, 5.0, 6, 7.0, 8, 1000.0, 10, 500.0, 5)
+    ], ["date_value", "institution_id", "corporation_id", "product_id", "a120_amount", "a120_count",
+        "a30_to_59_amount", "a30_to_59_count", "a60_to_89_amount", "a60_to_89_count",
+        "a90_to_119_amount", "a90_to_119_count", "charge_off_amount", "charge_off_count",
+        "fraud_amount", "fraud_count", "income_amount", "number_of_accounts", "purchases_amount", "purchases_count"])
+    dim_date, dim_institution, dim_corporation, dim_product = create_dim_tables(spark)
+    register_tables(spark, dim_date, dim_institution, dim_corporation, dim_product, stg)
+    run_fact_load(spark)
+    df = fetch_fact(spark)
+    assert df.count() == 0
 
-def test_TC06_null_handling(spark, setup_tables):
-    run_databricks_logic(spark)
-    fact = get_fact_df(spark)
-    null_counts = fact.filter(col("income_amount").isNull()).count()
-    assert null_counts == 0  # All income_amount should be non-null
-
-def test_TC07_data_type_mapping(spark, setup_tables):
-    run_databricks_logic(spark)
-    fact = get_fact_df(spark)
-    assert str(fact.schema["a120_amount"].dataType) in ["DoubleType", "DecimalType(10,0)"]
-
-def test_TC08_temp_view_cleanup(spark, setup_tables):
-    run_databricks_logic(spark)
-    assert "staging_metrics" not in spark.catalog.listTables()
-
-def test_TC09_performance_manual_review():
-    # Manual: Check execution time and resource usage in Databricks UI/logs
-    assert True
-
-def test_TC10_string_date_format(spark, setup_tables):
-    run_databricks_logic(spark)
-    fact = get_fact_df(spark)
-    assert isinstance(fact.first().date_key, int)
-```
-
-API Cost Estimation
-
-apiCost: 0.0523 USD
-```
+# TC07: Missing join in DIM_CORPORATION
+def test_missing_dim_corporation(spark):
+    stg = spark.createDataFrame([
+        (20230101, 1, 999, 100, 120.0, 1, 30.0, 2, 60.0, 3, 90.0, 4, 5.0, 6, 7.0, 8, 1000.0, 10, 500.0, 5)
+    ], ["date_value", "institution_id", "corporation_id", "product_id", "a120_amount", "a120_count",
+        "a30_to_59_amount", "a30_to_59_count", "a60_to_89_amount", "a60_to_89_count",
+        "a90_to_119_amount", "a90_to_119_count", "charge_off_amount", "charge_off_count",
