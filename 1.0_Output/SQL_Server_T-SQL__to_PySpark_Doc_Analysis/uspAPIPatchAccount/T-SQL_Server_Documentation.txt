@@ -2,233 +2,226 @@
 
 ## 1. Overview of Program
 
-### Purpose of the SQL Server Code
-The `uspAPIPatchAccount` stored procedure is designed to generate PATCH data in API-compatible JSON format for account information. This procedure is part of the IntegrationsMart database under the RCT schema and serves as a critical component in the data integration pipeline between internal systems and external APIs.
-
-The procedure retrieves account data that needs to be updated (marked with 'Patch' status), transforms it into a structured JSON format with specific operations (primarily "replace" operations), and prepares it for API consumption.
+### Purpose
+The `uspAPIPatchAccount` stored procedure is designed to prepare and format account data for PATCH operations in an API integration system. It transforms internal account data from AF Group's database tables into a standardized JSON format required by an external API endpoint. The procedure handles the complex task of mapping various account attributes, including contact details, location data, policy information, and numerous extension fields into a properly structured JSON PATCH request.
 
 ### Business Problem Addressed
-The procedure addresses the business need to synchronize account information between internal systems and external APIs. It enables automated updates of account data including contact information, addresses, policy details, and numerous extension fields containing business-specific data. This ensures that external systems have the most current account information for business operations, particularly for insurance policies and account management.
+This stored procedure addresses the critical business need for data synchronization between AF Group's internal insurance systems and an external system (likely a CRM or customer management platform). It ensures that account information is consistently maintained across platforms by:
+- Identifying accounts that require updates in the external system
+- Transforming internal data structures into API-compatible formats
+- Applying business rules for different account types (e.g., National Accounts)
+- Managing the batching of updates to handle API rate limits and large datasets
+- Tracking the synchronization status of accounts through flags and markers
+
+The procedure is part of a larger integration workflow that maintains data consistency between systems, which is essential for customer service, underwriting, and business operations in the insurance industry.
 
 ## 2. Code Structure and Design
 
 ### Structure and Flow
-The stored procedure follows a modular design with the following key components:
+The stored procedure follows a well-structured approach:
 
-1. **Parameter Definition**: 
-   - Accepts a single parameter `@LoopInstance` (INT) to process data in batches of 250 records
-   - Uses a date variable to filter records based on expiration dates
+1. **Parameter Definition**: Accepts a `@LoopInstance` INT parameter to support batch processing
+2. **Date Variable**: Sets up a date variable (`@Date`) for filtering records based on yesterday's date
+3. **Common Table Expressions (CTEs)**:
+   - `NationalAccts`: Identifies national accounts based on flags and expiration dates
+   - `INForceListCode`: Maps internal status codes to API-compatible values
+   - `BrandCode`: Maps internal brand codes to human-readable brand names
+   - `Final`: Performs the primary data selection and transformation
+4. **Main Query**: Formats the data from the Final CTE into JSON PATCH operations, filtered by the LoopInstance parameter
 
-2. **Common Table Expressions (CTEs)**:
-   - `NationalAccts`: Identifies national account flags from EDSMART.Semantic.PolicyDescriptors
-   - `INForceListCode`: Maps status codes to human-readable values (inforce, prospect, inactive)
-   - `BrandCode`: Maps brand IDs to brand names (Accident Fund, Third Coast Underwriters, etc.)
-   - `Final`: Main data selection and transformation CTE that joins account data with mapping tables
-
-3. **Main Query**:
-   - Selects from the `Final` CTE
-   - Filters by the provided loop instance
-   - Dynamically constructs JSON patch operations for each field
-   - Formats the output as a complete JSON message
+The procedure uses SQL Server's string manipulation capabilities extensively to construct complex JSON messages, with pagination implemented through the `@LoopInstance` parameter to process data in manageable batches of 250 records.
 
 ### Primary SQL Server Components
-- **Tables**: 
-  - RCT.Account (main data source)
-  - EDSMART.Semantic.PolicyDescriptors (for national accounts)
-  - RCT.AccountID (for ID mapping)
-  - RCT.IdOverride (for custom ID handling)
 
-- **Views**: None used directly
-
-- **Stored Procedures**: 
-  - uspAPIPatchAccount (the procedure itself)
-
-- **Joins**: 
-  - 5 LEFT JOINs connecting account data with reference tables and mapping tables
-
-- **Aggregations**: 
-  - ROW_NUMBER() window function for pagination and sorting
-
-- **Subqueries**: 
-  - None used directly; logic is organized using CTEs instead
+| Component Type | Count | Examples |
+|---------------|-------|----------|
+| Tables | 4 | RCT.Account, EDSMART.Semantic.PolicyDescriptors, RCT.AccountID, RCT.IdOverride |
+| Common Table Expressions (CTEs) | 4 | NationalAccts, INForceListCode, BrandCode, Final |
+| Joins | 5 | LEFT JOIN NationalAccts, LEFT JOIN INForceListCode, LEFT JOIN BrandCode, LEFT JOIN RCT.AccountID, LEFT JOIN RCT.IdOverride |
+| Window Functions | 2 | ROW_NUMBER() for LoopInstance calculation and sorting |
+| Conditional Logic | 7+ | Multiple IIF statements, COALESCE functions |
+| String Manipulation | Extensive | CAST, REPLACE, string concatenation for JSON |
+| Parameters | 1 | @LoopInstance |
+| Variables | 1 | @Date |
+| Filtering Conditions | 4 | PostPatch = 'Patch', Validated IS NULL, DateSent IS NULL, SubmissionFlag = 0 |
 
 ## 3. Data Flow and Processing Logic
 
 ### Processing Logic Components
 
-1. **Data Filtering and Selection**:
-   - **Functionality**: Identifies accounts that need to be patched but haven't been processed yet
-   - **Transformations**: Filters where `PostPatch = 'Patch'`, `Validated IS NULL`, `DateSent IS NULL`, and `SubmissionFlag = 0`
+1. **Date Calculation**
+   - **Functionality**: Sets up a date variable for filtering records
+   - **Transformation**: `DATEADD(DD,-1,GETDATE())` to get yesterday's date
 
-2. **National Account Identification**:
-   - **Functionality**: Identifies accounts flagged as national accounts
-   - **Transformations**: Filters PolicyDescriptors where NationalAccountFlag = 1 and ExpirationDate > @Date
+2. **National Account Identification**
+   - **Functionality**: Identifies accounts flagged as national accounts with non-expired policies
+   - **Transformation**: Filters PolicyDescriptors where NationalAccountFlag = 1 and ExpirationDate > @Date
 
-3. **Status Code Mapping**:
-   - **Functionality**: Translates numeric status codes to human-readable values
-   - **Transformations**: Maps ItemID to ItemCode for account status values
+3. **Code Translation**
+   - **Functionality**: Maps internal codes to human-readable values
+   - **Transformation**: Uses inline table values to create lookup tables for account status and brand codes
 
-4. **Brand Code Mapping**:
-   - **Functionality**: Translates numeric brand codes to brand names
-   - **Transformations**: Maps ItemID to ItemCode for brand values
+4. **Account Data Selection**
+   - **Functionality**: Retrieves and transforms account data from multiple sources
+   - **Transformation**: 
+     - Joins account data with lookup tables
+     - Resolves account IDs through multiple sources (AccountID table or IdOverride table)
+     - Applies special handling for national accounts (NULL UnderwriterId)
+     - Maps fields to API paths
+     - Formats extension fields with appropriate type conversions
 
-5. **Account ID Resolution**:
-   - **Functionality**: Determines the correct account ID to use
-   - **Transformations**: COALESCE(AC.AccountID, ID.RCT_ID) to use override ID when available
+5. **Pagination Logic**
+   - **Functionality**: Divides records into batches of 250 for processing
+   - **Transformation**: `(ROW_NUMBER() OVER (ORDER BY A.ContactNumber) -1) / 250 AS LoopInstance`
 
-6. **Batch Processing Calculation**:
-   - **Functionality**: Divides records into manageable batches
-   - **Transformations**: (ROW_NUMBER() OVER (ORDER BY A.ContactNumber) -1) / 250 to assign batch numbers
+6. **Email Validation**
+   - **Functionality**: Ensures only valid email addresses are included
+   - **Transformation**: Uses `IIF(EmailAddress like '%@%', EmailAddress, NULL)` pattern
 
-7. **Special Field Handling**:
-   - **Functionality**: Applies business rules to specific fields
-   - **Transformations**: 
-     - IIF(NA.AccountNumber IS NULL, UnderwriterId, NULL) to remove UnderwriterID for national accounts
-     - IIF(EmailAddress like '%@%', EmailAddress, NULL) to validate email addresses
+7. **JSON Construction**
+   - **Functionality**: Builds a complex JSON structure for API PATCH operations
+   - **Transformation**: 
+     - Creates "replace" operations for each field
+     - Uses COALESCE to handle NULL values
+     - Formats extension fields as an array of ID-value pairs
+     - Ensures proper JSON syntax with nested objects and arrays
 
-8. **JSON Construction**:
-   - **Functionality**: Builds a properly formatted JSON patch document
-   - **Transformations**: Extensive string concatenation with COALESCE to handle null values
+8. **Batch Filtering**
+   - **Functionality**: Returns only the records for the specified batch
+   - **Transformation**: `WHERE LoopInstance = @LoopInstance`
 
 ## 4. Data Mapping
 
-### Target to Source Mapping
-
 | Target Table Name | Target Column Name | Source Table Name | Source Column Name | Remarks |
 |-------------------|-------------------|-------------------|-------------------|---------|
-| API Endpoint | UnderwriterId | RCT.Account | UnderwriterId | Conditional: Removed for National Accounts |
-| API Endpoint | MailingAddress.ProvinceID | RCT.Account | MailingAddressProvinceId | 1:1 mapping |
-| API Endpoint | MailingAddress.AddressLine | RCT.Account | MailingAddressAddressLine | 1:1 mapping |
-| API Endpoint | MailingAddress.City | RCT.Account | MailingAddressCity | 1:1 mapping |
-| API Endpoint | MailingAddress.PostalCode | RCT.Account | MailingAddressPostalCode | 1:1 mapping |
-| API Endpoint | MailingAddress.Longitude | RCT.Account | MailingAddressLongitude | 1:1 mapping |
-| API Endpoint | MailingAddress.Latitude | RCT.Account | MailingAddressLatitude | 1:1 mapping |
-| API Endpoint | MailingAddress.County | RCT.Account | MailingAddressCounty | 1:1 mapping |
-| API Endpoint | Name | RCT.Account | Name | 1:1 mapping |
-| API Endpoint | Phone | RCT.Account | BusinessPhone | 1:1 mapping |
-| API Endpoint | Fax | RCT.Account | FaxPhone | 1:1 mapping |
-| API Endpoint | Email | RCT.Account | EmailAddress | Transformation: Validated with '%@%' pattern |
-| API Endpoint | Notes | RCT.Account | Notes | Transformation: CAST as VARCHAR(150) |
-| API Endpoint | ContactNumber | RCT.Account | ContactNumber | 1:1 mapping |
-| API Endpoint | ExtensionFields[11] | INForceListCode CTE | ItemID | Mapping: Account status code |
-| API Endpoint | ExtensionFields[37] | RCT.Account | BDCName | 1:1 mapping |
-| API Endpoint | ExtensionFields[40] | RCT.Account | UnderwriterEmail | Transformation: Validated with '%@%' pattern |
-| API Endpoint | ExtensionFields[67] | RCT.Account | OnBaseLink | 1:1 mapping |
-| API Endpoint | ExtensionFields[69] | RCT.Account | Policy1 | 1:1 mapping |
-| API Endpoint | ExtensionFields[72] | RCT.Account | LineOfBusiness1 | 1:1 mapping |
-| API Endpoint | ExtensionFields[73] | RCT.Account | Premium1 | 1:1 mapping |
-| API Endpoint | ExtensionFields[74] | RCT.Account | PolicyEffectiveDate1 | 1:1 mapping |
-| API Endpoint | ExtensionFields[75] | RCT.Account | PolicyExpirationDATE1 | 1:1 mapping |
-| API Endpoint | ExtensionFields[76] | RCT.Account | PricingType1 | 1:1 mapping |
-| API Endpoint | ExtensionFields[77] | RCT.Account | GoverningClassCode1 | 1:1 mapping |
-| API Endpoint | ExtensionFields[78] | RCT.Account | NAICSCode1 | 1:1 mapping |
-| API Endpoint | ExtensionFields[79] | RCT.Account | Industry1 | 1:1 mapping |
-| API Endpoint | ExtensionFields[80] | RCT.Account | HazardGroup1 | 1:1 mapping |
-| API Endpoint | ExtensionFields[81] | RCT.Account | PMScore1 | 1:1 mapping |
-| API Endpoint | ExtensionFields[82] | RCT.Account | ExperienceModificationFactor1 | Transformation: COALESCE with 0.0000 |
-| API Endpoint | ExtensionFields[83] | RCT.Account | Payroll1 | 1:1 mapping |
-| API Endpoint | ExtensionFields[85] | RCT.Account | Policy2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[88] | RCT.Account | LineOfBusiness2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[89] | RCT.Account | Premium2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[90] | RCT.Account | PolicyEffectiveDate2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[91] | RCT.Account | PolicyExpirationDATE2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[92] | RCT.Account | PricingType2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[93] | RCT.Account | GoverningClassCode2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[94] | RCT.Account | NAICSCode2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[95] | RCT.Account | Industry2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[96] | RCT.Account | HazardGroup2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[97] | RCT.Account | PMScore2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[98] | RCT.Account | ExperienceModificationFactor2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[99] | RCT.Account | Payroll2 | 1:1 mapping |
-| API Endpoint | ExtensionFields[101] | RCT.Account | Policy3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[104] | RCT.Account | LineOfBusiness3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[105] | RCT.Account | Premium3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[106] | RCT.Account | PolicyEffectiveDate3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[107] | RCT.Account | PolicyExpirationDATE3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[108] | RCT.Account | PricingType3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[109] | RCT.Account | GoverningClassCode3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[110] | RCT.Account | NAICSCode3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[111] | RCT.Account | Industry3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[112] | RCT.Account | HazardGroup3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[113] | RCT.Account | PMScore3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[114] | RCT.Account | ExperienceModificationFactor3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[115] | RCT.Account | Payroll3 | 1:1 mapping |
-| API Endpoint | ExtensionFields[116] | BrandCode CTE | ItemID | Mapping: Brand code |
-| API Endpoint | ExtensionFields[117] | RCT.Account | OperatingCompany | 1:1 mapping |
-| API Endpoint | ExtensionFields[118] | RCT.Account | PreviousAccountID | 1:1 mapping |
-| API Endpoint | ExtensionFields[119] | RCT.Account | PolicyRegion | 1:1 mapping |
-| API Endpoint | ExtensionFields[120] | RCT.Account | NewBusinessPolicyFlag | Transformation: IIF(NewBusinessPolicyFlag=1,'2444','2445') |
-| API Endpoint | ExtensionFields[121] | RCT.Account | AgencyID | 1:1 mapping |
-| API Endpoint | ExtensionFields[122] | RCT.Account | PrimaryContactName | 1:1 mapping |
-| API Endpoint | ExtensionFields[123] | RCT.Account | PrimaryContactPhone | Transformation: COALESCE with 'Unknown' |
-| API Endpoint | ExtensionFields[124] | RCT.Account | PrimaryContactEmail | Transformation: Validated with '%@%' pattern |
-| API Endpoint | ExtensionFields[125] | RCT.Account | PrimaryContactTitle | 1:1 mapping |
-| API Endpoint | ExtensionFields[126] | RCT.Account | UnderwriterName | 1:1 mapping |
-| API Endpoint | ExtensionFields[127] | RCT.Account | UnderwriterPhone | 1:1 mapping |
-| API Endpoint | ExtensionFields[129] | RCT.Account | ContractAgencyName | 1:1 mapping |
-| API Endpoint | ExtensionFields[130] | RCT.Account | ContractAgencyBusinessEmail | Transformation: Validated with '%@%' pattern |
-| API Endpoint | ExtensionFields[131] | RCT.Account | MasterAgent | 1:1 mapping |
-| API Endpoint | ExtensionFields[160] | RCT.Account | MasterCompany | 1:1 mapping |
-| API Endpoint | ExtensionFields[161] | RCT.Account | ComplianceFLAG | Transformation: COALESCE with 'N' |
-| API Endpoint | ExtensionFields[167] | RCT.Account | ExternalUniqueId/ContactNumber | Transformation: IIF(LEN > 15, REPLACE ContactNumber, REPLACE ExternalUniqueId) |
-| API Endpoint | ExtensionFields[168] | RCT.Account | WrittenLossRatio | 1:1 mapping |
+| API PATCH Request | AccountID | RCT.AccountID / RCT.IdOverride | AccountID / RCT_ID | 1:1 mapping with fallback logic |
+| API PATCH Request | UnderwriterId | RCT.Account | UnderwriterId | Transformation: NULL for National Accounts |
+| API PATCH Request | Location.Address.ProvinceID | RCT.Account | PrimaryLocationAddressProvinceId | 1:1 mapping |
+| API PATCH Request | Location.Address.AddressLine | RCT.Account | PrimaryLocationAddressAddressLine | 1:1 mapping |
+| API PATCH Request | Location.Address.City | RCT.Account | PrimaryLocationAddressCity | 1:1 mapping |
+| API PATCH Request | Location.Address.PostalCode | RCT.Account | PrimaryLocationAddressPostalCode | 1:1 mapping |
+| API PATCH Request | Location.Address.Longitude | RCT.Account | PrimaryLocationAddressLongitude | 1:1 mapping |
+| API PATCH Request | Location.Address.Latitude | RCT.Account | PrimaryLocationAddressLatitude | 1:1 mapping |
+| API PATCH Request | Location.Address.County | RCT.Account | PrimaryLocationAddressCounty | 1:1 mapping |
+| API PATCH Request | Location.ExternalUniqueId | RCT.Account | PrimaryLocationAddressExternalUniqueId | Transformation: CAST to VARCHAR(100) |
+| API PATCH Request | Location.LocationNumber | RCT.Account | PrimaryLocationAddressLocationNumber | 1:1 mapping |
+| API PATCH Request | Location.Description | RCT.Account | PrimaryLocationAddressDescription | 1:1 mapping |
+| API PATCH Request | Location.AdditionalInfo | RCT.Account | PrimaryLocationAddressAdditionalInfo | 1:1 mapping |
+| API PATCH Request | MailingAddress.ProvinceID | RCT.Account | MailingAddressProvinceId | 1:1 mapping |
+| API PATCH Request | MailingAddress.AddressLine | RCT.Account | MailingAddressAddressLine | 1:1 mapping |
+| API PATCH Request | MailingAddress.City | RCT.Account | MailingAddressCity | 1:1 mapping |
+| API PATCH Request | MailingAddress.PostalCode | RCT.Account | MailingAddressPostalCode | 1:1 mapping |
+| API PATCH Request | MailingAddress.Longitude | RCT.Account | MailingAddressLongitude | 1:1 mapping |
+| API PATCH Request | MailingAddress.Latitude | RCT.Account | MailingAddressLatitude | 1:1 mapping |
+| API PATCH Request | MailingAddress.County | RCT.Account | MailingAddressCounty | 1:1 mapping |
+| API PATCH Request | ExtensionFields[37] | RCT.Account | BDCName | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[11] | INForceListCode | ItemID | Transformation: Code lookup |
+| API PATCH Request | ExtensionFields[69] | RCT.Account | Policy1 | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[72] | RCT.Account | LineOfBusiness1 | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[76] | RCT.Account | PricingType1 | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[130] | RCT.Account | ContractAgencyBusinessEmail | Validation: Only if contains '@' |
+| API PATCH Request | ExtensionFields[131] | RCT.Account | MasterAgent | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[67] | RCT.Account | OnBaseLink | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[161] | RCT.Account | ComplianceFLAG | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[124] | RCT.Account | PrimaryContactEmail | Validation: Only if contains '@' |
+| API PATCH Request | ExtensionFields[125] | RCT.Account | PrimaryContactTitle | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[126] | RCT.Account | UnderwriterName | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[127] | RCT.Account | UnderwriterPhone | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[40] | RCT.Account | UnderwriterEmail | Validation: Only if contains '@' |
+| API PATCH Request | ExtensionFields[129] | RCT.Account | ContractAgencyName | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[116] | BrandCode | ItemID | Transformation: Code lookup |
+| API PATCH Request | ExtensionFields[117] | RCT.Account | OperatingCompany | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[118] | RCT.Account | PreviousAccountID | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[119] | RCT.Account | PolicyRegion | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[122] | RCT.Account | PrimaryContactName | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | ExtensionFields[123] | RCT.Account | PrimaryContactPhone | Transformation: COALESCE with 'Unknown' |
+| API PATCH Request | ExtensionFields[120] | RCT.Account | NewBusinessPolicyFlag | Transformation: '2444' if 1, '2445' otherwise |
+| API PATCH Request | ExtensionFields[167] | RCT.Account | ExternalUniqueId/ContactNumber | Transformation: Remove 'AF' prefix |
+| API PATCH Request | ExtensionFields[168] | RCT.Account | WrittenLossRatio | Transformation: CAST to VARCHAR(MAX) |
+| API PATCH Request | Name | RCT.Account | Name | 1:1 mapping |
+| API PATCH Request | Phone | RCT.Account | BusinessPhone | 1:1 mapping |
+| API PATCH Request | Fax | RCT.Account | FaxPhone | 1:1 mapping |
+| API PATCH Request | Email | RCT.Account | EmailAddress | Validation: Only if contains '@' |
+| API PATCH Request | Notes | RCT.Account | Notes | Transformation: CAST to VARCHAR(150) |
+| API PATCH Request | ContactNumber | RCT.Account | ContactNumber | 1:1 mapping |
 
 ## 5. Complexity Analysis
 
-| Complexity Factor | Count/Value | Description |
-|-------------------|-------------|-------------|
-| Lines of Code (LOC) | 370 | Total lines including comments and blank lines |
-| Cyclomatic Complexity | 8 | Base complexity (1) + 7 conditional operations |
-| Nesting Depth | 3 | Maximum depth of nested structures |
-| Tables | 5 | RCT.Account, EDSMART.Semantic.PolicyDescriptors, RCT.AccountID, RCT.IdOverride, plus CTEs |
-| Temporary Tables | 0 | No explicit temporary tables created |
-| DML Statements | 1 | 1 SELECT statement (no INSERT, UPDATE, DELETE) |
-| Joins | 5 | 5 LEFT JOIN operations |
-| Subqueries | 0 | Logic organized using CTEs instead |
-| CTEs | 4 | NationalAccts, INForceListCode, BrandCode, Final |
-| Aggregation Queries | 2 | 2 ROW_NUMBER() window functions |
-| Input Parameters | 1 | @LoopInstance INT |
-| Output Parameters | 0 | No explicit output parameters |
-| Data Transformations | 65+ | Multiple CAST, COALESCE, string operations |
-| Function Calls | 75+ | COALESCE, CAST, IIF, LEN, REPLACE, DATEADD, ROW_NUMBER() |
-| **Overall Complexity Score** | **75/100** | High complexity due to extensive data transformations and JSON construction |
+| Metric | Value | Description |
+|--------|-------|-------------|
+| Lines of Code (LOC) | 366 | Total number of lines in the procedure |
+| Cyclomatic Complexity | 5 | Number of independent execution paths |
+| Nesting Depth | 2 | Maximum depth of nested structures |
+| Tables | 4 | Total number of tables involved |
+| Temporary Tables | 0 | No temporary tables used |
+| DML Statements | 2 | SELECT statements (main query and subqueries) |
+| Joins | 5 | Count of JOIN clauses |
+| Subqueries | 0 | No explicit subqueries (uses CTEs instead) |
+| CTEs | 4 | Count of Common Table Expressions |
+| Aggregation Queries | 0 | No GROUP BY or HAVING clauses |
+| Input Parameters | 1 | @LoopInstance parameter |
+| Output Parameters | 0 | No output parameters |
+| Data Transformations | 60+ | Extensive field transformations and formatting |
+| Function Calls | 100+ | Numerous CAST, COALESCE, IIF calls |
+| **Overall Complexity Score** | 75/100 | High complexity due to extensive JSON construction and data transformation |
 
 ## 6. Key Outputs
 
-The procedure produces the following key outputs:
+The stored procedure generates a JSON-formatted message for each account record that follows the JSON PATCH format (RFC 6902). The output includes:
 
-1. **AccountID**: The unique identifier for the account in the target system
-2. **ContactNumber**: The account's contact number for reference
-3. **SubmissionFlag**: Indicates whether the account is a submission (0 in filtered records)
-4. **LoopInstance**: The batch number for processing
-5. **JSON_Message**: The primary output - a JSON Patch document containing:
-   - A JSON array of "replace" operations for core account fields
-   - Address information updates
-   - An ExtensionFields array with ID-value pairs for business-specific attributes
+1. **JSON PATCH Operations**: An array of "replace" operations for:
+   - Core account fields (UnderwriterId, Name, Phone, Email, etc.)
+   - Address information (mailing and location addresses)
+   - Extension fields (over 60 different business attributes)
 
-The procedure does not perform any direct INSERT, UPDATE, or DELETE operations on database tables. Instead, it prepares data for API consumption, which will presumably perform these operations in the external system.
+2. **Metadata Fields**:
+   - AccountID: The unique identifier for the account
+   - ContactNumber: The account's contact number
+   - SubmissionFlag: Flag indicating submission status
+   - LoopInstance: Batch identifier for processing
+
+3. **Data Modifications**:
+   - No direct database modifications (INSERT, UPDATE, DELETE) are performed
+   - The procedure only prepares data for API operations
+   - Actual updates to external systems occur when the API call is made with this data
+
+The JSON output is specifically structured to comply with the target API's requirements for PATCH operations, enabling partial updates to account resources without replacing the entire record.
 
 ## 7. Error Handling and Logging
 
-The procedure has limited explicit error handling mechanisms:
+### Error Identification and Management
 
-### Error Identification Methods:
-- **Null Handling**: Uses COALESCE extensively to prevent null values from breaking the JSON structure
-- **Email Validation**: Simple pattern matching (`like '%@%'`) to prevent invalid email formats
-- **Data Type Conversion**: CAST operations to ensure proper string formatting for JSON
+The stored procedure implements several error prevention mechanisms:
 
-### Missing Error Handling Components:
-- No TRY/CATCH blocks for exception handling
-- No explicit transaction management
-- No logging of execution status or errors
-- No validation of input parameters
+1. **Data Validation**:
+   - Email validation using pattern matching (`like '%@%'`)
+   - Conditional inclusion of fields based on data presence
+   - Type casting to ensure proper data formats
+   - Special handling for NULL values through COALESCE
 
-### Recommendations for Improvement:
-- Add TRY/CATCH blocks to handle exceptions gracefully
-- Implement logging of execution metrics (records processed, errors encountered)
-- Add validation for the @LoopInstance parameter
-- Consider adding transaction control for data consistency
-- Implement more robust email validation
-- Add comments explaining the business purpose of extension field IDs
+2. **Processing Controls**:
+   - Filters for records where `PostPatch = 'Patch'` and `Validated IS NULL` and `DateSent IS NULL`
+   - Submission flag check (`SubmissionFlag = 0`) to prevent reprocessing
+   - Batch processing through `@LoopInstance` parameter to manage resource usage
 
-The procedure relies on the calling application or process to handle any errors that might occur during execution. This approach places the responsibility for error handling and logging at a higher level in the application stack rather than within the stored procedure itself.
+3. **Implicit Tracking**:
+   - The procedure appears to be part of a workflow where records are marked with DateSent after processing
+   - This creates an audit trail of which accounts have been synchronized
+   - The `SubmissionFlag` field is used to track processing status
+
+### Logging Mechanisms
+
+The procedure does not implement explicit error logging within its code. Instead, it relies on:
+
+1. **Status Flags**: Uses database flags (PostPatch, Validated, DateSent, SubmissionFlag) to track processing status
+2. **Batch Processing**: The LoopInstance parameter enables tracking of which batches have been processed
+3. **External Logging**: Assumes that the calling application or process handles logging of errors and processing status
+
+### Error Handling Limitations
+
+The procedure lacks explicit TRY/CATCH blocks for error handling, which means:
+1. Errors would propagate to the calling application
+2. Partial batch failures could occur without internal recovery mechanisms
+3. The procedure relies on pre-validation of data rather than runtime error handling
+
+This approach prioritizes performance and simplicity but places the responsibility for error handling and recovery on the calling process.
