@@ -1,49 +1,49 @@
-# Python Script for Snowflake to BigQuery Migration Validation
-
 ```python
 import os
 import pandas as pd
+import pyarrow.parquet as pq
 from google.cloud import bigquery, storage
 import snowflake.connector
 from datetime import datetime
 
-# Step 1: Environment Setup
-# Ensure environment variables for credentials are set
+# Step 1: Set up environment variables for credentials
 SNOWFLAKE_USER = os.getenv('SNOWFLAKE_USER')
 SNOWFLAKE_PASSWORD = os.getenv('SNOWFLAKE_PASSWORD')
 SNOWFLAKE_ACCOUNT = os.getenv('SNOWFLAKE_ACCOUNT')
+SNOWFLAKE_WAREHOUSE = os.getenv('SNOWFLAKE_WAREHOUSE')
 SNOWFLAKE_DATABASE = os.getenv('SNOWFLAKE_DATABASE')
 SNOWFLAKE_SCHEMA = os.getenv('SNOWFLAKE_SCHEMA')
 
 GCP_PROJECT = os.getenv('GCP_PROJECT')
-GCS_BUCKET = os.getenv('GCS_BUCKET')
+GCP_BUCKET = os.getenv('GCP_BUCKET')
 BIGQUERY_DATASET = os.getenv('BIGQUERY_DATASET')
 
-# Step 2: Snowflake Connection
+# Step 2: Snowflake connection and query execution
 def execute_snowflake_query(query):
     conn = snowflake.connector.connect(
         user=SNOWFLAKE_USER,
         password=SNOWFLAKE_PASSWORD,
         account=SNOWFLAKE_ACCOUNT,
+        warehouse=SNOWFLAKE_WAREHOUSE,
         database=SNOWFLAKE_DATABASE,
         schema=SNOWFLAKE_SCHEMA
     )
     cursor = conn.cursor()
     cursor.execute(query)
     results = cursor.fetchall()
-    columns = [desc[0] for desc in cursor.description]
+    columns = [col[0] for col in cursor.description]
     cursor.close()
     conn.close()
     return pd.DataFrame(results, columns=columns)
 
-# Step 3: Export Snowflake Data to Parquet
+# Step 3: Export Snowflake data to Parquet
 def export_to_parquet(df, table_name):
     timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
     file_name = f"{table_name}_{timestamp}.parquet"
-    df.to_parquet(file_name, index=False)
+    df.to_parquet(file_name, engine='pyarrow')
     return file_name
 
-# Step 4: Upload Parquet to GCS
+# Step 4: Upload Parquet files to GCS
 def upload_to_gcs(file_name, bucket_name):
     client = storage.Client()
     bucket = client.bucket(bucket_name)
@@ -51,83 +51,69 @@ def upload_to_gcs(file_name, bucket_name):
     blob.upload_from_filename(file_name)
     return f"gs://{bucket_name}/{file_name}"
 
-# Step 5: Create External Table in BigQuery
-def create_external_table(bigquery_client, gcs_path, table_name):
+# Step 5: Create BigQuery external table
+def create_external_table(file_path, table_name, schema):
+    client = bigquery.Client()
     table_id = f"{GCP_PROJECT}.{BIGQUERY_DATASET}.{table_name}_external"
     external_config = bigquery.ExternalConfig("PARQUET")
-    external_config.source_uris = [gcs_path]
+    external_config.source_uris = [file_path]
+    external_config.schema = schema
     table = bigquery.Table(table_id)
     table.external_data_configuration = external_config
-    bigquery_client.create_table(table, exists_ok=True)
+    client.create_table(table, exists_ok=True)
     return table_id
 
-# Step 6: Execute BigQuery Query
+# Step 6: Execute BigQuery SQL
 def execute_bigquery_query(query):
     client = bigquery.Client()
     query_job = client.query(query)
-    results = query_job.result()
-    return results.to_dataframe()
+    return query_job.result().to_dataframe()
 
-# Step 7: Compare Data
-def compare_data(df1, df2):
-    if df1.equals(df2):
-        return "MATCH"
-    else:
-        mismatches = pd.concat([df1, df2]).drop_duplicates(keep=False)
-        return mismatches
+# Step 7: Validate data consistency
+def validate_data(snowflake_df, bigquery_df):
+    if snowflake_df.shape != bigquery_df.shape:
+        return False, "Row count mismatch"
+    for col in snowflake_df.columns:
+        if not snowflake_df[col].equals(bigquery_df[col]):
+            return False, f"Column mismatch: {col}"
+    return True, "Data matches"
 
-# Step 8: Main Script
-def main():
-    # Snowflake SQL Query
-    snowflake_query = """
-    WITH customer_sales AS (
-        SELECT 
-            c.customer_id,
-            c.customer_name,
-            c.region,
-            c.metadata:loyalty_level::STRING AS loyalty_level,
-            SUM(s.sale_amount) AS total_sales,
-            COUNT(s.sale_id) AS total_orders,
-            ARRAY_AGG(DISTINCT s.product_id) AS product_list
-        FROM 
-            Customers c
-        LEFT JOIN 
-            Sales s ON c.customer_id = s.customer_id
-        WHERE 
-            s.sale_date >= '2023-01-01' 
-            AND s.sale_date < '2024-01-01'
-            AND s.sale_metadata:discount_applied::BOOLEAN = TRUE
-        GROUP BY 
-            c.customer_id, c.customer_name, c.region, c.metadata:loyalty_level
-    )
-    SELECT * FROM customer_sales;
-    """
-    
-    # BigQuery SQL Query (Converted)
-    bigquery_query = """
-    SELECT * FROM `project.dataset.customer_sales`;
-    """
-    
-    # Execute Snowflake Query
-    snowflake_data = execute_snowflake_query(snowflake_query)
-    
-    # Export Snowflake Data to Parquet
-    parquet_file = export_to_parquet(snowflake_data, "customer_sales")
-    
-    # Upload Parquet to GCS
-    gcs_path = upload_to_gcs(parquet_file, GCS_BUCKET)
-    
-    # Create External Table in BigQuery
-    bigquery_client = bigquery.Client()
-    external_table_id = create_external_table(bigquery_client, gcs_path, "customer_sales")
-    
-    # Execute BigQuery Query
-    bigquery_data = execute_bigquery_query(bigquery_query)
-    
-    # Compare Data
-    comparison_result = compare_data(snowflake_data, bigquery_data)
-    print("Comparison Result:", comparison_result)
-
+# Main script execution
 if __name__ == "__main__":
-    main()
+    # Snowflake SQL query
+    snowflake_query = """
+    -- Snowflake SQL content here
+    """
+    snowflake_df = execute_snowflake_query(snowflake_query)
+    
+    # Export Snowflake data to Parquet
+    table_name = "total_sales"
+    parquet_file = export_to_parquet(snowflake_df, table_name)
+    
+    # Upload Parquet file to GCS
+    gcs_path = upload_to_gcs(parquet_file, GCP_BUCKET)
+    
+    # Define BigQuery schema (example schema, adjust as needed)
+    bigquery_schema = [
+        bigquery.SchemaField("customer_id", "STRING"),
+        bigquery.SchemaField("customer_name", "STRING"),
+        bigquery.SchemaField("region", "STRING"),
+        bigquery.SchemaField("loyalty_level", "STRING"),
+        bigquery.SchemaField("total_sales", "FLOAT"),
+        bigquery.SchemaField("total_orders", "INTEGER"),
+        bigquery.SchemaField("product_list", "STRING"),
+    ]
+    
+    # Create BigQuery external table
+    external_table_id = create_external_table(gcs_path, table_name, bigquery_schema)
+    
+    # BigQuery SQL query
+    bigquery_query = """
+    -- BigQuery SQL content here
+    """
+    bigquery_df = execute_bigquery_query(bigquery_query)
+    
+    # Validate data consistency
+    is_valid, message = validate_data(snowflake_df, bigquery_df)
+    print(f"Validation result: {message}")
 ```
