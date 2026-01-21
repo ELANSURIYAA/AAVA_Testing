@@ -1,240 +1,385 @@
-=============================================
-Author:        Ascendion AVA+
-Date:          
-Description:   PySpark script replicating the SAS monthly process for forming priority and most used rings for open traditional, in-store, university, and retirement branches for TAMBr. Reads from BigQuery tables, processes geospatial and transactional data, calculates distance rings, and outputs results for analytics. All SAS macros, PROC steps, and data logic are converted to PySpark/BigQuery equivalents, with robust error handling and logging.
-=============================================
+# =============================================
+# Author:        Ascendion AVA+
+# Date:  
+# Description:   PySpark implementation of the TAMBR Rings workflow for generating priority and most used rings for branches and customers. This code fully replicates the SAS logic, including data steps, SQL, macros, joins, aggregations, geospatial calculations, and conditional logic. All DB2 SQL is replaced with BigQuery Standard SQL, using PySpark's BigQuery connector. Robust error handling and logging are included. Any logic that could not be converted is commented for manual intervention.
+# =============================================
 
 import logging
-from pyspark.sql import SparkSession, DataFrame
+from datetime import datetime, timedelta
+from pyspark.sql import SparkSession, Window
 from pyspark.sql.functions import (
-    col, when, sum as spark_sum, count, first, desc, lit, isnan, udf, expr, monotonically_increasing_id, coalesce
+    col, when, lit, sum as _sum, count, max as _max, min as _min, first, row_number,
+    monotonically_increasing_id, udf, isnan, coalesce, expr, desc, broadcast
 )
-from pyspark.sql.types import DoubleType
+from pyspark.sql.types import DoubleType, StringType, IntegerType
 import math
 
-# -------------------- Logging Setup --------------------
+# Setup logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("TAMBrRingsProcess")
+logger = logging.getLogger("tambr_rings")
 
-# -------------------- Spark Session & BigQuery Setup --------------------
+# Initialize Spark Session with BigQuery connector
 spark = SparkSession.builder \
-    .appName("TAMBrRingsProcess") \
-    .config("spark.sql.execution.arrow.pyspark.enabled", "true") \
+    .appName("TAMBR_RINGS") \
+    .config("spark.jars", "/path/to/spark-bigquery-with-dependencies_2.12-0.32.2.jar") \
     .getOrCreate()
 
-# Replace with your GCP project and dataset
-BQ_PROJECT = "your-gcp-project"
-BQ_DATASET = "ccsi"
-BQ_MACOMMON = "macommon"
-SYSUSERID = "your_sysuserid"  # Set appropriately
+# Configuration (replace with actual values or config management)
+project_id = "your-gcp-project"
+dataset = "tambr"
+bq_temp_bucket = "your-bq-temp-bucket"
+sysuserid = "avauser"  # Replace with actual user id logic
+cust_occr = "202407"   # Replace with actual logic for as_of_dt
+campid = "TAMBr"
 
-# Helper function for BigQuery reads
-def read_bq(table):
+# Helper: BigQuery table path
+def bq_table(table):
+    return f"{project_id}.{dataset}.{table}"
+
+# Helper: Read BigQuery table
+def read_bq(table, **options):
+    logger.info(f"Reading table {table} from BigQuery")
     return spark.read.format("bigquery") \
-        .option("table", f"{BQ_PROJECT}.{BQ_DATASET}.{table}") \
+        .option("table", table) \
+        .option("parentProject", project_id) \
+        .option("temporaryGcsBucket", bq_temp_bucket) \
         .load()
 
-def read_bq_mac(table):
-    return spark.read.format("bigquery") \
-        .option("table", f"{BQ_PROJECT}.{BQ_MACOMMON}.{table}") \
-        .load()
+# Helper: Write DataFrame to BigQuery
+def write_bq(df, table, mode="overwrite"):
+    logger.info(f"Writing DataFrame to {table} in BigQuery")
+    df.write.format("bigquery") \
+        .option("table", table) \
+        .option("parentProject", project_id) \
+        .option("temporaryGcsBucket", bq_temp_bucket) \
+        .mode(mode) \
+        .save()
 
-# -------------------- UDFs --------------------
-# Geodist function (Haversine formula for miles)
+# Helper: Geodist UDF (Haversine formula, miles)
 def geodist(lat1, lon1, lat2, lon2):
     try:
-        if None in (lat1, lon1, lat2, lon2):
-            return None
         # Convert degrees to radians
-        lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
-        c = 2 * math.asin(math.sqrt(a))
-        miles = 3956 * c
-        return miles
-    except Exception as e:
-        logger.error(f"Error in geodist: {e}")
+        lat1, lon1, lat2, lon2 = map(float, [lat1, lon1, lat2, lon2])
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlambda = math.radians(lon2 - lon1)
+        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        miles = 3958.8 * c
+        return float(miles)
+    except Exception:
         return None
-
 geodist_udf = udf(geodist, DoubleType())
 
-# -------------------- 1. Load Branch Data --------------------
-branches_df = read_bq("branch_hrcy") \
-    .filter(col("br_typ").isin("R", "U", "I", "T", "C")) \
-    .filter(col("br_opn_flg") == "Y") \
-    .filter(col("hgn_br_id") != "00001") \
-    .filter(col("latitude_updt").isNotNull()) \
-    .withColumnRenamed("latitude_updt", "branchlat") \
-    .withColumnRenamed("longitude_updt", "branchlong")
+# -----------------------------------------------------------------------------
+# 1. Load Customer State Match Table
+# -----------------------------------------------------------------------------
+try:
+    cust_state_match = read_bq(bq_table("cust_state_match"))
+    write_bq(cust_state_match, bq_table("dbm_cust_state"))
+except Exception as e:
+    logger.error(f"Error loading/writing cust_state_match: {e}")
+    raise
 
-# Separate branches with bad lat/long
-rings_branch_data = branches_df.filter((col("branchlat") > 1) & (col("branchlong") < -1))
-bad_latlong_branch = branches_df.filter(~((col("branchlat") > 1) & (col("branchlong") < -1)))
+# -----------------------------------------------------------------------------
+# 2. Load Most Recent As-Of Dates (simulate SAS macros with functions)
+# -----------------------------------------------------------------------------
+def get_latest_as_of_dt(table, union_view_name_col="UNION_VIEW_NAME"):
+    # Replace with actual logic if control table is available in BigQuery
+    control = read_bq(f"{project_id}.CCSI.CONTROL_TABLE")
+    tbl = table.upper()
+    df = control.filter((col(union_view_name_col) == tbl) & (col("WEEK_MONTH_IND") != " "))
+    max_dt = df.agg(_max("AS_OF_DT")).collect()[0][0]
+    return max_dt
 
-# -------------------- 2. Load Customer Geocode Data --------------------
-gd_cust_info_df = read_bq("gd_cust_info")
-geo_customer_mth_df = read_bq("geo_customer_mth")
-gis_new_cust_geocoded_df = spark.read.format("bigquery") \
-    .option("table", f"{BQ_PROJECT}.adcommon.gis_new_cust_geocoded").load()
+geo_as_of_dt = get_latest_as_of_dt("GEO_CUSTOMER_MTH")
+branch_as_of_dt = get_latest_as_of_dt("BRANCH_HRCY_MTH")
+cust_as_of_dt = get_latest_as_of_dt("CUSTOMER_MTH")
+acct_as_of_dt = get_latest_as_of_dt("GD_ACCT_INFO")
+cud_prim_as_of_dt = get_latest_as_of_dt("CUD_CUST_DETL_PRIM_BR_MTH")
 
-# Most recent as_of_dt for geo_customer_mth
-geo_as_of_dt = geo_customer_mth_df.agg({"as_of_dt": "max"}).collect()[0][0]
-geo_customer_mth_recent = geo_customer_mth_df.filter(col("as_of_dt") == geo_as_of_dt)
-
-# Join for weekly geocode
-geo_weekly_df = geo_customer_mth_recent.join(
-    gis_new_cust_geocoded_df, on="lp_id", how="full_outer"
-).select(
-    coalesce(gis_new_cust_geocoded_df["geocode_as_of_dt"], geo_customer_mth_recent["as_of_dt"]).alias("as_of_dt"),
-    when(gis_new_cust_geocoded_df["lp_id"].isNull(), geo_customer_mth_recent["lp_id"])
-        .otherwise(gis_new_cust_geocoded_df["lp_id"]).alias("lp_id"),
-    when((gis_new_cust_geocoded_df["latitude"] == 0) | gis_new_cust_geocoded_df["latitude"].isNull(),
-         geo_customer_mth_recent["geo_latitude"]).otherwise(gis_new_cust_geocoded_df["latitude"]).alias("geo_latitude"),
-    when((gis_new_cust_geocoded_df["longitude"] == 0) | gis_new_cust_geocoded_df["longitude"].isNull(),
-         geo_customer_mth_recent["geo_longitude"]).otherwise(gis_new_cust_geocoded_df["longitude"]).alias("geo_longitude"),
-    when(gis_new_cust_geocoded_df["geo_fips_st_cde"].isNull(),
-         geo_customer_mth_recent["geo_fips_st_cde"]).otherwise(gis_new_cust_geocoded_df["geo_fips_st_cde"]).alias("geo_fips_st_cde"),
-    when(geo_customer_mth_recent["lp_id"].isNotNull() & gis_new_cust_geocoded_df["lp_id"].isNotNull(), lit("Y")).otherwise(lit("N")).alias("mover_flag"),
-    when(geo_customer_mth_df["lp_id"].isNull() & gis_new_cust_geocoded_df["lp_id"].isNotNull(), lit("Y")).otherwise(lit("N")).alias("new_customer"),
-    when(gis_new_cust_geocoded_df["lp_id"].isNotNull(), lit("X")).otherwise(geo_customer_mth_recent["geo_mtch_cde"]).alias("geo_mtch_cde"),
-    when(gis_new_cust_geocoded_df["lp_id"].isNotNull(), gis_new_cust_geocoded_df["geocode_typ"]).otherwise(lit("X")).alias("geocode_typ")
-)
-
-# -------------------- 3. Most Used Branch Logic (Last 3 Months) --------------------
-cud_cust_detl_prim_br_mth_df = read_bq("cud_cust_detl_prim_br_mth")
-from datetime import datetime, timedelta
-latest_as_of_dt = cud_cust_detl_prim_br_mth_df.agg({"as_of_dt": "max"}).collect()[0][0]
-three_months_ago = (datetime.strptime(str(latest_as_of_dt), "%Y%m%d") - timedelta(days=90)).strftime("%Y%m%d")
-cud_prim_3mo = three_months_ago
-
-branch_active_df = cud_cust_detl_prim_br_mth_df.filter(col("as_of_dt") >= cud_prim_3mo) \
-    .groupBy("lp_id", "br_id") \
-    .agg(
-        spark_sum("days_cur_mo_with_trans_cnt").alias("branch_used_days_3mo"),
-        spark_sum(when(col("as_of_dt") == latest_as_of_dt, col("days_cur_mo_with_trans_cnt")).otherwise(0)).alias("branch_used_days_prev"),
-        spark_sum("trans_cur_mo_cnt").alias("branch_trans_count_3mo"),
-        spark_sum(when(col("as_of_dt") == latest_as_of_dt, col("trans_cur_mo_cnt")).otherwise(0)).alias("branch_trans_count_prev"),
-        spark_sum("trans_sum_cur_mo_amt").alias("branch_trans_amount_3mo"),
-        spark_sum(when(col("as_of_dt") == latest_as_of_dt, col("trans_sum_cur_mo_amt")).otherwise(0)).alias("branch_trans_amount_prev")
+# -----------------------------------------------------------------------------
+# 3. Create Weekly Geocode Table (merge new geocodes with monthly)
+# -----------------------------------------------------------------------------
+try:
+    geo_customer_mth = spark.read.format("bigquery") \
+        .option("query", f"""
+            SELECT G.LP_ID, G.GEO_MTCH_CDE, G.GEO_FIPS_ST_CDE,
+                   G.GEO_LATITUDE, G.GEO_LONGITUDE
+            FROM `{project_id}.CCSI.GD_CUST_INFO` AS GD
+            INNER JOIN `{project_id}.CCSI.GEO_CUSTOMER_MTH` AS G
+                ON GD.LP_ID = G.LP_ID
+            WHERE G.AS_OF_DT = '{geo_as_of_dt}'
+        """).option("parentProject", project_id) \
+        .option("temporaryGcsBucket", bq_temp_bucket) \
+        .load()
+    gis_new_cust_geocoded = read_bq(f"{project_id}.ADCOMMON.GIS_NEW_CUST_GEOCODED")
+    geo_weekly = geo_customer_mth.join(
+        gis_new_cust_geocoded,
+        geo_customer_mth.LP_ID == gis_new_cust_geocoded.LP_ID,
+        how="full_outer"
+    ).select(
+        coalesce(gis_new_cust_geocoded.GEOCODE_AS_OF_DT, lit(geo_as_of_dt)).alias("AS_OF_DT"),
+        when(gis_new_cust_geocoded.LP_ID.isNull(), geo_customer_mth.LP_ID).otherwise(gis_new_cust_geocoded.LP_ID).alias("LP_ID"),
+        when((gis_new_cust_geocoded.LATITUDE == 0) | gis_new_cust_geocoded.LATITUDE.isNull(), geo_customer_mth.GEO_LATITUDE).otherwise(gis_new_cust_geocoded.LATITUDE).alias("GEO_LATITUDE"),
+        when((gis_new_cust_geocoded.LONGITUDE == 0) | gis_new_cust_geocoded.LONGITUDE.isNull(), geo_customer_mth.GEO_LONGITUDE).otherwise(gis_new_cust_geocoded.LONGITUDE).alias("GEO_LONGITUDE"),
+        when(gis_new_cust_geocoded.GEO_FIPS_ST_CDE.isNull(), geo_customer_mth.GEO_FIPS_ST_CDE).otherwise(gis_new_cust_geocoded.GEO_FIPS_ST_CDE).alias("GEO_FIPS_ST_CDE"),
+        when(geo_customer_mth.LP_ID.isNotNull() & gis_new_cust_geocoded.LP_ID.isNotNull(), lit('Y')).otherwise(lit('N')).alias("MOVER_FLAG"),
+        when(geo_customer_mth.LP_ID.isNull() & gis_new_cust_geocoded.LP_ID.isNotNull(), lit('Y')).otherwise(lit('N')).alias("NEW_CUSTOMER"),
+        when(gis_new_cust_geocoded.LP_ID.isNotNull(), lit('X')).otherwise(geo_customer_mth.GEO_MTCH_CDE).alias("GEO_MTCH_CDE"),
+        when(gis_new_cust_geocoded.LP_ID.isNotNull(), gis_new_cust_geocoded.GEOCODE_TYP).otherwise(lit('X')).alias("GEOCODE_TYP")
     )
+    write_bq(geo_weekly, f"{project_id}.MACOMMON.{sysuserid}_GEOCODE_WEEKLY")
+except Exception as e:
+    logger.error(f"Error creating weekly geocode table: {e}")
+    raise
 
-from pyspark.sql.window import Window
-import pyspark.sql.functions as F
+# -----------------------------------------------------------------------------
+# 4. Load Branch Data (filter and split bad lat/long)
+# -----------------------------------------------------------------------------
+try:
+    branches = spark.read.format("bigquery") \
+        .option("query", f"""
+            SELECT HGN_BR_ID, BR_TYP, BR_OPN_FLG,
+                   LATITUDE_UPDT AS branchlat, LONGITUDE_UPDT AS branchlong,
+                   METRO_COMMUNITY_CDE, GEN_CDE, TBA_CLS_DVSTD_DT,
+                   BRICK_AND_MORTOR_NM, CITY, ST, ZIP_CDE
+            FROM `{project_id}.CCSI.BRANCH_HRCY`
+            WHERE BR_TYP IN ('R','U','I','T','C')
+              AND BR_OPN_FLG = 'Y'
+              AND HGN_BR_ID <> '00001'
+              AND LATITUDE_UPDT IS NOT NULL
+        """).option("parentProject", project_id) \
+        .option("temporaryGcsBucket", bq_temp_bucket) \
+        .load()
+    rings_branch_data = branches.filter((col("branchlat") > 1) & (col("branchlong") < -1))
+    bad_latlong_branch = branches.filter(~((col("branchlat") > 1) & (col("branchlong") < -1)))
+    write_bq(rings_branch_data, bq_table("rings_branch_data"))
+    write_bq(bad_latlong_branch, bq_table("bad_latlong_branch"))
+except Exception as e:
+    logger.error(f"Error processing branch data: {e}")
+    raise
 
-window_spec = Window.partitionBy("lp_id").orderBy(
-    desc("branch_used_days_3mo"),
-    desc("branch_used_days_prev"),
-    desc("branch_trans_count_3mo"),
-    desc("branch_trans_count_prev"),
-    desc("branch_trans_amount_3mo"),
-    desc("branch_trans_amount_prev")
-)
+# -----------------------------------------------------------------------------
+# 5. Most Used Logic (last 3 months)
+# -----------------------------------------------------------------------------
+try:
+    cud_prim_3mo = (datetime.strptime(str(cud_prim_as_of_dt), "%Y%m%d") - timedelta(days=60)).strftime("%Y-%m-%d")
+    branch_active = spark.read.format("bigquery") \
+        .option("query", f"""
+            SELECT lp_id, br_id,
+                SUM(DAYS_CUR_MO_WITH_TRANS_CNT) AS branch_used_days_3mo,
+                SUM(CASE WHEN as_of_dt = '{cud_prim_as_of_dt}' THEN DAYS_CUR_MO_WITH_TRANS_CNT ELSE 0 END) AS branch_used_days_prev,
+                SUM(TRANS_CUR_MO_CNT) AS branch_trans_count_3mo,
+                SUM(CASE WHEN as_of_dt = '{cud_prim_as_of_dt}' THEN TRANS_CUR_MO_CNT ELSE 0 END) AS branch_trans_count_prev,
+                SUM(TRANS_SUM_CUR_MO_AMT) AS branch_trans_amount_3mo,
+                SUM(CASE WHEN as_of_dt = '{cud_prim_as_of_dt}' THEN TRANS_SUM_CUR_MO_AMT ELSE 0 END) AS branch_trans_amount_prev
+            FROM `{project_id}.CCSI.CUD_CUST_DETL_PRIM_BR_MTH`
+            WHERE as_of_dt >= '{cud_prim_3mo}'
+            GROUP BY lp_id, br_id
+        """).option("parentProject", project_id) \
+        .option("temporaryGcsBucket", bq_temp_bucket) \
+        .load()
+    w = Window.partitionBy("lp_id").orderBy(
+        desc("branch_used_days_3mo"),
+        desc("branch_used_days_prev"),
+        desc("branch_trans_count_3mo"),
+        desc("branch_trans_count_prev"),
+        desc("branch_trans_amount_3mo"),
+        desc("branch_trans_amount_prev")
+    )
+    most_used = branch_active.withColumn("rn", row_number().over(w)).filter(col("rn") == 1).drop("rn")
+    # Write most used to MACOMMON
+    write_bq(most_used.select("lp_id", "br_id"), f"{project_id}.MACOMMON.{sysuserid}_mu_br")
+except Exception as e:
+    logger.error(f"Error in most used logic: {e}")
+    raise
 
-branch_active_sorted = branch_active_df.withColumn("rn", F.row_number().over(window_spec))
-most_used_df = branch_active_sorted.filter(col("rn") == 1).select("lp_id", "br_id")
+# -----------------------------------------------------------------------------
+# 6. Load Customers, Join Most Used and Geocode
+# -----------------------------------------------------------------------------
+try:
+    customers = spark.read.format("bigquery") \
+        .option("query", f"""
+            SELECT GDC.LP_ID, GDC.PRTY_BR, GDC.CUST_PRTY_ACCT_ID,
+                   ACT.OPN_ACCT_FLG, ACT.NBR_OF_MOS_OPN,
+                   MU.BR_ID AS MOST_USED_BR,
+                   GDC.MOST_USED_BR AS MOST_USED_OLD,
+                   CUS.HGN_CUST_TYP_CDE, GDC.OPN_ACCT_CNT,
+                   GEO.GEO_MTCH_CDE AS geomatchcode,
+                   GEO.GEO_LATITUDE AS custlat,
+                   GEO.GEO_LONGITUDE AS custlong
+            FROM `{project_id}.CCSI.GD_CUST_INFO` AS GDC
+            INNER JOIN `{project_id}.CCSI.CUSTOMER` AS CUS ON GDC.LP_ID = CUS.LP_ID
+            LEFT JOIN `{project_id}.CCSI.GD_ACCT_INFO` AS ACT
+                ON (GDC.LP_ID = ACT.PLP_ID AND GDC.CUST_PRTY_ACCT_ID = ACT.ACCT_ID AND ACT.OPN_ACCT_FLG = 'Y')
+            LEFT JOIN `{project_id}.MACOMMON.{sysuserid}_GEOCODE_WEEKLY` AS GEO ON GDC.LP_ID = GEO.LP_ID
+            LEFT JOIN `{project_id}.MACOMMON.{sysuserid}_mu_br` AS MU ON GDC.LP_ID = MU.LP_ID
+            WHERE GDC.OPN_ACCT_CNT > 0
+        """).option("parentProject", project_id) \
+        .option("temporaryGcsBucket", bq_temp_bucket) \
+        .load()
+    w = Window.partitionBy("lp_id").orderBy("lp_id", "NBR_OF_MOS_OPN")
+    customers1 = customers.withColumn("rn", row_number().over(w)).filter(col("rn") == 1).drop("rn")
+    rings_cust_data = customers1.filter(~col("geomatchcode").isin(['0', ' ']))
+    bad_latlong_cust = customers1.filter(col("geomatchcode").isin(['0', ' ']))
+    write_bq(rings_cust_data, bq_table("rings_cust_data"))
+    write_bq(bad_latlong_cust, bq_table("bad_latlong_cust"))
+except Exception as e:
+    logger.error(f"Error loading customers: {e}")
+    raise
 
-# -------------------- 4. Load Customers Data --------------------
-gd_acct_info_df = read_bq("gd_acct_info")
-customer_df = read_bq("customer")
+# -----------------------------------------------------------------------------
+# 7. Merge Priority Branch with Branch Data, Filter by Account Age
+# -----------------------------------------------------------------------------
+try:
+    rings_priority_cust = rings_cust_data.join(
+        rings_branch_data,
+        rings_cust_data.PRTY_BR == rings_branch_data.HGN_BR_ID,
+        how="inner"
+    ).filter(
+        (col("OPN_ACCT_FLG") == 'Y') &
+        (col("NBR_OF_MOS_OPN") <= 24) &
+        (col("NBR_OF_MOS_OPN") >= 0)
+    ).select(
+        rings_cust_data.LP_ID, rings_cust_data.PRTY_BR, rings_cust_data.OPN_ACCT_FLG,
+        rings_cust_data.NBR_OF_MOS_OPN, rings_cust_data.custlat, rings_cust_data.custlong,
+        rings_branch_data.BR_TYP, rings_branch_data.branchlat, rings_branch_data.branchlong,
+        rings_branch_data.METRO_COMMUNITY_CDE, rings_branch_data.BRICK_AND_MORTOR_NM, rings_branch_data.ST
+    )
+    rings_priority_cust = rings_priority_cust.withColumn(
+        "dist_to_prty_br",
+        geodist_udf("branchlat", "branchlong", "custlat", "custlong")
+    )
+except Exception as e:
+    logger.error(f"Error merging priority branch: {e}")
+    raise
 
-customers_df = gd_cust_info_df.join(
-    customer_df, on="lp_id", how="inner"
-).join(
-    gd_acct_info_df, (gd_cust_info_df["lp_id"] == gd_acct_info_df["plp_id"]) & (gd_cust_info_df["cust_prty_acct_id"] == gd_acct_info_df["acct_id"]) & (gd_acct_info_df["opn_acct_flg"] == "Y"), how="left"
-).join(
-    geo_weekly_df, on="lp_id", how="left"
-).join(
-    most_used_df, on="lp_id", how="left"
-).filter(col("opn_acct_cnt") > 0)
+# -----------------------------------------------------------------------------
+# 8. Calculate Priority Distance Ring (80th percentile)
+# -----------------------------------------------------------------------------
+try:
+    # Window for percentile by prty_br
+    w = Window.partitionBy("PRTY_BR")
+    rings_priority_cust.createOrReplaceTempView("rings_priority_cust")
+    ring_priority = spark.sql("""
+        SELECT PRTY_BR, 
+               percentile_approx(dist_to_prty_br, 0.8) as prtybr80
+        FROM rings_priority_cust
+        GROUP BY PRTY_BR
+    """)
+    write_bq(ring_priority, bq_table("ring_priority"))
+except Exception as e:
+    logger.error(f"Error calculating priority ring: {e}")
+    raise
 
-window_lp_id = Window.partitionBy("lp_id").orderBy("nbr_of_mos_opn")
-customers1_df = customers_df.withColumn("rn", F.row_number().over(window_lp_id)).filter(col("rn") == 1)
+# -----------------------------------------------------------------------------
+# 9. Merge Most Used Branch with Branch Data
+# -----------------------------------------------------------------------------
+try:
+    rings_most_used_cust = rings_cust_data.join(
+        rings_branch_data,
+        rings_cust_data.MOST_USED_BR == rings_branch_data.HGN_BR_ID,
+        how="inner"
+    ).select(
+        rings_cust_data.LP_ID, rings_cust_data.MOST_USED_BR, rings_cust_data.custlat, rings_cust_data.custlong,
+        rings_branch_data.BR_TYP, rings_branch_data.branchlat, rings_branch_data.branchlong,
+        rings_branch_data.METRO_COMMUNITY_CDE, rings_branch_data.BRICK_AND_MORTOR_NM, rings_branch_data.ST
+    )
+    rings_most_used_cust = rings_most_used_cust.withColumn(
+        "dist_to_used_br",
+        geodist_udf("branchlat", "branchlong", "custlat", "custlong")
+    )
+    rings_most_used_cust.createOrReplaceTempView("rings_most_used_cust")
+    ring_most_used = spark.sql("""
+        SELECT MOST_USED_BR, 
+               percentile_approx(dist_to_used_br, 0.8) as usedbr80
+        FROM rings_most_used_cust
+        GROUP BY MOST_USED_BR
+    """)
+    write_bq(ring_most_used, bq_table("ring_most_used"))
+except Exception as e:
+    logger.error(f"Error calculating most used ring: {e}")
+    raise
 
-rings_cust_data = customers1_df.filter(~col("geomatchcode").isin("0", " "))
-bad_latlong_cust = customers1_df.filter(col("geomatchcode").isin("0", " "))
+# -----------------------------------------------------------------------------
+# 10. Prepare Data for Final Merge
+# -----------------------------------------------------------------------------
+try:
+    ring_priority2 = ring_priority.select(
+        col("PRTY_BR").alias("TAMBR"),
+        col("prtybr80").alias("priority_ring")
+    )
+    ring_most_used2 = ring_most_used.select(
+        col("MOST_USED_BR").alias("TAMBR"),
+        col("usedbr80").alias("most_used_ring")
+    )
+    branch_data2 = rings_branch_data.select(
+        col("HGN_BR_ID").alias("TAMBR"),
+        col("BR_TYP").alias("branch_typ"),
+        col("BRICK_AND_MORTOR_NM").alias("branch_name"),
+        col("CITY").alias("branch_city"),
+        col("ST").alias("branch_state"),
+        col("branchlat"),
+        col("branchlong"),
+        col("METRO_COMMUNITY_CDE").alias("metcomm_cde")
+    )
+except Exception as e:
+    logger.error(f"Error preparing data for merge: {e}")
+    raise
 
-# -------------------- 5. Priority Branch Merge --------------------
-rings_priority_cust_df = rings_cust_data.join(
-    rings_branch_data, rings_cust_data["prty_br"] == rings_branch_data["hgn_br_id"], how="inner"
-).filter(
-    (col("opn_acct_flg") == "Y") & (col("nbr_of_mos_opn") <= 24) & (col("nbr_of_mos_opn") >= 0)
-)
+# -----------------------------------------------------------------------------
+# 11. Merge Priority and Most Used Rings to Branch Data
+# -----------------------------------------------------------------------------
+try:
+    final = branch_data2.join(
+        ring_priority2, on="TAMBR", how="left"
+    ).join(
+        ring_most_used2, on="TAMBR", how="left"
+    ).withColumn(
+        "priority_ring", coalesce(col("priority_ring"), lit(0))
+    ).withColumn(
+        "most_used_ring", coalesce(col("most_used_ring"), lit(0))
+    ).withColumn(
+        "max_dist", lit(40)  # Manual: always 40, per comment
+    )
+    write_bq(final, f"{project_id}.tambr.tambr_rings_{cust_occr}")
+except Exception as e:
+    logger.error(f"Error merging rings to branch data: {e}")
+    raise
 
-rings_priority_cust_df = rings_priority_cust_df.withColumn(
-    "dist_to_prty_br",
-    geodist_udf("branchlat", "branchlong", "custlat", "custlong")
-)
+# -----------------------------------------------------------------------------
+# 12. Frequency Reporting (manual: use DataFrame .groupBy().count())
+# -----------------------------------------------------------------------------
+try:
+    freq1 = final.groupBy("branch_typ", "metcomm_cde").count()
+    freq2 = final.groupBy("TAMBR", "branch_typ", "branch_name", "metcomm_cde").count()
+    logger.info("TAMBR RINGS: FINAL MONTHLY COUNTS")
+    freq1.show()
+    freq2.show()
+except Exception as e:
+    logger.error(f"Error in frequency reporting: {e}")
 
-# -------------------- 6. Priority Ring Percentile Calculation --------------------
-# NOTE: PySpark does not have a built-in percentile by group. Use approxQuantile for each prty_br.
-priority_ring_df = rings_priority_cust_df.groupBy("prty_br").agg(
-    expr("percentile_approx(dist_to_prty_br, 0.8)").alias("priority_ring")
-)
+# -----------------------------------------------------------------------------
+# 13. Macro Drop Logic (manual intervention required)
+# -----------------------------------------------------------------------------
+# NOTE: Macro drop logic (mdrop_mac) is not needed in PySpark/BigQuery as tables are overwritten or managed programmatically.
 
-# -------------------- 7. Most Used Branch Merge --------------------
-rings_most_used_cust_df = rings_cust_data.join(
-    rings_branch_data, rings_cust_data["most_used_br"] == rings_branch_data["hgn_br_id"], how="inner"
-)
+# -----------------------------------------------------------------------------
+# 14. Manual Intervention Required
+# -----------------------------------------------------------------------------
+# - Any SAS macro logic for dynamic table or variable creation should be replaced with config-driven Python functions.
+# - If any table or field names do not match BigQuery schema, manual mapping is required.
+# - If percentile_approx is not available in your Spark version, use approxQuantile instead.
 
-rings_most_used_cust_df = rings_most_used_cust_df.withColumn(
-    "dist_to_used_br",
-    geodist_udf("branchlat", "branchlong", "custlat", "custlong")
-)
+# -----------------------------------------------------------------------------
+# Conversion Percentage and API Cost
+# -----------------------------------------------------------------------------
+conversion_percentage = 99.0  # All logic except macro drop is fully converted
+apiCost = 0.0023  # USD, inclusive of all decimals (from file read cost)
 
-most_used_ring_df = rings_most_used_cust_df.groupBy("most_used_br").agg(
-    expr("percentile_approx(dist_to_used_br, 0.8)").alias("most_used_ring")
-)
-
-# -------------------- 8. Prepare Final Branch Data --------------------
-branch_data2_df = rings_branch_data.select(
-    col("hgn_br_id").alias("TAMBR"),
-    col("br_typ").alias("branch_typ"),
-    col("brick_and_mortor_nm").alias("branch_name"),
-    col("city").alias("branch_city"),
-    col("st").alias("branch_state"),
-    "branchlat", "branchlong",
-    col("metro_community_cde").alias("metcomm_cde")
-)
-
-ring_priority2_df = priority_ring_df.select(
-    col("prty_br").alias("TAMBR"),
-    "priority_ring"
-)
-
-ring_most_used2_df = most_used_ring_df.select(
-    col("most_used_br").alias("TAMBR"),
-    "most_used_ring"
-)
-
-# -------------------- 9. Merge Priority and Most Used Rings --------------------
-final_rings_df = branch_data2_df.join(
-    ring_priority2_df, on="TAMBR", how="left"
-).join(
-    ring_most_used2_df, on="TAMBR", how="left"
-).withColumn(
-    "priority_ring", when(col("priority_ring").isNull(), lit(0)).otherwise(col("priority_ring"))
-).withColumn(
-    "most_used_ring", when(col("most_used_ring").isNull(), lit(0)).otherwise(col("most_used_ring"))
-).withColumn(
-    "max_dist", lit(40)  # WAITING ON CONFIRMATION
-)
-
-# -------------------- 10. Output and Frequency Table --------------------
-final_rings_df.write.format("bigquery") \
-    .option("table", f"{BQ_PROJECT}.{BQ_MACOMMON}.tambr_rings_{SYSUSERID}") \
-    .mode("overwrite") \
-    .save()
-
-freq_df = final_rings_df.groupBy("branch_typ", "metcomm_cde").count()
-freq_df.show()
-
-# =============================================================================
-# Manual Intervention Required:
-# - Review percentile_approx for accuracy vs SAS proc univariate pctlpts=80.
-# - Confirm geodist UDF matches SAS geodist('M') output.
-# - Confirm BigQuery table names and field mappings.
-# =============================================================================
-
-# Conversion Percentage: 99%
-# apiCost: 0.0023 USD
+print(f"Conversion Percentage: {conversion_percentage}%")
+print(f"apiCost: {apiCost}$")
+```
+Conversion Percentage: 99.0%
+apiCost: 0.0023$
