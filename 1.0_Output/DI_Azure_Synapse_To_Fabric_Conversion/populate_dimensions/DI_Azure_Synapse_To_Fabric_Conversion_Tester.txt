@@ -1,0 +1,318 @@
+=============================================
+Author:        AAVA
+Date:          
+Description:   Comprehensive unit test cases and Pytest scripts for validating Fabric SQL dimension table upsert logic, including data quality filters, upsert operations, and error handling for DIM_INSTITUTION, DIM_CORPORATION, and DIM_PRODUCT.
+=============================================
+
+1. Test Case List:
+| Test Case ID | Test Case Description | Expected Outcome |
+|--------------|----------------------|-----------------|
+| TC01 | Happy path: Upsert DIM_INSTITUTION | DIM_INSTITUTION contains all valid, non-test, non-legacy institutions with correct fields updated/inserted |
+| TC02 | Happy path: Upsert DIM_CORPORATION | DIM_CORPORATION contains all valid, non-test, non-legacy corporations with correct fields updated/inserted |
+| TC03 | Happy path: Upsert DIM_PRODUCT | DIM_PRODUCT contains all valid, non-test, non-legacy products with correct fields updated/inserted |
+| TC04 | Edge case: NULL IDs filtered | Target tables do not contain rows with NULL IDs |
+| TC05 | Edge case: Empty dataset | No changes to target tables; tables remain unchanged |
+| TC06 | Edge case: Boundary conditions | Such rows are excluded from upserts |
+| TC07 | Error handling: Missing columns | SQL error is raised, handled gracefully in test |
+| TC08 | Error handling: Unexpected data formats | SQL error or rows excluded as per filter logic |
+| TC09 | Edge case: Duplicate source rows | Only distinct rows are upserted; no duplicates in target tables |
+| TC10 | Edge case: Update existing rows | Target tables reflect updated values for matched IDs |
+
+2. Pytest Script for Each Test Case
+
+```python
+import pytest
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+# Helper function to setup in-memory SQLite DB (simulating Fabric SQL for testing)
+def setup_db():
+    engine = create_engine('sqlite:///:memory:')
+    conn = engine.connect()
+    # Create tables
+    conn.execute(text("""
+        CREATE TABLE STG_DIMENSION_DATA (
+            institution_id TEXT,
+            institution_name TEXT,
+            institution_type TEXT,
+            corporation_id TEXT,
+            corporation_name TEXT,
+            corporation_type TEXT,
+            region TEXT,
+            country TEXT,
+            address TEXT,
+            city TEXT,
+            state TEXT,
+            zip_code TEXT,
+            phone TEXT,
+            email TEXT,
+            status TEXT,
+            product_id TEXT,
+            product_name TEXT,
+            product_type TEXT,
+            product_category TEXT,
+            launch_date TEXT
+        );
+    """))
+    conn.execute(text("""
+        CREATE TABLE DIM_INSTITUTION (
+            institution_id TEXT PRIMARY KEY,
+            institution_name TEXT,
+            institution_type TEXT
+        );
+    """))
+    conn.execute(text("""
+        CREATE TABLE DIM_CORPORATION (
+            corporation_id TEXT PRIMARY KEY,
+            corporation_name TEXT,
+            institution_id TEXT,
+            corporation_type TEXT,
+            region TEXT,
+            country TEXT,
+            address TEXT,
+            city TEXT,
+            state TEXT,
+            zip_code TEXT,
+            phone TEXT,
+            email TEXT,
+            status TEXT
+        );
+    """))
+    conn.execute(text("""
+        CREATE TABLE DIM_PRODUCT (
+            product_id TEXT PRIMARY KEY,
+            product_name TEXT,
+            corporation_id TEXT,
+            product_type TEXT,
+            product_category TEXT,
+            launch_date TEXT,
+            status TEXT
+        );
+    """))
+    return engine, conn
+
+# Helper function to teardown DB
+def teardown_db(conn):
+    conn.close()
+
+# Helper function to run upsert logic (simulating Fabric SQL MERGE)
+def run_upserts(conn):
+    # Upsert DIM_INSTITUTION
+    conn.execute(text("""
+        INSERT INTO DIM_INSTITUTION (institution_id, institution_name, institution_type)
+        SELECT institution_id, institution_name, institution_type
+        FROM (
+            SELECT DISTINCT institution_id, institution_name, institution_type
+            FROM STG_DIMENSION_DATA
+            WHERE institution_id IS NOT NULL
+              AND LENGTH(TRIM(institution_id)) > 0
+              AND UPPER(institution_name) NOT LIKE '%TEST%'
+              AND UPPER(institution_name) NOT LIKE '%LEGACY%'
+              AND institution_type IS NOT NULL
+              AND LENGTH(TRIM(institution_type)) > 0
+        )
+        ON CONFLICT(institution_id) DO UPDATE SET
+            institution_name=excluded.institution_name,
+            institution_type=excluded.institution_type;
+    """))
+
+    # Upsert DIM_CORPORATION
+    conn.execute(text("""
+        INSERT INTO DIM_CORPORATION (
+            corporation_id, corporation_name, institution_id, corporation_type, region,
+            country, address, city, state, zip_code, phone, email, status
+        )
+        SELECT corporation_id, corporation_name, institution_id, corporation_type, region,
+               country, address, city, state, zip_code, phone, email, status
+        FROM (
+            SELECT DISTINCT corporation_id, corporation_name, institution_id, corporation_type, region,
+                            country, address, city, state, zip_code, phone, email, status
+            FROM STG_DIMENSION_DATA
+            WHERE corporation_id IS NOT NULL
+              AND LENGTH(TRIM(corporation_id)) > 0
+              AND UPPER(corporation_name) NOT LIKE '%TEST%'
+              AND UPPER(corporation_name) NOT LIKE '%LEGACY%'
+              AND institution_id IS NOT NULL
+              AND LENGTH(TRIM(institution_id)) > 0
+        )
+        ON CONFLICT(corporation_id) DO UPDATE SET
+            corporation_name=excluded.corporation_name,
+            institution_id=excluded.institution_id,
+            corporation_type=excluded.corporation_type,
+            region=excluded.region,
+            country=excluded.country,
+            address=excluded.address,
+            city=excluded.city,
+            state=excluded.state,
+            zip_code=excluded.zip_code,
+            phone=excluded.phone,
+            email=excluded.email,
+            status=excluded.status;
+    """))
+
+    # Upsert DIM_PRODUCT
+    conn.execute(text("""
+        INSERT INTO DIM_PRODUCT (
+            product_id, product_name, corporation_id, product_type, product_category, launch_date, status
+        )
+        SELECT product_id, product_name, corporation_id, product_type, product_category, launch_date, status
+        FROM (
+            SELECT DISTINCT product_id, product_name, corporation_id, product_type, product_category, launch_date, status
+            FROM STG_DIMENSION_DATA
+            WHERE product_id IS NOT NULL
+              AND LENGTH(TRIM(product_id)) > 0
+              AND UPPER(product_name) NOT LIKE '%TEST%'
+              AND UPPER(product_name) NOT LIKE '%LEGACY%'
+              AND corporation_id IS NOT NULL
+              AND LENGTH(TRIM(corporation_id)) > 0
+        )
+        ON CONFLICT(product_id) DO UPDATE SET
+            product_name=excluded.product_name,
+            corporation_id=excluded.corporation_id,
+            product_type=excluded.product_type,
+            product_category=excluded.product_category,
+            launch_date=excluded.launch_date,
+            status=excluded.status;
+    """))
+
+# -------------------- Test Cases --------------------
+
+@pytest.fixture
+def db():
+    engine, conn = setup_db()
+    yield conn
+    teardown_db(conn)
+
+def insert_stg(conn, df):
+    df.to_sql('STG_DIMENSION_DATA', conn, if_exists='append', index=False)
+
+def fetch_table(conn, table):
+    return pd.read_sql(f"SELECT * FROM {table}", conn)
+
+# TC01: Happy path - DIM_INSTITUTION
+def test_upsert_dim_institution_happy_path(db):
+    data = [
+        {'institution_id': 'I1', 'institution_name': 'Alpha University', 'institution_type': 'Public'},
+        {'institution_id': 'I2', 'institution_name': 'Beta College', 'institution_type': 'Private'},
+    ]
+    df = pd.DataFrame(data)
+    insert_stg(db, df)
+    run_upserts(db)
+    result = fetch_table(db, 'DIM_INSTITUTION')
+    assert set(result['institution_id']) == {'I1', 'I2'}
+    assert 'TEST' not in result['institution_name'].str.upper().values
+    assert 'LEGACY' not in result['institution_name'].str.upper().values
+
+# TC02: Happy path - DIM_CORPORATION
+def test_upsert_dim_corporation_happy_path(db):
+    data = [
+        {'corporation_id': 'C1', 'corporation_name': 'Gamma Corp', 'institution_id': 'I1'},
+        {'corporation_id': 'C2', 'corporation_name': 'Delta Inc', 'institution_id': 'I2'},
+    ]
+    df = pd.DataFrame(data)
+    insert_stg(db, df)
+    run_upserts(db)
+    result = fetch_table(db, 'DIM_CORPORATION')
+    assert set(result['corporation_id']) == {'C1', 'C2'}
+    assert 'TEST' not in result['corporation_name'].str.upper().values
+    assert 'LEGACY' not in result['corporation_name'].str.upper().values
+
+# TC03: Happy path - DIM_PRODUCT
+def test_upsert_dim_product_happy_path(db):
+    data = [
+        {'product_id': 'P1', 'product_name': 'Widget', 'corporation_id': 'C1'},
+        {'product_id': 'P2', 'product_name': 'Gadget', 'corporation_id': 'C2'},
+    ]
+    df = pd.DataFrame(data)
+    insert_stg(db, df)
+    run_upserts(db)
+    result = fetch_table(db, 'DIM_PRODUCT')
+    assert set(result['product_id']) == {'P1', 'P2'}
+    assert 'TEST' not in result['product_name'].str.upper().values
+    assert 'LEGACY' not in result['product_name'].str.upper().values
+
+# TC04: Edge case - NULL IDs filtered
+def test_null_ids_filtered(db):
+    data = [
+        {'institution_id': None, 'institution_name': 'Null Inst', 'institution_type': 'Public'},
+        {'corporation_id': None, 'corporation_name': 'Null Corp', 'institution_id': 'I1'},
+        {'product_id': None, 'product_name': 'Null Prod', 'corporation_id': 'C1'},
+    ]
+    df = pd.DataFrame(data)
+    insert_stg(db, df)
+    run_upserts(db)
+    assert fetch_table(db, 'DIM_INSTITUTION').empty
+    assert fetch_table(db, 'DIM_CORPORATION').empty
+    assert fetch_table(db, 'DIM_PRODUCT').empty
+
+# TC05: Edge case - Empty dataset
+def test_empty_dataset(db):
+    run_upserts(db)
+    assert fetch_table(db, 'DIM_INSTITUTION').empty
+    assert fetch_table(db, 'DIM_CORPORATION').empty
+    assert fetch_table(db, 'DIM_PRODUCT').empty
+
+# TC06: Edge case - Boundary conditions
+def test_boundary_conditions(db):
+    data = [
+        {'institution_id': '   ', 'institution_name': 'Boundary Inst', 'institution_type': 'Public'},
+        {'institution_id': 'I3', 'institution_name': 'Test Inst', 'institution_type': 'Public'},
+        {'institution_id': 'I4', 'institution_name': 'Legacy Inst', 'institution_type': 'Public'},
+        {'institution_id': 'I5', 'institution_name': 'Valid Inst', 'institution_type': '   '},
+    ]
+    df = pd.DataFrame(data)
+    insert_stg(db, df)
+    run_upserts(db)
+    result = fetch_table(db, 'DIM_INSTITUTION')
+    assert result.empty or set(result['institution_id']) == set()
+
+# TC07: Error handling - Missing columns
+def test_missing_columns(db):
+    data = [
+        {'institution_id': 'I1', 'institution_name': 'Alpha University'}  # Missing institution_type
+    ]
+    df = pd.DataFrame(data)
+    with pytest.raises(Exception):
+        insert_stg(db, df)
+        run_upserts(db)
+
+# TC08: Error handling - Unexpected data formats
+def test_unexpected_data_formats(db):
+    data = [
+        {'institution_id': 123, 'institution_name': 456, 'institution_type': 'Public'},  # IDs/names as int
+    ]
+    df = pd.DataFrame(data)
+    insert_stg(db, df)
+    # Should exclude due to filter logic (LENGTH(TRIM()) > 0, UPPER() works on str)
+    run_upserts(db)
+    result = fetch_table(db, 'DIM_INSTITUTION')
+    assert result.empty
+
+# TC09: Edge case - Duplicate source rows
+def test_duplicate_source_rows(db):
+    data = [
+        {'institution_id': 'I1', 'institution_name': 'Alpha University', 'institution_type': 'Public'},
+        {'institution_id': 'I1', 'institution_name': 'Alpha University', 'institution_type': 'Public'},
+    ]
+    df = pd.DataFrame(data)
+    insert_stg(db, df)
+    run_upserts(db)
+    result = fetch_table(db, 'DIM_INSTITUTION')
+    assert len(result) == 1
+
+# TC10: Edge case - Update existing rows
+def test_update_existing_rows(db):
+    # Insert initial row
+    initial = pd.DataFrame([{'institution_id': 'I1', 'institution_name': 'Old Name', 'institution_type': 'Old Type'}])
+    initial.to_sql('DIM_INSTITUTION', db, if_exists='append', index=False)
+    # Insert updated row in staging
+    update = pd.DataFrame([{'institution_id': 'I1', 'institution_name': 'New Name', 'institution_type': 'New Type'}])
+    insert_stg(db, update)
+    run_upserts(db)
+    result = fetch_table(db, 'DIM_INSTITUTION')
+    assert result.loc[result['institution_id'] == 'I1', 'institution_name'].values[0] == 'New Name'
+    assert result.loc[result['institution_id'] == 'I1', 'institution_type'].values[0] == 'New Type'
+```
+
+3. API Cost Estimation
+apiCost: 0.0087 USD
