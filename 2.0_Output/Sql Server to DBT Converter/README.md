@@ -7,5 +7,5 @@ Inputs:
 - SQL_TO_DBT
 - Analysis%20output%20(1)
 
-Execution ID: 980268b9-ca84-4d51-94ba-62dc789c1c07
-Execution Time: 2026-01-19 11:40:57 UTC
+Execution ID: 6d109ee2-5d26-4e45-bc55-9d1c72042cac
+Execution Time: 2026-01-23 06:28:19 UTC
