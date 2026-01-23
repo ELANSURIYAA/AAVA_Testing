@@ -1,154 +1,167 @@
-# PySpark Delta Lake Equivalent for SSIS Package: Employee_Data_Warehouse
+# PySpark Delta Lake Equivalent of SSIS Package: Employee_Data_Warehouse
 
-```python
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, year, month, current_date, lit
+# This script replicates the ETL process of the SSIS package using PySpark and Delta Lake.
+# All data sources and destinations are Delta tables. No SQL Server or external DB code is used.
+# Logging and error handling are implemented using Python's logging and Delta tables.
+# Environment-specific configurations are read from environment variables or a config file.
+
+from pyspark.sql import SparkSession, functions as F, Window
 from delta.tables import DeltaTable
 import logging
 import sys
-import datetime
+import os
+from datetime import datetime
 
-# =========================
-# Environment Configuration
-# =========================
+# ==============================
+# Environment & Configurations
+# ==============================
 
-# These would be dynamically loaded from your environment file or passed as parameters
-LOG_FILE_PATH = "/mnt/delta/logs/employee_data_warehouse.log"
-BATCH_ID = str(datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
-SOURCE_EMPLOYEES_DELTA = "/mnt/delta/source/employees"
-LOOKUP_DEPARTMENTS_DELTA = "/mnt/delta/source/departments"
-LOOKUP_LOCATIONS_DELTA = "/mnt/delta/source/locations"
-DEST_EMPLOYEES_DW_DELTA = "/mnt/delta/warehouse/employees_dw"
-DEST_HIGHSALARY_SUMMARY_DELTA = "/mnt/delta/warehouse/highsalary_summary"
-DEST_LOWSALARY_SUMMARY_DELTA = "/mnt/delta/warehouse/lowsalary_summary"
-ERROR_LOG_DELTA = "/mnt/delta/logs/ssis_error_log"
+# These would be set via environment variables or a config file in production
+LOG_FILE_PATH = os.environ.get("LOG_FILE_PATH", "/tmp/employee_dw_etl.log")
+BATCH_ID = os.environ.get("BATCH_ID", str(int(datetime.now().timestamp())))
+LOAD_DATE = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# =========================
+# Delta Table paths (replace with actual paths in your environment)
+DELTA_SOURCE_EMPLOYEES = "/delta/source/employees"
+DELTA_LOOKUP_DEPARTMENTS = "/delta/lookup/departments"
+DELTA_LOOKUP_LOCATIONS = "/delta/lookup/locations"
+DELTA_DEST_EMPLOYEES_DW = "/delta/dw/employees"
+DELTA_DEST_HIGH_SALARY_SUMMARY = "/delta/dw/high_salary_summary"
+DELTA_DEST_LOW_SALARY_SUMMARY = "/delta/dw/low_salary_summary"
+DELTA_ERROR_LOG = "/delta/log/error_log"
+
+# ==============================
 # Logging Setup
-# =========================
+# ==============================
 
 logging.basicConfig(
     filename=LOG_FILE_PATH,
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 def log_event(message):
-    logging.info(f"Batch ID: {BATCH_ID} - {message}")
+    logging.info(f"{message} | Batch ID: {BATCH_ID}")
 
-def log_error(error_msg):
-    logging.error(f"Batch ID: {BATCH_ID} - {error_msg}")
-    # Also write error to Delta error log table
+def log_error(message):
+    logging.error(f"{message} | Batch ID: {BATCH_ID}")
+    # Also write to Delta error log table
     error_df = spark.createDataFrame(
-        [(error_msg, datetime.datetime.now(), BATCH_ID)],
+        [(message, datetime.now(), BATCH_ID)],
         ["ErrorMessage", "ErrorTime", "BatchID"]
     )
-    error_df.write.format("delta").mode("append").save(ERROR_LOG_DELTA)
+    error_delta = DeltaTable.forPath(spark, DELTA_ERROR_LOG)
+    error_delta.alias("t").merge(
+        error_df.alias("s"),
+        "t.ErrorMessage = s.ErrorMessage AND t.BatchID = s.BatchID"
+    ).whenNotMatchedInsertAll().execute()
 
-# =========================
-# Spark Session
-# =========================
+# ==============================
+# Spark Session Initialization
+# ==============================
 
 spark = SparkSession.builder \
-    .appName("Employee_Data_Warehouse") \
+    .appName("Employee_Data_Warehouse_ETL") \
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
     .getOrCreate()
+
+spark.conf.set("spark.sql.shuffle.partitions", 8)
+
+# ==============================
+# Main ETL Logic
+# ==============================
 
 try:
     log_event("Package Execution Started.")
 
-    # =========================
-    # Data Flow: Source Employees
-    # =========================
-    df_employees = spark.read.format("delta").load(SOURCE_EMPLOYEES_DELTA)
+    # 1. Read Source Employees Table (Delta)
+    df_employees = spark.read.format("delta").load(DELTA_SOURCE_EMPLOYEES)
 
-    # =========================
-    # Lookup: Departments
-    # =========================
-    df_departments = spark.read.format("delta").load(LOOKUP_DEPARTMENTS_DELTA)
+    # 2. Lookup: Departments
+    df_departments = spark.read.format("delta").load(DELTA_LOOKUP_DEPARTMENTS)
     df_employees = df_employees.join(
         df_departments,
-        df_employees["DepartmentID"] == df_departments["DepartmentID"],
-        "left"
-    ).drop(df_departments["DepartmentID"])
+        on="DepartmentID",
+        how="left"
+    )
 
-    # =========================
-    # Lookup: Locations
-    # =========================
-    df_locations = spark.read.format("delta").load(LOOKUP_LOCATIONS_DELTA)
+    # 3. Lookup: Locations
+    df_locations = spark.read.format("delta").load(DELTA_LOOKUP_LOCATIONS)
     df_employees = df_employees.join(
         df_locations,
-        df_employees["LocationID"] == df_locations["LocationID"],
-        "left"
-    ).drop(df_locations["LocationID"])
+        on="LocationID",
+        how="left"
+    )
 
-    # =========================
-    # Derived Columns
-    # =========================
-    df_employees = df_employees.withColumn("HireYear", year(col("HireDate"))) \
-        .withColumn("HireMonth", month(col("HireDate"))) \
-        .withColumn("LoadDate", current_date()) \
-        .withColumn("BatchID", lit(BATCH_ID))
+    # 4. Derived Columns
+    df_employees = df_employees \
+        .withColumn("HireYear", F.year("HireDate")) \
+        .withColumn("HireMonth", F.month("HireDate")) \
+        .withColumn("LoadDate", F.lit(LOAD_DATE)) \
+        .withColumn("BatchID", F.lit(BATCH_ID))
 
-    # =========================
-    # Conditional Split
-    # =========================
+    # 5. Conditional Split: High Salary vs Low Salary
     HIGH_SALARY_THRESHOLD = 100000  # Example threshold, adjust as needed
-    df_high_salary = df_employees.filter(col("Salary") >= HIGH_SALARY_THRESHOLD)
-    df_low_salary = df_employees.filter(col("Salary") < HIGH_SALARY_THRESHOLD)
+    df_high_salary = df_employees.filter(F.col("Salary") >= HIGH_SALARY_THRESHOLD)
+    df_low_salary = df_employees.filter(F.col("Salary") < HIGH_SALARY_THRESHOLD)
 
-    # =========================
-    # Aggregates
-    # =========================
+    # 6. Aggregate: High Salary
     df_high_salary_summary = df_high_salary.groupBy("DepartmentID").agg(
-        {"Salary": "avg", "*": "count"}
-    ).withColumnRenamed("avg(Salary)", "AvgHighSalary") \
-     .withColumnRenamed("count(1)", "HighSalaryEmployeeCount")
+        F.count("*").alias("HighSalaryCount"),
+        F.avg("Salary").alias("AvgHighSalary"),
+        F.lit(LOAD_DATE).alias("LoadDate"),
+        F.lit(BATCH_ID).alias("BatchID")
+    )
 
+    # 7. Aggregate: Low Salary
     df_low_salary_summary = df_low_salary.groupBy("DepartmentID").agg(
-        {"Salary": "avg", "*": "count"}
-    ).withColumnRenamed("avg(Salary)", "AvgLowSalary") \
-     .withColumnRenamed("count(1)", "LowSalaryEmployeeCount")
+        F.count("*").alias("LowSalaryCount"),
+        F.avg("Salary").alias("AvgLowSalary"),
+        F.lit(LOAD_DATE).alias("LoadDate"),
+        F.lit(BATCH_ID).alias("BatchID")
+    )
 
-    # =========================
-    # Destination: Employees DW
-    # =========================
-    df_employees.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(DEST_EMPLOYEES_DW_DELTA)
+    # 8. Write to Destination Employees DW Table (Delta Upsert)
+    dest_employees_dw = DeltaTable.forPath(spark, DELTA_DEST_EMPLOYEES_DW)
+    dest_employees_dw.alias("t").merge(
+        df_employees.alias("s"),
+        "t.EmployeeID = s.EmployeeID"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
-    # =========================
-    # Destination: High Salary Summary
-    # =========================
-    df_high_salary_summary.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(DEST_HIGHSALARY_SUMMARY_DELTA)
+    # 9. Write to High Salary Summary Table (Delta Upsert)
+    dest_high_salary = DeltaTable.forPath(spark, DELTA_DEST_HIGH_SALARY_SUMMARY)
+    dest_high_salary.alias("t").merge(
+        df_high_salary_summary.alias("s"),
+        "t.DepartmentID = s.DepartmentID AND t.BatchID = s.BatchID"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
-    # =========================
-    # Destination: Low Salary Summary
-    # =========================
-    df_low_salary_summary.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(DEST_LOWSALARY_SUMMARY_DELTA)
+    # 10. Write to Low Salary Summary Table (Delta Upsert)
+    dest_low_salary = DeltaTable.forPath(spark, DELTA_DEST_LOW_SALARY_SUMMARY)
+    dest_low_salary.alias("t").merge(
+        df_low_salary_summary.alias("s"),
+        "t.DepartmentID = s.DepartmentID AND t.BatchID = s.BatchID"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
-    # =========================
-    # Delta Lake Optimization
-    # =========================
-    for path in [DEST_EMPLOYEES_DW_DELTA, DEST_HIGHSALARY_SUMMARY_DELTA, DEST_LOWSALARY_SUMMARY_DELTA]:
-        dt = DeltaTable.forPath(spark, path)
-        dt.optimize().executeCompaction()
-        dt.vacuum(168)  # Retain 7 days of history
+    # 11. Delta Table Maintenance: OPTIMIZE and VACUUM
+    for table_path in [
+        DELTA_DEST_EMPLOYEES_DW,
+        DELTA_DEST_HIGH_SALARY_SUMMARY,
+        DELTA_DEST_LOW_SALARY_SUMMARY
+    ]:
+        spark.sql(f"OPTIMIZE delta.`{table_path}`")
+        spark.sql(f"VACUUM delta.`{table_path}` RETAIN 168 HOURS")  # Retain last 7 days
 
     log_event("Package Execution Completed Successfully.")
 
 except Exception as e:
-    log_error(str(e))
+    log_error(f"ETL Failure: {str(e)}")
     sys.exit(1)
 
 finally:
     spark.stop()
-```
 
-# API Cost Consumed for this Call: 0.02 USD
-
-# Notes:
-- All sources and destinations are Delta tables.
-- No SQL Server or SQL code is used anywhere.
-- All variables (e.g., BatchID, LogFilePath) are handled as Python variables.
-- Logging is implemented using Python's logging module and also written to a Delta table for error logs.
-- The workflow and data dependencies are preserved.
-- Delta Lake ACID transactions, OPTIMIZE, and VACUUM are used for performance and reliability.
-- You can adjust paths and thresholds as per your environment.
+# ==============================
+# API Cost
+# ==============================
+# apiCost: 0.02 USD
