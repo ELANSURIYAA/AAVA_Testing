@@ -1,6 +1,6 @@
 # AAVA Comparison Results
 
-Generated: 2026-01-27 14:33:05
+Generated: 2026-01-27 15:07:05
 
 ## Workflows Compared
 - AAVA 1.0: ABAP_To_Pyspark_Convert
@@ -9,28 +9,28 @@ Generated: 2026-01-27 14:33:05
 ## Agent Comparisons
 Total Agents: 5
 
-### abaptopysparkconversiontester
+### ABAP_to_PySpark_Conversion_Tester
 - AAVA 1.0: `ABAP_to_PySpark_Conversion_Tester.txt`
 - AAVA 2.0: `abap_to_pyspark_conversion_tester.txt`
-- Results: [abaptopysparkconversiontester/](./abaptopysparkconversiontester/)
+- Results: [ABAP_to_PySpark_Conversion_Tester/](./ABAP_to_PySpark_Conversion_Tester/)
 
-### abaptopysparkconverter
+### ABAP_to_PySpark_Converter
 - AAVA 1.0: `ABAP_to_PySpark_Converter.txt`
 - AAVA 2.0: `abap_to_pyspark_converter.txt`
-- Results: [abaptopysparkconverter/](./abaptopysparkconverter/)
+- Results: [ABAP_to_PySpark_Converter/](./ABAP_to_PySpark_Converter/)
 
-### abaptopysparkrecontester
+### ABAP_To_PySpark_Recon_Tester
 - AAVA 1.0: `ABAP_To_PySpark_Recon_Tester.txt`
 - AAVA 2.0: `abap_to_pyspark_recon_tester.txt`
-- Results: [abaptopysparkrecontester/](./abaptopysparkrecontester/)
+- Results: [ABAP_To_PySpark_Recon_Tester/](./ABAP_To_PySpark_Recon_Tester/)
 
-### abaptopysparkreviewer
+### ABAP_To_PySpark_Reviewer
 - AAVA 1.0: `ABAP_To_PySpark_Reviewer.txt`
 - AAVA 2.0: `abap_to_pyspark_reviewer.txt`
-- Results: [abaptopysparkreviewer/](./abaptopysparkreviewer/)
+- Results: [ABAP_To_PySpark_Reviewer/](./ABAP_To_PySpark_Reviewer/)
 
-### abaptopysparkunittesting
+### ABAP_to_PySpark_Unit_Testing
 - AAVA 1.0: `ABAP_to_PySpark_Unit_Testing.txt`
 - AAVA 2.0: `abap_to_pyspark_unit_testing.txt`
-- Results: [abaptopysparkunittesting/](./abaptopysparkunittesting/)
+- Results: [ABAP_to_PySpark_Unit_Testing/](./ABAP_to_PySpark_Unit_Testing/)
 
