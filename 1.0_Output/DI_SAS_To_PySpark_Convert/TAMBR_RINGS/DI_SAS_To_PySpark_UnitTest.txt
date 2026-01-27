@@ -1,265 +1,276 @@
+```
 =============================================
 Author: Ascendion AVAA
 Date: 
-Description: Pytest test suite for validating the PySpark TAMBR Rings workflow, including transformation logic, joins, aggregations, geospatial UDFs, and edge case handling.
+Description: Pytest suite for validating PySpark TAMBr ring calculation logic, including joins, aggregations, UDFs, and edge cases.
 =============================================
 
+# =========================
 # 1. Test Case List
+# =========================
 
-| Test Case ID | Description                                                                                   | Expected Outcome                                                                                      |
-|--------------|----------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------|
-| TC01         | Happy path: Valid customer and branch data, all joins and aggregations work as expected       | Output DataFrames match expected schema and data, distances are correct, percentiles are accurate     |
-| TC02         | Edge case: NULL/zero latitude or longitude in customer/branch data                           | NULL or default values handled, records routed to bad_latlong tables as expected                     |
-| TC03         | Edge case: Empty input DataFrames                                                            | Output DataFrames are empty, no errors thrown                                                        |
-| TC04         | Edge case: Duplicate LP_IDs or BR_IDs                                                        | Window/row_number logic deduplicates as expected, only one record per partition                      |
-| TC05         | Error handling: Type mismatch in latitude/longitude columns                                  | Exception is raised or rows with bad types are excluded                                              |
-| TC06         | Filtering: Only open branches (BR_OPN_FLG='Y') and valid branch types are included           | Output contains only valid branches                                                                  |
-| TC07         | Aggregation: 80th percentile calculation for distance rings                                  | Percentile values are correct for known input                                                        |
-| TC08         | UDF: geodist returns correct distance for known coordinates                                  | Output matches Haversine formula result                                                              |
-| TC09         | Schema: Output DataFrames have expected columns and types                                    | Assert schema matches specification                                                                  |
-| TC10         | Performance: Large input DataFrames complete within reasonable time (mocked)                 | Test completes within timeout, no memory errors                                                      |
+| Test Case ID | Description                                                                                     | Expected Outcome                                                                                   |
+|--------------|------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: Valid customer, branch, and geocode data, all joins succeed, distances calculated   | Output DataFrame has correct schema, correct distances, correct rings, and expected row count      |
+| TC02         | Edge: Customer with NULL latitude/longitude                                                     | Distance is NULL, customer excluded from ring calculation, schema/data correct                     |
+| TC03         | Edge: Branch with invalid lat/long (<=1 or >=-1)                                                | Branch excluded from ring calculation, not present in output                                       |
+| TC04         | Edge: Customer with no matching branch (priority or most used)                                  | Customer excluded from final ring calculation, output as expected                                  |
+| TC05         | Edge: Duplicate customers (same LP_ID, different NBR_OF_MOS_OPN)                                | Only first record per LP_ID is kept (lowest NBR_OF_MOS_OPN)                                        |
+| TC06         | Edge: No data (empty DataFrames)                                                                | Output DataFrame is empty with correct schema                                                      |
+| TC07         | Error: Type mismatch in latitude/longitude (e.g., string instead of float)                      | Exception is raised, error handling/logging is triggered                                           |
+| TC08         | Error: Missing required columns in input DataFrames                                             | Exception is raised, error handling/logging is triggered                                           |
+| TC09         | Happy path: Percentile calculation for ring is correct                                          | 80th percentile distance is correctly calculated for each branch                                   |
+| TC10         | Edge: All distances are NULL for a branch                                                       | Ring value for that branch is set to 0 (as per coalesce logic)                                     |
 
-# 2. Pytest Script for Each Test Case
+# =========================
+# 2. Pytest Script
+# =========================
 
-```python
 import pytest
-from pyspark.sql import SparkSession
-from pyspark.sql import Row
-from pyspark.sql.types import *
-from pyspark.sql.functions import col, lit, when
-import math
+from pyspark.sql import SparkSession, Row, functions as F, types as T, Window
+from math import radians, cos, sin, asin, sqrt
 
-# --- Fixtures and Helpers ---
+# Helper: geodist function/UDF
+def geodist(lat1, lon1, lat2, lon2):
+    if None in [lat1, lon1, lat2, lon2]:
+        return None
+    lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * asin(sqrt(a))
+    miles = 3956 * c
+    return miles
 
+geodist_udf = F.udf(geodist, T.DoubleType())
+
+# Pytest fixture for SparkSession
 @pytest.fixture(scope="session")
 def spark():
-    spark = SparkSession.builder.master("local[2]").appName("tambr_rings_test").getOrCreate()
-    yield spark
-    spark.stop()
+    return SparkSession.builder.master("local[2]").appName("tambr_test").getOrCreate()
 
-@pytest.fixture
-def sample_branch_df(spark):
-    data = [
-        Row(HGN_BR_ID="B001", BR_TYP="R", BR_OPN_FLG="Y", branchlat=40.0, branchlong=-74.0, METRO_COMMUNITY_CDE="M1", GEN_CDE=None, TBA_CLS_DVSTD_DT=None, BRICK_AND_MORTOR_NM="Main", CITY="NY", ST="NY", ZIP_CDE="10001"),
-        Row(HGN_BR_ID="B002", BR_TYP="U", BR_OPN_FLG="Y", branchlat=41.0, branchlong=-75.0, METRO_COMMUNITY_CDE="M2", GEN_CDE=None, TBA_CLS_DVSTD_DT=None, BRICK_AND_MORTOR_NM="Second", CITY="LA", ST="CA", ZIP_CDE="90001"),
-    ]
-    schema = StructType([
-        StructField("HGN_BR_ID", StringType()),
-        StructField("BR_TYP", StringType()),
-        StructField("BR_OPN_FLG", StringType()),
-        StructField("branchlat", DoubleType()),
-        StructField("branchlong", DoubleType()),
-        StructField("METRO_COMMUNITY_CDE", StringType()),
-        StructField("GEN_CDE", StringType()),
-        StructField("TBA_CLS_DVSTD_DT", StringType()),
-        StructField("BRICK_AND_MORTOR_NM", StringType()),
-        StructField("CITY", StringType()),
-        StructField("ST", StringType()),
-        StructField("ZIP_CDE", StringType()),
+# Helper: DataFrame equality check (schema & data)
+def assert_df_equality(df1, df2, ignore_nullable=True, ignore_row_order=True):
+    # Compare schema
+    assert df1.schema == df2.schema, f"Schema mismatch: {df1.schema} != {df2.schema}"
+    # Compare data
+    data1 = df1.collect()
+    data2 = df2.collect()
+    if ignore_row_order:
+        assert sorted(data1) == sorted(data2), f"Data mismatch: {data1} != {data2}"
+    else:
+        assert data1 == data2, f"Data mismatch: {data1} != {data2}"
+
+# =========================
+# TC01: Happy path
+# =========================
+def test_happy_path(spark):
+    # Mock input DataFrames
+    rings_cust_data = spark.createDataFrame([
+        Row(LP_ID="C1", PRTY_BR="B1", OPN_ACCT_FLG="Y", NBR_OF_MOS_OPN=12, custlat=40.0, custlong=-75.0, MOST_USED_BR="B2"),
+        Row(LP_ID="C2", PRTY_BR="B1", OPN_ACCT_FLG="Y", NBR_OF_MOS_OPN=10, custlat=41.0, custlong=-76.0, MOST_USED_BR="B2"),
     ])
-    return spark.createDataFrame(data, schema=schema)
-
-@pytest.fixture
-def sample_customer_df(spark):
-    data = [
-        Row(LP_ID="C001", PRTY_BR="B001", CUST_PRTY_ACCT_ID="A001", OPN_ACCT_FLG="Y", NBR_OF_MOS_OPN=12, MOST_USED_BR="B002", HGN_CUST_TYP_CDE="T1", OPN_ACCT_CNT=1, geomatchcode="1", custlat=40.1, custlong=-74.1),
-        Row(LP_ID="C002", PRTY_BR="B002", CUST_PRTY_ACCT_ID="A002", OPN_ACCT_FLG="Y", NBR_OF_MOS_OPN=24, MOST_USED_BR="B001", HGN_CUST_TYP_CDE="T2", OPN_ACCT_CNT=2, geomatchcode="1", custlat=41.1, custlong=-75.1),
-    ]
-    schema = StructType([
-        StructField("LP_ID", StringType()),
-        StructField("PRTY_BR", StringType()),
-        StructField("CUST_PRTY_ACCT_ID", StringType()),
-        StructField("OPN_ACCT_FLG", StringType()),
-        StructField("NBR_OF_MOS_OPN", IntegerType()),
-        StructField("MOST_USED_BR", StringType()),
-        StructField("HGN_CUST_TYP_CDE", StringType()),
-        StructField("OPN_ACCT_CNT", IntegerType()),
-        StructField("geomatchcode", StringType()),
-        StructField("custlat", DoubleType()),
-        StructField("custlong", DoubleType()),
+    rings_branch_data = spark.createDataFrame([
+        Row(HGN_BR_ID="B1", BR_TYP="R", branchlat=40.1, branchlong=-75.1, BRICK_AND_MORTOR_NM="Branch 1", CITY="CityA", ST="PA", METRO_COMMUNITY_CDE="X"),
+        Row(HGN_BR_ID="B2", BR_TYP="I", branchlat=41.1, branchlong=-76.1, BRICK_AND_MORTOR_NM="Branch 2", CITY="CityB", ST="PA", METRO_COMMUNITY_CDE="Y"),
     ])
-    return spark.createDataFrame(data, schema=schema)
-
-@pytest.fixture
-def geodist_udf():
-    def geodist(lat1, lon1, lat2, lon2):
-        try:
-            lat1, lon1, lat2, lon2 = map(float, [lat1, lon1, lat2, lon2])
-            phi1, phi2 = math.radians(lat1), math.radians(lat2)
-            dphi = math.radians(lat2 - lat1)
-            dlambda = math.radians(lon2 - lon1)
-            a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-            miles = 3958.8 * c
-            return float(miles)
-        except Exception:
-            return None
-    from pyspark.sql.functions import udf
-    from pyspark.sql.types import DoubleType
-    return udf(geodist, DoubleType())
-
-# --- Test Cases ---
-
-def test_TC01_happy_path(spark, sample_branch_df, sample_customer_df, geodist_udf):
-    # Join customer and branch, calculate distance
-    df = sample_customer_df.join(
-        sample_branch_df,
-        sample_customer_df.PRTY_BR == sample_branch_df.HGN_BR_ID,
-        how="inner"
+    # Priority join
+    priority_cust = rings_cust_data.join(
+        rings_branch_data,
+        rings_cust_data.PRTY_BR == rings_branch_data.HGN_BR_ID,
+        "inner"
+    ).filter(
+        (rings_cust_data.OPN_ACCT_FLG == 'Y') &
+        (rings_cust_data.NBR_OF_MOS_OPN <= 24) &
+        (rings_cust_data.NBR_OF_MOS_OPN >= 0)
     ).withColumn(
         "dist_to_prty_br",
-        geodist_udf(col("branchlat"), col("branchlong"), col("custlat"), col("custlong"))
+        geodist_udf("branchlat", "branchlong", "custlat", "custlong")
     )
-    # Check schema
-    assert "dist_to_prty_br" in df.columns
-    # Check data
-    rows = df.collect()
-    assert len(rows) == 2
-    assert all(isinstance(r.dist_to_prty_br, float) for r in rows)
+    # Percentile
+    priority_ring = priority_cust.groupBy("PRTY_BR").agg(
+        F.expr("percentile_approx(dist_to_prty_br, 0.8)").alias("priority_ring")
+    ).withColumnRenamed("PRTY_BR", "TAMBR")
+    # Check schema and data
+    expected_schema = T.StructType([
+        T.StructField("TAMBR", T.StringType(), True),
+        T.StructField("priority_ring", T.DoubleType(), True),
+    ])
+    assert priority_ring.schema == expected_schema
+    assert priority_ring.count() == 1
+    assert abs(priority_ring.collect()[0]["priority_ring"] - geodist(40.1, -75.1, 41.0, -76.0)) < 1.0
 
-def test_TC02_null_latlong(spark, sample_branch_df, sample_customer_df, geodist_udf):
-    # Add a branch with null lat/long
-    null_branch = Row(HGN_BR_ID="B003", BR_TYP="R", BR_OPN_FLG="Y", branchlat=None, branchlong=None, METRO_COMMUNITY_CDE="M3", GEN_CDE=None, TBA_CLS_DVSTD_DT=None, BRICK_AND_MORTOR_NM="Null", CITY="SF", ST="CA", ZIP_CDE="94101")
-    branch_df = sample_branch_df.union(spark.createDataFrame([null_branch], sample_branch_df.schema))
-    # Add a customer referencing null branch
-    null_cust = Row(LP_ID="C003", PRTY_BR="B003", CUST_PRTY_ACCT_ID="A003", OPN_ACCT_FLG="Y", NBR_OF_MOS_OPN=10, MOST_USED_BR="B003", HGN_CUST_TYP_CDE="T3", OPN_ACCT_CNT=1, geomatchcode="1", custlat=None, custlong=None)
-    customer_df = sample_customer_df.union(spark.createDataFrame([null_cust], sample_customer_df.schema))
-    df = customer_df.join(
-        branch_df,
-        customer_df.PRTY_BR == branch_df.HGN_BR_ID,
-        how="inner"
+# =========================
+# TC02: NULL latitude/longitude
+# =========================
+def test_null_latlong(spark):
+    rings_cust_data = spark.createDataFrame([
+        Row(LP_ID="C1", PRTY_BR="B1", OPN_ACCT_FLG="Y", NBR_OF_MOS_OPN=12, custlat=None, custlong=None, MOST_USED_BR="B2"),
+    ])
+    rings_branch_data = spark.createDataFrame([
+        Row(HGN_BR_ID="B1", BR_TYP="R", branchlat=40.1, branchlong=-75.1, BRICK_AND_MORTOR_NM="Branch 1", CITY="CityA", ST="PA", METRO_COMMUNITY_CDE="X"),
+    ])
+    priority_cust = rings_cust_data.join(
+        rings_branch_data,
+        rings_cust_data.PRTY_BR == rings_branch_data.HGN_BR_ID,
+        "inner"
     ).withColumn(
         "dist_to_prty_br",
-        geodist_udf(col("branchlat"), col("branchlong"), col("custlat"), col("custlong"))
+        geodist_udf("branchlat", "branchlong", "custlat", "custlong")
     )
-    # The distance should be None for nulls
-    row = df.filter(col("LP_ID") == "C003").collect()[0]
-    assert row.dist_to_prty_br is None
+    assert priority_cust.collect()[0]["dist_to_prty_br"] is None
 
-def test_TC03_empty_input(spark, geodist_udf):
-    schema = StructType([
-        StructField("LP_ID", StringType()),
-        StructField("PRTY_BR", StringType()),
-        StructField("CUST_PRTY_ACCT_ID", StringType()),
-        StructField("OPN_ACCT_FLG", StringType()),
-        StructField("NBR_OF_MOS_OPN", IntegerType()),
-        StructField("MOST_USED_BR", StringType()),
-        StructField("HGN_CUST_TYP_CDE", StringType()),
-        StructField("OPN_ACCT_CNT", IntegerType()),
-        StructField("geomatchcode", StringType()),
-        StructField("custlat", DoubleType()),
-        StructField("custlong", DoubleType()),
+# =========================
+# TC03: Invalid branch lat/long
+# =========================
+def test_invalid_branch_latlong(spark):
+    rings_branch_data = spark.createDataFrame([
+        Row(HGN_BR_ID="B1", BR_TYP="R", branchlat=0.0, branchlong=0.0, BRICK_AND_MORTOR_NM="Branch 1", CITY="CityA", ST="PA", METRO_COMMUNITY_CDE="X"),
+        Row(HGN_BR_ID="B2", BR_TYP="I", branchlat=41.1, branchlong=-76.1, BRICK_AND_MORTOR_NM="Branch 2", CITY="CityB", ST="PA", METRO_COMMUNITY_CDE="Y"),
     ])
-    empty_cust = spark.createDataFrame([], schema)
-    empty_branch = spark.createDataFrame([], StructType([
-        StructField("HGN_BR_ID", StringType()),
-        StructField("BR_TYP", StringType()),
-        StructField("BR_OPN_FLG", StringType()),
-        StructField("branchlat", DoubleType()),
-        StructField("branchlong", DoubleType()),
-        StructField("METRO_COMMUNITY_CDE", StringType()),
-        StructField("GEN_CDE", StringType()),
-        StructField("TBA_CLS_DVSTD_DT", StringType()),
-        StructField("BRICK_AND_MORTOR_NM", StringType()),
-        StructField("CITY", StringType()),
-        StructField("ST", StringType()),
-        StructField("ZIP_CDE", StringType()),
+    good_branches = rings_branch_data.filter((F.col("branchlat") > 1) & (F.col("branchlong") < -1))
+    assert good_branches.count() == 1
+    assert good_branches.collect()[0]["HGN_BR_ID"] == "B2"
+
+# =========================
+# TC04: No matching branch
+# =========================
+def test_no_matching_branch(spark):
+    rings_cust_data = spark.createDataFrame([
+        Row(LP_ID="C1", PRTY_BR="B99", OPN_ACCT_FLG="Y", NBR_OF_MOS_OPN=12, custlat=40.0, custlong=-75.0, MOST_USED_BR="B99"),
+    ])
+    rings_branch_data = spark.createDataFrame([
+        Row(HGN_BR_ID="B1", BR_TYP="R", branchlat=40.1, branchlong=-75.1, BRICK_AND_MORTOR_NM="Branch 1", CITY="CityA", ST="PA", METRO_COMMUNITY_CDE="X"),
+    ])
+    priority_cust = rings_cust_data.join(
+        rings_branch_data,
+        rings_cust_data.PRTY_BR == rings_branch_data.HGN_BR_ID,
+        "inner"
+    )
+    assert priority_cust.count() == 0
+
+# =========================
+# TC05: Duplicate customers
+# =========================
+def test_duplicate_customers(spark):
+    customers = spark.createDataFrame([
+        Row(LP_ID="C1", NBR_OF_MOS_OPN=5),
+        Row(LP_ID="C1", NBR_OF_MOS_OPN=10),
+        Row(LP_ID="C2", NBR_OF_MOS_OPN=3),
+    ])
+    window_first = Window.partitionBy("LP_ID").orderBy("NBR_OF_MOS_OPN")
+    customers1 = customers.withColumn("rn", F.row_number().over(window_first)).filter(F.col("rn") == 1).drop("rn")
+    result = customers1.select("LP_ID", "NBR_OF_MOS_OPN").collect()
+    assert Row(LP_ID="C1", NBR_OF_MOS_OPN=5) in result
+    assert Row(LP_ID="C2", NBR_OF_MOS_OPN=3) in result
+    assert len(result) == 2
+
+# =========================
+# TC06: Empty DataFrames
+# =========================
+def test_empty_dataframes(spark):
+    schema = T.StructType([
+        T.StructField("LP_ID", T.StringType(), True),
+        T.StructField("PRTY_BR", T.StringType(), True),
+        T.StructField("OPN_ACCT_FLG", T.StringType(), True),
+        T.StructField("NBR_OF_MOS_OPN", T.IntegerType(), True),
+        T.StructField("custlat", T.DoubleType(), True),
+        T.StructField("custlong", T.DoubleType(), True),
+        T.StructField("MOST_USED_BR", T.StringType(), True),
+    ])
+    rings_cust_data = spark.createDataFrame([], schema)
+    rings_branch_data = spark.createDataFrame([], T.StructType([
+        T.StructField("HGN_BR_ID", T.StringType(), True),
+        T.StructField("BR_TYP", T.StringType(), True),
+        T.StructField("branchlat", T.DoubleType(), True),
+        T.StructField("branchlong", T.DoubleType(), True),
+        T.StructField("BRICK_AND_MORTOR_NM", T.StringType(), True),
+        T.StructField("CITY", T.StringType(), True),
+        T.StructField("ST", T.StringType(), True),
+        T.StructField("METRO_COMMUNITY_CDE", T.StringType(), True),
     ]))
-    df = empty_cust.join(
-        empty_branch,
-        empty_cust.PRTY_BR == empty_branch.HGN_BR_ID,
-        how="inner"
+    priority_cust = rings_cust_data.join(
+        rings_branch_data,
+        rings_cust_data.PRTY_BR == rings_branch_data.HGN_BR_ID,
+        "inner"
     )
-    assert df.count() == 0
+    assert priority_cust.count() == 0
 
-def test_TC04_duplicate_lp_ids(spark, sample_customer_df):
-    # Duplicate LP_ID in customer
-    dup_data = sample_customer_df.union(sample_customer_df)
-    from pyspark.sql import Window
-    from pyspark.sql.functions import row_number
-    w = Window.partitionBy("LP_ID").orderBy("NBR_OF_MOS_OPN")
-    df = dup_data.withColumn("rn", row_number().over(w)).filter(col("rn") == 1)
-    # Only one record per LP_ID
-    assert df.groupBy("LP_ID").count().filter(col("count") > 1).count() == 0
-
-def test_TC05_type_mismatch_latlong(spark, sample_branch_df, sample_customer_df, geodist_udf):
-    # Add a branch with string lat/long
-    bad_branch = Row(HGN_BR_ID="B004", BR_TYP="R", BR_OPN_FLG="Y", branchlat="bad", branchlong="bad", METRO_COMMUNITY_CDE="M4", GEN_CDE=None, TBA_CLS_DVSTD_DT=None, BRICK_AND_MORTOR_NM="Bad", CITY="SF", ST="CA", ZIP_CDE="94102")
-    branch_df = sample_branch_df.union(spark.createDataFrame([bad_branch], sample_branch_df.schema))
-    bad_cust = Row(LP_ID="C004", PRTY_BR="B004", CUST_PRTY_ACCT_ID="A004", OPN_ACCT_FLG="Y", NBR_OF_MOS_OPN=5, MOST_USED_BR="B004", HGN_CUST_TYP_CDE="T4", OPN_ACCT_CNT=1, geomatchcode="1", custlat="bad", custlong="bad")
-    customer_df = sample_customer_df.union(spark.createDataFrame([bad_cust], sample_customer_df.schema))
-    df = customer_df.join(
-        branch_df,
-        customer_df.PRTY_BR == branch_df.HGN_BR_ID,
-        how="inner"
-    ).withColumn(
-        "dist_to_prty_br",
-        geodist_udf(col("branchlat"), col("branchlong"), col("custlat"), col("custlong"))
-    )
-    # The distance should be None for bad types
-    row = df.filter(col("LP_ID") == "C004").collect()[0]
-    assert row.dist_to_prty_br is None
-
-def test_TC06_filter_open_branches(spark, sample_branch_df):
-    # Add a closed branch
-    closed_branch = Row(HGN_BR_ID="B005", BR_TYP="R", BR_OPN_FLG="N", branchlat=42.0, branchlong=-76.0, METRO_COMMUNITY_CDE="M5", GEN_CDE=None, TBA_CLS_DVSTD_DT=None, BRICK_AND_MORTOR_NM="Closed", CITY="TX", ST="TX", ZIP_CDE="75001")
-    branch_df = sample_branch_df.union(spark.createDataFrame([closed_branch], sample_branch_df.schema))
-    open_branches = branch_df.filter((col("BR_OPN_FLG") == "Y") & (col("BR_TYP").isin(["R", "U", "I", "T", "C"])))
-    assert open_branches.filter(col("HGN_BR_ID") == "B005").count() == 0
-
-def test_TC07_percentile_aggregation(spark):
-    # Test percentile_approx
-    data = [Row(PRTY_BR="B001", dist_to_prty_br=x) for x in range(1, 101)]
-    df = spark.createDataFrame(data)
-    df.createOrReplaceTempView("rings_priority_cust")
-    percentile = spark.sql("""
-        SELECT PRTY_BR, percentile_approx(dist_to_prty_br, 0.8) as prtybr80
-        FROM rings_priority_cust
-        GROUP BY PRTY_BR
-    """).collect()[0].prtybr80
-    # 80th percentile of 1..100 is 80
-    assert percentile == 80
-
-def test_TC08_geodist_udf(geodist_udf, spark):
-    # NYC (40.7128, -74.0060) to LA (34.0522, -118.2437)
-    df = spark.createDataFrame([
-        Row(branchlat=40.7128, branchlong=-74.0060, custlat=34.0522, custlong=-118.2437)
+# =========================
+# TC07: Type mismatch in lat/long
+# =========================
+def test_type_mismatch_latlong(spark):
+    rings_cust_data = spark.createDataFrame([
+        Row(LP_ID="C1", PRTY_BR="B1", OPN_ACCT_FLG="Y", NBR_OF_MOS_OPN=12, custlat="not_a_float", custlong=-75.0, MOST_USED_BR="B2"),
     ])
-    df = df.withColumn("dist", geodist_udf("branchlat", "branchlong", "custlat", "custlong"))
-    dist = df.collect()[0].dist
-    # Should be around 2445 miles
-    assert abs(dist - 2445) < 10
-
-def test_TC09_schema(sample_branch_df):
-    expected_fields = {"HGN_BR_ID", "BR_TYP", "BR_OPN_FLG", "branchlat", "branchlong", "METRO_COMMUNITY_CDE", "BRICK_AND_MORTOR_NM", "CITY", "ST", "ZIP_CDE"}
-    actual_fields = set(sample_branch_df.columns)
-    assert expected_fields.issubset(actual_fields)
-
-def test_TC10_performance(spark, sample_branch_df, sample_customer_df, geodist_udf):
-    # Large DataFrame (simulate, but keep small for test)
-    big_branches = sample_branch_df
-    for _ in range(10):  # 2^10 = 1024 rows
-        big_branches = big_branches.union(big_branches)
-    big_customers = sample_customer_df
-    for _ in range(10):
-        big_customers = big_customers.union(big_customers)
-    import time
-    start = time.time()
-    df = big_customers.join(
-        big_branches,
-        big_customers.PRTY_BR == big_branches.HGN_BR_ID,
-        how="inner"
-    ).withColumn(
-        "dist_to_prty_br",
-        geodist_udf(col("branchlat"), col("branchlong"), col("custlat"), col("custlong"))
+    rings_branch_data = spark.createDataFrame([
+        Row(HGN_BR_ID="B1", BR_TYP="R", branchlat=40.1, branchlong=-75.1, BRICK_AND_MORTOR_NM="Branch 1", CITY="CityA", ST="PA", METRO_COMMUNITY_CDE="X"),
+    ])
+    priority_cust = rings_cust_data.join(
+        rings_branch_data,
+        rings_cust_data.PRTY_BR == rings_branch_data.HGN_BR_ID,
+        "inner"
     )
-    df.count()
-    end = time.time()
-    # Should finish within 10 seconds
-    assert (end - start) < 10
+    with pytest.raises(Exception):
+        priority_cust.withColumn(
+            "dist_to_prty_br",
+            geodist_udf("branchlat", "branchlong", "custlat", "custlong")
+        ).collect()
 
-```
+# =========================
+# TC08: Missing required columns
+# =========================
+def test_missing_columns(spark):
+    rings_cust_data = spark.createDataFrame([
+        Row(LP_ID="C1", OPN_ACCT_FLG="Y", NBR_OF_MOS_OPN=12, custlat=40.0, custlong=-75.0, MOST_USED_BR="B2"),
+    ])
+    rings_branch_data = spark.createDataFrame([
+        Row(HGN_BR_ID="B1", BR_TYP="R", branchlat=40.1, branchlong=-75.1, BRICK_AND_MORTOR_NM="Branch 1", CITY="CityA", ST="PA", METRO_COMMUNITY_CDE="X"),
+    ])
+    # PRTY_BR is missing from rings_cust_data
+    with pytest.raises(Exception):
+        rings_cust_data.join(
+            rings_branch_data,
+            rings_cust_data.PRTY_BR == rings_branch_data.HGN_BR_ID,
+            "inner"
+        ).collect()
 
+# =========================
+# TC09: Percentile calculation
+# =========================
+def test_percentile_calculation(spark):
+    data = [
+        Row(PRTY_BR="B1", dist_to_prty_br=1.0),
+        Row(PRTY_BR="B1", dist_to_prty_br=2.0),
+        Row(PRTY_BR="B1", dist_to_prty_br=3.0),
+        Row(PRTY_BR="B1", dist_to_prty_br=4.0),
+        Row(PRTY_BR="B1", dist_to_prty_br=5.0),
+    ]
+    df = spark.createDataFrame(data)
+    priority_ring = df.groupBy("PRTY_BR").agg(
+        F.expr("percentile_approx(dist_to_prty_br, 0.8)").alias("priority_ring")
+    ).withColumnRenamed("PRTY_BR", "TAMBR")
+    val = priority_ring.collect()[0]["priority_ring"]
+    assert abs(val - 4.2) < 0.1  # 80th percentile between 4 and 5
+
+# =========================
+# TC10: All distances NULL
+# =========================
+def test_all_distances_null(spark):
+    data = [
+        Row(PRTY_BR="B1", dist_to_prty_br=None),
+        Row(PRTY_BR="B1", dist_to_prty_br=None),
+    ]
+    df = spark.createDataFrame(data)
+    priority_ring = df.groupBy("PRTY_BR").agg(
+        F.expr("percentile_approx(dist_to_prty_br, 0.8)").alias("priority_ring")
+    ).withColumnRenamed("PRTY_BR", "TAMBR")
+    # Coalesce logic in main code sets to 0 if null
+    priority_ring = priority_ring.withColumn("priority_ring", F.coalesce("priority_ring", F.lit(0)))
+    assert priority_ring.collect()[0]["priority_ring"] == 0
+
+# =========================
 # 3. API Cost
-
+# =========================
 apiCost: 0.0023 USD
+```
