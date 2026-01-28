@@ -1,7 +1,7 @@
 # Agent Comparison Report: ABAP_To_PySpark_Reviewer
 
-Generated: 2026-01-28 15:31:54
-Execution ID: 50887c2a-9042-4aa2-ac5d-be0bf92ebb5f
+Generated: 2026-01-28 19:36:02
+Execution ID: 5107daf6-ca1c-4608-91c8-821dd63eca4a
 
 ## Files Compared
 - AAVA 1.0: ABAP_To_PySpark_Reviewer.txt
@@ -9,3 +9,4 @@ Execution ID: 50887c2a-9042-4aa2-ac5d-be0bf92ebb5f
 
 ## Outputs
 - 📄 TXT: `ABAP_To_PySpark_Reviewer.txt` - Full comparison report
+- 📊 CSV: `ABAP_To_PySpark_Reviewer.csv` - Structured comparison data
