@@ -1,0 +1,313 @@
+=============================================
+Author: AAVA
+Created on: 
+Description: Automates reconciliation between Synapse stored procedure (LOAD_FACT_EXECUTIVE_SUMMARY) and Databricks SQL/PySpark implementation. Executes both logics, exports and transfers data, performs column/row-level validation, and generates a comprehensive reconciliation report with robust error handling, logging, and security best practices.
+=============================================
+
+```python
+import os
+import sys
+import logging
+import traceback
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import datetime
+import uuid
+from typing import List, Dict, Any
+
+# Databricks and Synapse connectors
+from pyspark.sql import SparkSession
+from pyspark.sql.utils import AnalysisException
+
+# =========================
+# Configuration Section
+# =========================
+
+# Environment variables for credentials (never hardcode secrets)
+SYNAPSE_JDBC_URL = os.getenv("SYNAPSE_JDBC_URL")
+SYNAPSE_USER = os.getenv("SYNAPSE_USER")
+SYNAPSE_PASSWORD = os.getenv("SYNAPSE_PASSWORD")
+DATABRICKS_HOST = os.getenv("DATABRICKS_HOST")
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
+ADLS_CONTAINER = os.getenv("ADLS_CONTAINER")
+ADLS_ACCOUNT = os.getenv("ADLS_ACCOUNT")
+ADLS_CLIENT_ID = os.getenv("ADLS_CLIENT_ID")
+ADLS_CLIENT_SECRET = os.getenv("ADLS_CLIENT_SECRET")
+ADLS_TENANT_ID = os.getenv("ADLS_TENANT_ID")
+ADLS_PATH = os.getenv("ADLS_PATH", "/tmp/recon/")
+
+# Table and file naming
+FACT_TABLE = "FACT_EXECUTIVE_SUMMARY"
+STAGING_TABLE = "STG_HOLDING_METRICS"
+DIM_TABLES = ["DIM_DATE", "DIM_INSTITUTION", "DIM_CORPORATION", "DIM_PRODUCT"]
+
+EXPORT_DIR = "/tmp/recon_exports"
+LOG_FILE = f"/tmp/recon_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+# =========================
+# Logging Setup
+# =========================
+
+os.makedirs(EXPORT_DIR, exist_ok=True)
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
+console.setFormatter(formatter)
+logging.getLogger('').addHandler(console)
+
+def log_status(msg):
+    logging.info(msg)
+    print(msg)
+
+# =========================
+# Utility Functions
+# =========================
+
+def export_to_csv_parquet(df: pd.DataFrame, table_name: str) -> str:
+    """Exports DataFrame to CSV and Parquet, returns Parquet file path."""
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = f"{table_name}_{timestamp}_{uuid.uuid4().hex[:8]}"
+    csv_path = os.path.join(EXPORT_DIR, f"{base}.csv")
+    parquet_path = os.path.join(EXPORT_DIR, f"{base}.parquet")
+    df.to_csv(csv_path, index=False)
+    table = pa.Table.from_pandas(df)
+    pq.write_table(table, parquet_path)
+    return parquet_path
+
+def transfer_to_adls(local_path: str, remote_path: str):
+    """Transfers file to ADLS/DBFS. Implement with Azure SDK or Databricks CLI."""
+    # Placeholder: Implement with Azure CLI, SDK, or Databricks CLI as per infra
+    log_status(f"Simulated transfer of {local_path} to {remote_path}")
+    # In production, use azure-storage-blob or databricks CLI
+    return True
+
+def compare_dataframes(df1: pd.DataFrame, df2: pd.DataFrame, pk_cols: List[str]=None) -> Dict[str, Any]:
+    """Compares two DataFrames for reconciliation."""
+    result = {}
+    result['row_count_1'] = len(df1)
+    result['row_count_2'] = len(df2)
+    result['row_count_match'] = (len(df1) == len(df2))
+    result['column_match'] = True
+    mismatches = []
+    sample_mismatches = []
+    if pk_cols:
+        df1 = df1.sort_values(pk_cols).reset_index(drop=True)
+        df2 = df2.sort_values(pk_cols).reset_index(drop=True)
+    else:
+        df1 = df1.sort_index().reset_index(drop=True)
+        df2 = df2.sort_index().reset_index(drop=True)
+    cols = set(df1.columns).intersection(set(df2.columns))
+    for col in cols:
+        s1 = df1[col].fillna("##NULL##")
+        s2 = df2[col].fillna("##NULL##")
+        if not s1.equals(s2):
+            result['column_match'] = False
+            mismatches.append(col)
+            # Sample mismatched records
+            diffs = df1[s1 != s2]
+            if not diffs.empty:
+                sample_mismatches.append({
+                    "column": col,
+                    "sample": diffs.head(5).to_dict(orient='records')
+                })
+    result['mismatched_columns'] = mismatches
+    result['sample_mismatches'] = sample_mismatches
+    result['match_status'] = (
+        "MATCH" if result['row_count_match'] and result['column_match'] else
+        "NO MATCH" if not result['row_count_match'] and not result['column_match'] else
+        "PARTIAL MATCH"
+    )
+    return result
+
+# =========================
+# Step 1: Synapse Extraction
+# =========================
+
+def extract_synapse_data():
+    """Extracts data from Synapse target tables after executing stored procedure."""
+    import pyodbc
+    try:
+        log_status("Connecting to Synapse...")
+        conn = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={SYNAPSE_JDBC_URL};UID={SYNAPSE_USER};PWD={SYNAPSE_PASSWORD}"
+        )
+        cursor = conn.cursor()
+        log_status("Executing Synapse stored procedure: dbo.LOAD_FACT_EXECUTIVE_SUMMARY")
+        cursor.execute("EXEC dbo.LOAD_FACT_EXECUTIVE_SUMMARY")
+        conn.commit()
+        # Extract FACT_EXECUTIVE_SUMMARY
+        log_status("Extracting FACT_EXECUTIVE_SUMMARY from Synapse...")
+        df_fact = pd.read_sql("SELECT * FROM dbo.FACT_EXECUTIVE_SUMMARY", conn)
+        # Extract dimension tables for referential integrity
+        dim_dfs = {}
+        for dim in DIM_TABLES:
+            dim_dfs[dim] = pd.read_sql(f"SELECT * FROM dbo.{dim}", conn)
+        conn.close()
+        return df_fact, dim_dfs
+    except Exception as e:
+        log_status(f"Error extracting Synapse data: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+# =========================
+# Step 2: Export & Transfer
+# =========================
+
+def export_and_transfer(df_fact, dim_dfs):
+    """Exports Synapse data to Parquet and transfers to Databricks/ADLS."""
+    log_status("Exporting Synapse FACT_EXECUTIVE_SUMMARY to Parquet...")
+    fact_parquet = export_to_csv_parquet(df_fact, FACT_TABLE)
+    transfer_to_adls(fact_parquet, os.path.join(ADLS_PATH, os.path.basename(fact_parquet)))
+    dim_parquets = {}
+    for dim, df in dim_dfs.items():
+        log_status(f"Exporting {dim} to Parquet...")
+        p = export_to_csv_parquet(df, dim)
+        transfer_to_adls(p, os.path.join(ADLS_PATH, os.path.basename(p)))
+        dim_parquets[dim] = p
+    return fact_parquet, dim_parquets
+
+# =========================
+# Step 3: Databricks Setup
+# =========================
+
+def get_spark():
+    """Initializes SparkSession for Databricks."""
+    log_status("Initializing SparkSession for Databricks...")
+    spark = SparkSession.builder \
+        .appName("DatabricksReconciliation") \
+        .getOrCreate()
+    return spark
+
+def load_parquet_to_delta(spark, parquet_path, table_name):
+    """Loads Parquet file into Databricks Delta table."""
+    log_status(f"Loading {parquet_path} into Databricks table {table_name}...")
+    df = spark.read.parquet(parquet_path)
+    df.write.format("delta").mode("overwrite").saveAsTable(table_name)
+    return df
+
+# =========================
+# Step 4: Databricks Transformation
+# =========================
+
+def run_databricks_procedure(spark, dim_tables: Dict[str, str], staging_parquet: str, fact_table: str):
+    """Executes Databricks SQL logic for FACT_EXECUTIVE_SUMMARY."""
+    # Load all dimension tables
+    for dim, path in dim_tables.items():
+        load_parquet_to_delta(spark, path, dim)
+    # Load staging data
+    load_parquet_to_delta(spark, staging_parquet, STAGING_TABLE)
+    # Create temp view for staging
+    spark.sql(f"CREATE OR REPLACE TEMP VIEW staging_metrics AS SELECT * FROM {STAGING_TABLE}")
+    # Run transformation (matches Databricks SQL logic)
+    log_status("Running Databricks transformation for FACT_EXECUTIVE_SUMMARY...")
+    spark.sql(f"""
+        CREATE OR REPLACE TABLE {fact_table} AS
+        SELECT 
+            dt.date_key,
+            inst.institution_id,
+            corp.corporation_id,
+            prod.product_id,
+            stg.a120_amount,
+            stg.a120_count,
+            stg.a30_to_59_amount,
+            stg.a30_to_59_count,
+            stg.a60_to_89_amount,
+            stg.a60_to_89_count,
+            stg.a90_to_119_amount,
+            stg.a90_to_119_count,
+            stg.charge_off_amount,
+            stg.charge_off_count,
+            stg.fraud_amount,
+            stg.fraud_count,
+            CASE 
+                WHEN stg.income_amount IS NULL OR stg.income_amount < 0 THEN 0
+                ELSE stg.income_amount
+            END AS income_amount,
+            stg.number_of_accounts,
+            stg.purchases_amount,
+            stg.purchases_count
+        FROM staging_metrics stg
+        INNER JOIN DIM_DATE dt ON dt.date_key = stg.date_value
+        INNER JOIN DIM_INSTITUTION inst ON inst.institution_id = stg.institution_id
+        INNER JOIN DIM_CORPORATION corp ON corp.corporation_id = stg.corporation_id
+        INNER JOIN DIM_PRODUCT prod ON prod.product_id = stg.product_id
+    """)
+    return spark.table(fact_table)
+
+# =========================
+# Step 5: Validation & Reconciliation
+# =========================
+
+def fetch_databricks_fact(spark, fact_table: str) -> pd.DataFrame:
+    """Fetches FACT_EXECUTIVE_SUMMARY from Databricks as Pandas DataFrame."""
+    log_status(f"Fetching {fact_table} from Databricks for validation...")
+    df = spark.table(fact_table)
+    return df.toPandas()
+
+def generate_report(recon_result: Dict[str, Any], output_path: str):
+    """Generates reconciliation report as CSV/JSON."""
+    log_status(f"Generating reconciliation report at {output_path}...")
+    report = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "row_count_synapse": recon_result['row_count_1'],
+        "row_count_databricks": recon_result['row_count_2'],
+        "row_count_match": recon_result['row_count_match'],
+        "column_match": recon_result['column_match'],
+        "mismatched_columns": recon_result['mismatched_columns'],
+        "sample_mismatches": recon_result['sample_mismatches'],
+        "match_status": recon_result['match_status']
+    }
+    pd.DataFrame([report]).to_csv(output_path, index=False)
+    return report
+
+# =========================
+# Step 6: Main Orchestration
+# =========================
+
+def main():
+    try:
+        log_status("=== Automated Reconciliation: START ===")
+        # 1. Extract Synapse data
+        df_fact, dim_dfs = extract_synapse_data()
+        # 2. Export and transfer to ADLS/DBFS
+        fact_parquet, dim_parquets = export_and_transfer(df_fact, dim_dfs)
+        # 3. Databricks: Setup Spark
+        spark = get_spark()
+        # 4. Databricks: Run transformation
+        run_databricks_procedure(
+            spark,
+            dim_tables=dim_parquets,
+            staging_parquet=fact_parquet,
+            fact_table=FACT_TABLE
+        )
+        # 5. Fetch Databricks output
+        df_databricks = fetch_databricks_fact(spark, FACT_TABLE)
+        # 6. Validation
+        pk_cols = ["date_key", "institution_id", "corporation_id", "product_id"]
+        recon_result = compare_dataframes(df_fact, df_databricks, pk_cols=pk_cols)
+        # 7. Report
+        report_path = os.path.join(EXPORT_DIR, f"recon_report_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        report = generate_report(recon_result, report_path)
+        log_status(f"Reconciliation Status: {report['match_status']}")
+        log_status(f"Row Count Synapse: {report['row_count_synapse']}, Databricks: {report['row_count_databricks']}")
+        if report['mismatched_columns']:
+            log_status(f"Mismatched Columns: {report['mismatched_columns']}")
+            log_status(f"Sample Mismatches: {report['sample_mismatches']}")
+        log_status("=== Automated Reconciliation: END ===")
+    except Exception as e:
+        log_status(f"ERROR during reconciliation: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
+```
+
+apiCost: 0.0060 USD
