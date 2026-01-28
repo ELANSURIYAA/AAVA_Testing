@@ -1,0 +1,235 @@
+```
+=============================================
+Author:        Ascendion AVA+
+Created on:   
+Description:   Snowflake-compatible SQL script to create or recreate a backup of Employee master data, keyed by EmployeeNo, for troubleshooting, point-in-time comparison, and recovery use-cases.
+=============================================
+
+Test Case List:
+1. Test case ID: TC01
+   Test case description: Happy path - Employees with matching salary records are backed up correctly.
+   Expected outcome: EMPLOYEE_BKUP contains all employees with their corresponding salary.
+
+2. Test case ID: TC02
+   Test case description: Edge case - Employee with no matching salary record.
+   Expected outcome: EMPLOYEE_BKUP is empty.
+
+3. Test case ID: TC03
+   Test case description: Edge case - Salary record with no matching employee.
+   Expected outcome: EMPLOYEE_BKUP is empty.
+
+4. Test case ID: TC04
+   Test case description: Boundary case - Salary is 0.00.
+   Expected outcome: EMPLOYEE_BKUP contains the employee with salary 0.00.
+
+5. Test case ID: TC05
+   Test case description: Error handling - Duplicate EmployeeNo in EMPLOYEE.
+   Expected outcome: Error due to PRIMARY KEY constraint violation.
+
+6. Test case ID: TC06
+   Test case description: Null values - Null FirstName and LastName.
+   Expected outcome: EMPLOYEE_BKUP contains the employee with null names.
+
+7. Test case ID: TC07
+   Test case description: Null values - Null Salary.
+   Expected outcome: EMPLOYEE_BKUP contains the employee with null salary.
+
+8. Test case ID: TC08
+   Test case description: Empty input tables.
+   Expected outcome: EMPLOYEE_BKUP is empty.
+
+9. Test case ID: TC09
+   Test case description: Performance - Large dataset join.
+   Expected outcome: EMPLOYEE_BKUP contains all joined records, join completes within reasonable time (<2 seconds).
+
+10. Test case ID: TC10
+    Test case description: Data integrity - All joined records have correct fields.
+    Expected outcome: EMPLOYEE_BKUP contains correct values for all fields.
+
+Pytest Script for each test case:
+
+```python
+import pytest
+import snowflake.connector
+
+def setup_tables(conn, employee_data, salary_data):
+    cur = conn.cursor()
+    cur.execute("DROP TABLE IF EXISTS EMPLOYEE_BKUP")
+    cur.execute("DROP TABLE IF EXISTS EMPLOYEE")
+    cur.execute("DROP TABLE IF EXISTS SALARY")
+    cur.execute("""
+        CREATE TABLE EMPLOYEE (
+            EmployeeNo INT,
+            FirstName STRING,
+            LastName STRING,
+            DepartmentNo INT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE SALARY (
+            EmployeeNo INT,
+            Salary NUMBER(18,2)
+        )
+    """)
+    for emp in employee_data:
+        cur.execute(
+            "INSERT INTO EMPLOYEE VALUES (%s, %s, %s, %s)",
+            (emp['EmployeeNo'], emp['FirstName'], emp['LastName'], emp['DepartmentNo'])
+        )
+    for sal in salary_data:
+        cur.execute(
+            "INSERT INTO SALARY VALUES (%s, %s)",
+            (sal['EmployeeNo'], sal['Salary'])
+        )
+    cur.close()
+
+def run_backup_sql(conn):
+    cur = conn.cursor()
+    cur.execute("DROP TABLE IF EXISTS EMPLOYEE_BKUP")
+    cur.execute("""
+        CREATE TABLE EMPLOYEE_BKUP (
+            EmployeeNo INT PRIMARY KEY,
+            FirstName STRING,
+            LastName STRING,
+            DepartmentNo INT,
+            Salary NUMBER(18,2)
+        )
+    """)
+    cur.execute("""
+        INSERT INTO EMPLOYEE_BKUP (EmployeeNo, FirstName, LastName, DepartmentNo, Salary)
+        SELECT E.EmployeeNo, E.FirstName, E.LastName, E.DepartmentNo, S.Salary
+        FROM EMPLOYEE E
+        INNER JOIN SALARY S ON E.EmployeeNo = S.EmployeeNo
+    """)
+    cur.close()
+
+def fetch_bkup(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM EMPLOYEE_BKUP ORDER BY EmployeeNo")
+    results = cur.fetchall()
+    cur.close()
+    return results
+
+@pytest.fixture(scope="function")
+def snowflake_conn():
+    conn = snowflake.connector.connect(
+        user='YOUR_USER',
+        password='YOUR_PASSWORD',
+        account='YOUR_ACCOUNT',
+        warehouse='YOUR_WAREHOUSE',
+        database='YOUR_DATABASE',
+        schema='YOUR_SCHEMA'
+    )
+    yield conn
+    conn.close()
+
+def test_happy_path(snowflake_conn):
+    setup_tables(
+        snowflake_conn,
+        [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10},
+         {'EmployeeNo': 2, 'FirstName': 'Jane', 'LastName': 'Smith', 'DepartmentNo': 20}],
+        [{'EmployeeNo': 1, 'Salary': 50000.00}, {'EmployeeNo': 2, 'Salary': 60000.00}]
+    )
+    run_backup_sql(snowflake_conn)
+    results = fetch_bkup(snowflake_conn)
+    assert results == [
+        (1, 'John', 'Doe', 10, 50000.00),
+        (2, 'Jane', 'Smith', 20, 60000.00)
+    ]
+
+def test_employee_no_salary(snowflake_conn):
+    setup_tables(
+        snowflake_conn,
+        [{'EmployeeNo': 3, 'FirstName': 'Alice', 'LastName': 'Brown', 'DepartmentNo': 30}],
+        []
+    )
+    run_backup_sql(snowflake_conn)
+    results = fetch_bkup(snowflake_conn)
+    assert results == []
+
+def test_salary_no_employee(snowflake_conn):
+    setup_tables(
+        snowflake_conn,
+        [],
+        [{'EmployeeNo': 4, 'Salary': 70000.00}]
+    )
+    run_backup_sql(snowflake_conn)
+    results = fetch_bkup(snowflake_conn)
+    assert results == []
+
+def test_salary_zero(snowflake_conn):
+    setup_tables(
+        snowflake_conn,
+        [{'EmployeeNo': 5, 'FirstName': 'Bob', 'LastName': 'White', 'DepartmentNo': 40}],
+        [{'EmployeeNo': 5, 'Salary': 0.00}]
+    )
+    run_backup_sql(snowflake_conn)
+    results = fetch_bkup(snowflake_conn)
+    assert results == [(5, 'Bob', 'White', 40, 0.00)]
+
+def test_duplicate_employee_no(snowflake_conn):
+    setup_tables(
+        snowflake_conn,
+        [{'EmployeeNo': 6, 'FirstName': 'Sam', 'LastName': 'Green', 'DepartmentNo': 50},
+         {'EmployeeNo': 6, 'FirstName': 'Samuel', 'LastName': 'Green', 'DepartmentNo': 50}],
+        [{'EmployeeNo': 6, 'Salary': 80000.00}]
+    )
+    with pytest.raises(Exception):
+        run_backup_sql(snowflake_conn)
+
+def test_null_names(snowflake_conn):
+    setup_tables(
+        snowflake_conn,
+        [{'EmployeeNo': 7, 'FirstName': None, 'LastName': None, 'DepartmentNo': 60}],
+        [{'EmployeeNo': 7, 'Salary': 90000.00}]
+    )
+    run_backup_sql(snowflake_conn)
+    results = fetch_bkup(snowflake_conn)
+    assert results == [(7, None, None, 60, 90000.00)]
+
+def test_null_salary(snowflake_conn):
+    setup_tables(
+        snowflake_conn,
+        [{'EmployeeNo': 8, 'FirstName': 'Eve', 'LastName': 'Black', 'DepartmentNo': 70}],
+        [{'EmployeeNo': 8, 'Salary': None}]
+    )
+    run_backup_sql(snowflake_conn)
+    results = fetch_bkup(snowflake_conn)
+    assert results == [(8, 'Eve', 'Black', 70, None)]
+
+def test_empty_tables(snowflake_conn):
+    setup_tables(
+        snowflake_conn,
+        [],
+        []
+    )
+    run_backup_sql(snowflake_conn)
+    results = fetch_bkup(snowflake_conn)
+    assert results == []
+
+def test_large_dataset_performance(snowflake_conn):
+    import time
+    employee_data = [{'EmployeeNo': i, 'FirstName': f'First{i}', 'LastName': f'Last{i}', 'DepartmentNo': i % 10} for i in range(1, 10001)]
+    salary_data = [{'EmployeeNo': i, 'Salary': float(i * 1000)} for i in range(1, 10001)]
+    setup_tables(snowflake_conn, employee_data, salary_data)
+    start = time.time()
+    run_backup_sql(snowflake_conn)
+    elapsed = time.time() - start
+    results = fetch_bkup(snowflake_conn)
+    assert len(results) == 10000
+    assert elapsed < 2.0
+
+def test_data_integrity(snowflake_conn):
+    setup_tables(
+        snowflake_conn,
+        [{'EmployeeNo': 9, 'FirstName': 'Tom', 'LastName': 'Jones', 'DepartmentNo': 80}],
+        [{'EmployeeNo': 9, 'Salary': 100000.00}]
+    )
+    run_backup_sql(snowflake_conn)
+    results = fetch_bkup(snowflake_conn)
+    assert results == [(9, 'Tom', 'Jones', 80, 100000.00)]
+```
+
+API Cost Calculation:
+apiCost: 0.0042 USD
+```
