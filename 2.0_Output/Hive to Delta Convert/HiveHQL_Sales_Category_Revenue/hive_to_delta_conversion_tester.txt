@@ -1,0 +1,273 @@
+**1. Test Case Document**
+
+| Test Case ID | Description | Preconditions | Test Steps | Expected Result | Actual Result | Pass/Fail Status |
+|--------------|-------------|---------------|------------|----------------|--------------|------------------|
+| TC01 | Happy path: Multiple regions, categories, and sales in last 12 months | All tables populated with valid data for >1 region/category | 1. Setup tables with valid data<br>2. Run Delta query<br>3. Validate output | Top 3 categories by revenue per region, correct ranking, correct aggregations |  |  |
+| TC02 | Region with fewer than 3 categories | Region exists with only 1-2 categories with sales | 1. Setup tables with only 1-2 categories for a region<br>2. Run Delta query | Only available categories returned for that region, correct ranking |  |  |
+| TC03 | Region with no sales in last 12 months | Region exists but all sales are older than 12 months | 1. Setup tables with old sales<br>2. Run Delta query | Region not present in output |  |  |
+| TC04 | Category with zero revenue (quantity or price is zero) | Sales rows with quantity or price zero | 1. Setup tables with zero quantity/price<br>2. Run Delta query | Category included if in top 3, revenue shown as zero |  |  |
+| TC05 | Sales with NULL quantity or price | Sales rows with NULLs in quantity/price | 1. Setup tables with NULLs<br>2. Run Delta query | Such sales excluded from calculations |  |  |
+| TC06 | Empty sales table | Sales table is empty | 1. Setup empty sales table<br>2. Run Delta query | Empty result set |  |  |
+| TC07 | Ties in revenue between categories | Multiple categories with same revenue in a region | 1. Setup tables with tied revenue<br>2. Run Delta query | Categories with same revenue share rank, next rank skipped (RANK semantics) |  |  |
+| TC08 | Invalid data types (non-numeric quantity/price) | Sales rows with non-numeric values | 1. Setup tables with invalid types<br>2. Run Delta query | Query fails or such rows excluded |  |  |
+| TC09 | Sales on boundary date (exactly 12 months ago) | Sales row with order_date exactly at boundary | 1. Setup tables with boundary date<br>2. Run Delta query | Row included in calculation |  |  |
+| TC10 | Multiple orders for same product/category in region | Multiple sales for same product/category/region | 1. Setup tables with multiple orders<br>2. Run Delta query | Aggregations sum/avg correctly |  |  |
+
+---
+
+**2. Pytest Script for Each Test Case**
+
+```python
+import pytest
+from pyspark.sql import SparkSession
+from datetime import datetime, timedelta
+
+@pytest.fixture(scope="module")
+def spark():
+    return SparkSession.builder \
+        .master("local[1]") \
+        .appName("DeltaUnitTest") \
+        .getOrCreate()
+
+def setup_tables(spark, sales_data, products_data, regions_data):
+    sales_df = spark.createDataFrame(sales_data, ["order_id", "product_id", "region_id", "order_date", "quantity", "price"])
+    products_df = spark.createDataFrame(products_data, ["product_id", "category_id"])
+    regions_df = spark.createDataFrame(regions_data, ["region_id"])
+    sales_df.createOrReplaceTempView("sales")
+    products_df.createOrReplaceTempView("products")
+    regions_df.createOrReplaceTempView("regions")
+
+def run_query(spark):
+    query = """
+    WITH FilteredSales AS (
+        SELECT 
+            s.order_id,
+            s.product_id,
+            p.category_id,
+            r.region_id,
+            s.order_date,
+            CAST(s.quantity * s.price AS DECIMAL(10,2)) AS revenue
+        FROM sales s
+        JOIN products p ON s.product_id = p.product_id
+        JOIN regions r ON s.region_id = r.region_id
+        WHERE s.order_date >= DATE_ADD(CURRENT_DATE(), -365)
+    ),
+    CategoryRevenue AS (
+        SELECT 
+            f.region_id,
+            f.category_id,
+            SUM(f.revenue) AS total_revenue,
+            AVG(f.revenue) AS avg_order_value
+        FROM FilteredSales f
+        GROUP BY f.region_id, f.category_id
+    ),
+    RankedCategories AS (
+        SELECT 
+            cr.region_id,
+            cr.category_id,
+            cr.total_revenue,
+            cr.avg_order_value,
+            RANK() OVER (PARTITION BY cr.region_id ORDER BY cr.total_revenue DESC) AS category_rank
+        FROM CategoryRevenue cr
+    )
+    SELECT 
+        rc.region_id,
+        rc.category_id,
+        rc.total_revenue,
+        rc.avg_order_value,
+        rc.category_rank
+    FROM RankedCategories rc
+    WHERE rc.category_rank <= 3
+    ORDER BY rc.region_id, rc.category_rank
+    """
+    return spark.sql(query)
+
+# TC01: Happy path
+def test_happy_path(spark):
+    today = datetime.today().date()
+    sales_data = [
+        (1, 101, 1, today, 2, 50.0),
+        (2, 102, 2, today, 1, 100.0),
+        (3, 103, 1, today, 3, 30.0),
+        (4, 104, 1, today, 5, 10.0),
+        (5, 105, 2, today, 2, 200.0),
+    ]
+    products_data = [
+        (101, 10), (102, 20), (103, 10), (104, 30), (105, 20)
+    ]
+    regions_data = [
+        (1,), (2,)
+    ]
+    setup_tables(spark, sales_data, products_data, regions_data)
+    result = run_query(spark).collect()
+    assert len(result) > 0
+
+# TC02: Region with fewer than 3 categories
+def test_region_with_fewer_categories(spark):
+    today = datetime.today().date()
+    sales_data = [
+        (1, 101, 1, today, 2, 50.0),
+        (2, 102, 1, today, 1, 100.0),
+    ]
+    products_data = [
+        (101, 10), (102, 20)
+    ]
+    regions_data = [
+        (1,)
+    ]
+    setup_tables(spark, sales_data, products_data, regions_data)
+    result = run_query(spark).collect()
+    assert len(result) == 2
+    assert all(r.region_id == 1 for r in result)
+
+# TC03: Region with no sales in last 12 months
+def test_region_no_sales(spark):
+    today = datetime.today().date()
+    old_date = today - timedelta(days=366)
+    sales_data = [
+        (1, 101, 1, old_date, 2, 50.0)
+    ]
+    products_data = [
+        (101, 10)
+    ]
+    regions_data = [
+        (1,)
+    ]
+    setup_tables(spark, sales_data, products_data, regions_data)
+    result = run_query(spark).collect()
+    assert len(result) == 0
+
+# TC04: Category with zero revenue
+def test_category_zero_revenue(spark):
+    today = datetime.today().date()
+    sales_data = [
+        (1, 101, 1, today, 0, 50.0),
+        (2, 102, 1, today, 1, 0.0)
+    ]
+    products_data = [
+        (101, 10), (102, 20)
+    ]
+    regions_data = [
+        (1,)
+    ]
+    setup_tables(spark, sales_data, products_data, regions_data)
+    result = run_query(spark).collect()
+    assert all(r.total_revenue == 0 for r in result)
+
+# TC05: Sales with NULL quantity or price
+def test_null_quantity_price(spark):
+    today = datetime.today().date()
+    sales_data = [
+        (1, 101, 1, today, None, 50.0),
+        (2, 102, 1, today, 1, None)
+    ]
+    products_data = [
+        (101, 10), (102, 20)
+    ]
+    regions_data = [
+        (1,)
+    ]
+    setup_tables(spark, sales_data, products_data, regions_data)
+    result = run_query(spark).collect()
+    assert len(result) == 0
+
+# TC06: Empty sales table
+def test_empty_sales(spark):
+    products_data = [
+        (101, 10), (102, 20)
+    ]
+    regions_data = [
+        (1,)
+    ]
+    setup_tables(spark, [], products_data, regions_data)
+    result = run_query(spark).collect()
+    assert len(result) == 0
+
+# TC07: Ties in revenue between categories
+def test_tied_revenue(spark):
+    today = datetime.today().date()
+    sales_data = [
+        (1, 101, 1, today, 1, 100.0),
+        (2, 102, 1, today, 1, 100.0)
+    ]
+    products_data = [
+        (101, 10), (102, 20)
+    ]
+    regions_data = [
+        (1,)
+    ]
+    setup_tables(spark, sales_data, products_data, regions_data)
+    result = run_query(spark).collect()
+    ranks = [r.category_rank for r in result]
+    assert ranks.count(1) == 2  # Both categories should have rank 1
+
+# TC08: Invalid data types
+def test_invalid_data_types(spark):
+    today = datetime.today().date()
+    sales_data = [
+        (1, 101, 1, today, "two", 50.0),
+        (2, 102, 1, today, 1, "fifty")
+    ]
+    products_data = [
+        (101, 10), (102, 20)
+    ]
+    regions_data = [
+        (1,)
+    ]
+    with pytest.raises(Exception):
+        setup_tables(spark, sales_data, products_data, regions_data)
+        run_query(spark).collect()
+
+# TC09: Sales on boundary date
+def test_boundary_date(spark):
+    today = datetime.today().date()
+    boundary_date = today - timedelta(days=365)
+    sales_data = [
+        (1, 101, 1, boundary_date, 1, 100.0)
+    ]
+    products_data = [
+        (101, 10)
+    ]
+    regions_data = [
+        (1,)
+    ]
+    setup_tables(spark, sales_data, products_data, regions_data)
+    result = run_query(spark).collect()
+    assert len(result) == 1
+
+# TC10: Multiple orders for same product/category
+def test_multiple_orders_same_category(spark):
+    today = datetime.today().date()
+    sales_data = [
+        (1, 101, 1, today, 1, 100.0),
+        (2, 101, 1, today, 2, 100.0)
+    ]
+    products_data = [
+        (101, 10)
+    ]
+    regions_data = [
+        (1,)
+    ]
+    setup_tables(spark, sales_data, products_data, regions_data)
+    result = run_query(spark).collect()
+    assert result[0].total_revenue == 300.0
+    assert result[0].avg_order_value == 150.0
+```
+
+---
+
+**3. Test Execution Report Template**
+
+| Test Case ID | Description | Expected Result | Actual Result | Pass/Fail | Notes |
+|--------------|-------------|----------------|--------------|-----------|-------|
+| TC01         | Happy path  | ...            | ...          | ...       | ...   |
+| TC02         | ...         | ...            | ...          | ...       | ...   |
+| ...          | ...         | ...            | ...          | ...       | ...   |
+
+---
+
+**4. API Cost Consumed:** 2 tool calls (directory listing, file read)
+
+---
+
+**All content is complete and directly based on the actual files and instructions provided.**
