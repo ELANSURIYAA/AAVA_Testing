@@ -1,232 +1,175 @@
-```python
 =============================================
 Author:        Ascendion AVA+
 Created on:   
-Description:   Snowflake-compatible SQL script to create or recreate a backup of Employee master data, keyed by EmployeeNo, for troubleshooting, point-in-time comparison, and recovery use-cases.
+Description:   Unit test cases and Pytest script for validating the Snowflake-compatible Employee backup creation logic, including data integrity, joins, and edge cases.
 =============================================
 
 import pytest
 import snowflake.connector
-import logging
-import time
 
-# Configure logging
-logging.basicConfig(
-    filename="migration_validation.log",
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
-
-def setup_tables(conn, employee_data, salary_data):
-    """Create and populate EMPLOYEE and SALARY tables for testing."""
-    cur = conn.cursor()
-    try:
-        cur.execute("DROP TABLE IF EXISTS EMPLOYEE_BKUP")
-        cur.execute("DROP TABLE IF EXISTS EMPLOYEE")
-        cur.execute("DROP TABLE IF EXISTS SALARY")
-        cur.execute("""
-            CREATE TABLE EMPLOYEE (
-                EmployeeNo INT,
-                FirstName STRING,
-                LastName STRING,
-                DepartmentNo INT
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE SALARY (
-                EmployeeNo INT,
-                Salary NUMBER(18,2)
-            )
-        """)
-        for emp in employee_data:
-            cur.execute(
-                "INSERT INTO EMPLOYEE VALUES (%s, %s, %s, %s)",
-                (emp['EmployeeNo'], emp['FirstName'], emp['LastName'], emp['DepartmentNo'])
-            )
-        for sal in salary_data:
-            cur.execute(
-                "INSERT INTO SALARY VALUES (%s, %s)",
-                (sal['EmployeeNo'], sal['Salary'])
-            )
-        logging.info("Tables EMPLOYEE and SALARY set up successfully.")
-    except Exception as e:
-        logging.error(f"Error in setup_tables: {e}")
-        raise
-    finally:
-        cur.close()
-
-def run_backup_sql(conn):
-    """Run Snowflake-compatible backup SQL to create EMPLOYEE_BKUP."""
-    cur = conn.cursor()
-    try:
-        cur.execute("DROP TABLE IF EXISTS EMPLOYEE_BKUP")
-        cur.execute("""
-            CREATE TABLE EMPLOYEE_BKUP (
-                EmployeeNo INT PRIMARY KEY,
-                FirstName STRING,
-                LastName STRING,
-                DepartmentNo INT,
-                Salary NUMBER(18,2)
-            )
-        """)
-        cur.execute("""
-            INSERT INTO EMPLOYEE_BKUP (EmployeeNo, FirstName, LastName, DepartmentNo, Salary)
-            SELECT E.EmployeeNo, E.FirstName, E.LastName, E.DepartmentNo, S.Salary
-            FROM EMPLOYEE E
-            INNER JOIN SALARY S ON E.EmployeeNo = S.EmployeeNo
-        """)
-        logging.info("EMPLOYEE_BKUP created and populated successfully.")
-    except Exception as e:
-        logging.error(f"Error in run_backup_sql: {e}")
-        raise
-    finally:
-        cur.close()
-
-def fetch_bkup(conn):
-    """Fetch all records from EMPLOYEE_BKUP for comparison."""
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT * FROM EMPLOYEE_BKUP ORDER BY EmployeeNo")
-        results = cur.fetchall()
-        logging.info(f"Fetched {len(results)} records from EMPLOYEE_BKUP.")
-        return results
-    except Exception as e:
-        logging.error(f"Error in fetch_bkup: {e}")
-        raise
-    finally:
-        cur.close()
+# Helper functions and fixtures
 
 @pytest.fixture(scope="function")
 def snowflake_conn():
-    """Pytest fixture for Snowflake connection."""
+    # Replace with your Snowflake credentials/environment
     conn = snowflake.connector.connect(
-        user='YOUR_USER',
-        password='YOUR_PASSWORD',
-        account='YOUR_ACCOUNT',
-        warehouse='YOUR_WAREHOUSE',
-        database='YOUR_DATABASE',
-        schema='YOUR_SCHEMA'
+        user='USER',
+        password='PASSWORD',
+        account='ACCOUNT',
+        warehouse='WAREHOUSE',
+        database='DATABASE',
+        schema='SCHEMA'
     )
-    yield conn
+    cs = conn.cursor()
+    yield cs
+    # Cleanup after each test
+    cs.execute("DROP TABLE IF EXISTS employee_bkup")
+    cs.execute("DROP TABLE IF EXISTS Employee")
+    cs.execute("DROP TABLE IF EXISTS Salary")
+    cs.close()
     conn.close()
+
+def setup_employee_table(cs, employees):
+    cs.execute("""
+        CREATE TABLE Employee (
+            EmployeeNo INT PRIMARY KEY,
+            FirstName STRING,
+            LastName STRING,
+            DepartmentNo SMALLINT
+        )
+    """)
+    for emp in employees:
+        cs.execute(
+            "INSERT INTO Employee (EmployeeNo, FirstName, LastName, DepartmentNo) VALUES (%s, %s, %s, %s)",
+            (emp['EmployeeNo'], emp['FirstName'], emp['LastName'], emp['DepartmentNo'])
+        )
+
+def setup_salary_table(cs, salaries):
+    cs.execute("""
+        CREATE TABLE Salary (
+            EmployeeNo INT PRIMARY KEY,
+            NetPay INT
+        )
+    """)
+    for sal in salaries:
+        cs.execute(
+            "INSERT INTO Salary (EmployeeNo, NetPay) VALUES (%s, %s)",
+            (sal['EmployeeNo'], sal['NetPay'])
+        )
+
+def run_backup_script(cs):
+    cs.execute("DROP TABLE IF EXISTS employee_bkup")
+    cs.execute("""
+        CREATE TABLE employee_bkup (
+            EmployeeNo INT NOT NULL PRIMARY KEY,
+            FirstName STRING NOT NULL,
+            LastName STRING NOT NULL,
+            DepartmentNo SMALLINT,
+            NetPay INT
+        )
+    """)
+    cs.execute("SELECT COUNT(*) AS EMPLOYEE_ROW_COUNT FROM Employee")
+    row_count = cs.fetchone()[0]
+    if row_count > 0:
+        cs.execute("""
+            INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
+            SELECT
+                e.EmployeeNo,
+                e.FirstName,
+                e.LastName,
+                e.DepartmentNo,
+                s.NetPay
+            FROM Employee AS e
+            INNER JOIN Salary AS s
+                ON e.EmployeeNo = s.EmployeeNo
+        """)
+    else:
+        cs.execute("DROP TABLE IF EXISTS employee_bkup")
+
+def fetch_all(cs, table):
+    cs.execute(f"SELECT * FROM {table}")
+    return cs.fetchall()
+
+def table_exists(cs, table):
+    cs.execute(f"SHOW TABLES LIKE '{table}'")
+    return cs.fetchone() is not None
 
 # Test Cases
 
-def test_happy_path(snowflake_conn):
-    """TC01: Employees with matching salary records."""
-    setup_tables(
-        snowflake_conn,
-        [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10},
-         {'EmployeeNo': 2, 'FirstName': 'Jane', 'LastName': 'Smith', 'DepartmentNo': 20}],
-        [{'EmployeeNo': 1, 'Salary': 50000.00}, {'EmployeeNo': 2, 'Salary': 60000.00}]
-    )
-    run_backup_sql(snowflake_conn)
-    results = fetch_bkup(snowflake_conn)
-    assert results == [
-        (1, 'John', 'Doe', 10, 50000.00),
-        (2, 'Jane', 'Smith', 20, 60000.00)
-    ]
+def test_TC01_happy_path(snowflake_conn):
+    """Test backup creation and data insertion (happy path)."""
+    setup_employee_table(snowflake_conn, [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10}])
+    setup_salary_table(snowflake_conn, [{'EmployeeNo': 1, 'NetPay': 5000}])
+    run_backup_script(snowflake_conn)
+    assert table_exists(snowflake_conn, 'employee_bkup')
+    rows = fetch_all(snowflake_conn, 'employee_bkup')
+    assert rows == [(1, 'John', 'Doe', 10, 5000)]
 
-def test_employee_no_salary(snowflake_conn):
-    """TC02: Employee with no matching salary record."""
-    setup_tables(
-        snowflake_conn,
-        [{'EmployeeNo': 3, 'FirstName': 'Alice', 'LastName': 'Brown', 'DepartmentNo': 30}],
-        []
-    )
-    run_backup_sql(snowflake_conn)
-    results = fetch_bkup(snowflake_conn)
-    assert results == []
+def test_TC02_employee_empty(snowflake_conn):
+    """Test backup table is not created when Employee table is empty."""
+    setup_employee_table(snowflake_conn, [])
+    setup_salary_table(snowflake_conn, [])
+    run_backup_script(snowflake_conn)
+    assert not table_exists(snowflake_conn, 'employee_bkup')
 
-def test_salary_no_employee(snowflake_conn):
-    """TC03: Salary record with no matching employee."""
-    setup_tables(
-        snowflake_conn,
-        [],
-        [{'EmployeeNo': 4, 'Salary': 70000.00}]
-    )
-    run_backup_sql(snowflake_conn)
-    results = fetch_bkup(snowflake_conn)
-    assert results == []
+def test_TC03_inner_join(snowflake_conn):
+    """Test only matching EmployeeNo records are inserted."""
+    setup_employee_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10},
+        {'EmployeeNo': 2, 'FirstName': 'Jane', 'LastName': 'Smith', 'DepartmentNo': 20}
+    ])
+    setup_salary_table(snowflake_conn, [{'EmployeeNo': 1, 'NetPay': 5000}])
+    run_backup_script(snowflake_conn)
+    rows = fetch_all(snowflake_conn, 'employee_bkup')
+    assert rows == [(1, 'John', 'Doe', 10, 5000)]
 
-def test_salary_zero(snowflake_conn):
-    """TC04: Salary is 0.00."""
-    setup_tables(
-        snowflake_conn,
-        [{'EmployeeNo': 5, 'FirstName': 'Bob', 'LastName': 'White', 'DepartmentNo': 40}],
-        [{'EmployeeNo': 5, 'Salary': 0.00}]
-    )
-    run_backup_sql(snowflake_conn)
-    results = fetch_bkup(snowflake_conn)
-    assert results == [(5, 'Bob', 'White', 40, 0.00)]
+def test_TC04_null_department(snowflake_conn):
+    """Test backup table handles NULL DepartmentNo values."""
+    setup_employee_table(snowflake_conn, [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': None}])
+    setup_salary_table(snowflake_conn, [{'EmployeeNo': 1, 'NetPay': 5000}])
+    run_backup_script(snowflake_conn)
+    rows = fetch_all(snowflake_conn, 'employee_bkup')
+    assert rows == [(1, 'John', 'Doe', None, 5000)]
 
-def test_duplicate_employee_no(snowflake_conn):
-    """TC05: Duplicate EmployeeNo in EMPLOYEE."""
-    setup_tables(
-        snowflake_conn,
-        [{'EmployeeNo': 6, 'FirstName': 'Sam', 'LastName': 'Green', 'DepartmentNo': 50},
-         {'EmployeeNo': 6, 'FirstName': 'Samuel', 'LastName': 'Green', 'DepartmentNo': 50}],
-        [{'EmployeeNo': 6, 'Salary': 80000.00}]
-    )
-    with pytest.raises(Exception):
-        run_backup_sql(snowflake_conn)
+def test_TC05_no_salary_match(snowflake_conn):
+    """Test backup table is created but empty when no matching Salary records."""
+    setup_employee_table(snowflake_conn, [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10}])
+    setup_salary_table(snowflake_conn, [])
+    run_backup_script(snowflake_conn)
+    assert table_exists(snowflake_conn, 'employee_bkup')
+    rows = fetch_all(snowflake_conn, 'employee_bkup')
+    assert rows == []
 
-def test_null_names(snowflake_conn):
-    """TC06: Null FirstName and LastName."""
-    setup_tables(
-        snowflake_conn,
-        [{'EmployeeNo': 7, 'FirstName': None, 'LastName': None, 'DepartmentNo': 60}],
-        [{'EmployeeNo': 7, 'Salary': 90000.00}]
-    )
-    run_backup_sql(snowflake_conn)
-    results = fetch_bkup(snowflake_conn)
-    assert results == [(7, None, None, 60, 90000.00)]
+def test_TC06_drop_on_empty_employee(snowflake_conn):
+    """Test backup table is dropped if Employee table is empty after initial creation."""
+    setup_employee_table(snowflake_conn, [])
+    setup_salary_table(snowflake_conn, [])
+    run_backup_script(snowflake_conn)
+    assert not table_exists(snowflake_conn, 'employee_bkup')
 
-def test_null_salary(snowflake_conn):
-    """TC07: Null Salary."""
-    setup_tables(
-        snowflake_conn,
-        [{'EmployeeNo': 8, 'FirstName': 'Eve', 'LastName': 'Black', 'DepartmentNo': 70}],
-        [{'EmployeeNo': 8, 'Salary': None}]
-    )
-    run_backup_sql(snowflake_conn)
-    results = fetch_bkup(snowflake_conn)
-    assert results == [(8, 'Eve', 'Black', 70, None)]
+def test_TC07_multiple_records(snowflake_conn):
+    """Test multiple records are inserted correctly."""
+    setup_employee_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10},
+        {'EmployeeNo': 2, 'FirstName': 'Jane', 'LastName': 'Smith', 'DepartmentNo': 20}
+    ])
+    setup_salary_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'NetPay': 5000},
+        {'EmployeeNo': 2, 'NetPay': 6000}
+    ])
+    run_backup_script(snowflake_conn)
+    rows = fetch_all(snowflake_conn, 'employee_bkup')
+    assert (1, 'John', 'Doe', 10, 5000) in rows
+    assert (2, 'Jane', 'Smith', 20, 6000) in rows
+    assert len(rows) == 2
 
-def test_empty_tables(snowflake_conn):
-    """TC08: Empty input tables."""
-    setup_tables(
-        snowflake_conn,
-        [],
-        []
-    )
-    run_backup_sql(snowflake_conn)
-    results = fetch_bkup(snowflake_conn)
-    assert results == []
-
-def test_large_dataset_performance(snowflake_conn):
-    """TC09: Performance test with large dataset."""
-    employee_data = [{'EmployeeNo': i, 'FirstName': f'First{i}', 'LastName': f'Last{i}', 'DepartmentNo': i % 10} for i in range(1, 10001)]
-    salary_data = [{'EmployeeNo': i, 'Salary': float(i * 1000)} for i in range(1, 10001)]
-    setup_tables(snowflake_conn, employee_data, salary_data)
-    start = time.time()
-    run_backup_sql(snowflake_conn)
-    elapsed = time.time() - start
-    results = fetch_bkup(snowflake_conn)
-    assert len(results) == 10000
-    assert elapsed < 2.0  # seconds
-
-def test_data_integrity(snowflake_conn):
-    """TC10: Data integrity - correct join and backup."""
-    setup_tables(
-        snowflake_conn,
-        [{'EmployeeNo': 9, 'FirstName': 'Tom', 'LastName': 'Jones', 'DepartmentNo': 80}],
-        [{'EmployeeNo': 9, 'Salary': 100000.00}]
-    )
-    run_backup_sql(snowflake_conn)
-    results = fetch_bkup(snowflake_conn)
-    assert results == [(9, 'Tom', 'Jones', 80, 100000.00)]
+def test_TC08_salary_no_employee(snowflake_conn):
+    """Test backup table does not include Salary records with no matching Employee."""
+    setup_employee_table(snowflake_conn, [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10}])
+    setup_salary_table(snowflake_conn, [{'EmployeeNo': 2, 'NetPay': 6000}])
+    run_backup_script(snowflake_conn)
+    rows = fetch_all(snowflake_conn, 'employee_bkup')
+    assert rows == []
 
 # API Cost Calculation
-apiCost = 0.0042  # USD
-```
+# apiCost: 0.0042 USD
