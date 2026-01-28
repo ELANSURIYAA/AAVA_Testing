@@ -1,7 +1,7 @@
 # Agent Comparison Report: ABAP_to_PySpark_Converter
 
-Generated: 2026-01-28 15:28:10
-Execution ID: bdf83eea-a319-4f7e-acbe-340e8a92d6ea
+Generated: 2026-01-28 19:34:12
+Execution ID: fb6f84d3-436c-41c8-81a5-658d336a11a5
 
 ## Files Compared
 - AAVA 1.0: ABAP_to_PySpark_Converter.txt
@@ -9,3 +9,4 @@ Execution ID: bdf83eea-a319-4f7e-acbe-340e8a92d6ea
 
 ## Outputs
 - 📄 TXT: `ABAP_to_PySpark_Converter.txt` - Full comparison report
+- 📊 CSV: `ABAP_to_PySpark_Converter.csv` - Structured comparison data
