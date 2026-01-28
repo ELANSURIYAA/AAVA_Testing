@@ -1,0 +1,345 @@
+=============================================
+Author:      Ascendion  AAVA
+Created on:   
+Description:   Converts Azure Synapse stored procedure logic for dimension table population (DIM_INSTITUTION, DIM_CORPORATION, DIM_PRODUCT) into Microsoft Fabric SQL code using Delta Lake operations. Ensures idempotent loads, applies data quality filters, and optimizes for Fabric execution.
+=============================================
+
+## Test Case List
+
+| Test Case ID | Test Case | Description | Expected Outcome |
+|--------------|-----------|-------------|------------------|
+| TC01 | Happy path: All valid records | Test with a staging table containing valid, non-duplicate, non-null, non-legacy/test data for all dimensions | All valid records are inserted into respective dimension tables |
+| TC02 | Edge: NULL IDs in institution | Staging table contains records with NULL `institution_id` | Records with NULL `institution_id` are excluded from `DIM_INSTITUTION` |
+| TC03 | Edge: Short institution_id | Staging table contains records with `institution_id` length ≤ 3 | Records with short `institution_id` are excluded from `DIM_INSTITUTION` |
+| TC04 | Edge: corporation_name starts with 'TEST' | Staging table contains records where `corporation_name` starts with 'TEST' (case insensitive) | Records with such `corporation_name` are excluded from `DIM_CORPORATION` |
+| TC05 | Edge: processing_group is 'DEPRECATED' or 'LEGACY' | Staging table contains records with `processing_group` as 'DEPRECATED' or 'LEGACY' | Records with such `processing_group` are excluded from `DIM_PRODUCT` |
+| TC06 | Error: Missing columns in staging | Staging table missing required columns for one dimension | SQL error or handled gracefully, no records loaded for affected dimension |
+| TC07 | Edge: Empty staging table | Staging table is empty | No records inserted into any dimension tables |
+| TC08 | Edge: Duplicate records in staging | Staging table contains duplicate records | Only distinct records are inserted into dimension tables |
+| TC09 | Error: Invalid data types | Staging table contains invalid data types (e.g., string in integer column) | SQL error or handled gracefully, invalid records not loaded |
+| TC10 | Edge: Boundary values | Staging table contains boundary values (e.g., max length strings, min/max IDs) | Boundary records are processed correctly if they pass filters |
+
+---
+
+## Pytest Script for Each Test Case
+
+```python
+import pytest
+import pandas as pd
+from sqlalchemy import create_engine, MetaData, Table, Column, String, Integer
+from sqlalchemy.exc import SQLAlchemyError
+
+# Helper function to create in-memory SQLite tables for test simulation
+def setup_tables(engine):
+    metadata = MetaData()
+    Table('STG_DIMENSION_DATA', metadata,
+          Column('institution_id', String),
+          Column('institution', String),
+          Column('institution_name', String),
+          Column('corporation_id', String),
+          Column('corp_id', String),
+          Column('corporation', String),
+          Column('corporation_name', String),
+          Column('sub_corporation', String),
+          Column('sub_corporation_id', String),
+          Column('sub_corporation_name', String),
+          Column('master_corporation_dim_key', String),
+          Column('association', String),
+          Column('bin', String),
+          Column('company', String),
+          Column('company_id', String),
+          Column('company_name', String),
+          Column('product_id', String),
+          Column('product', String),
+          Column('product_description', String),
+          Column('sub_product', String),
+          Column('processing_code', String),
+          Column('processing_code_description', String),
+          Column('processing_group', String),
+    )
+    Table('DIM_INSTITUTION', metadata,
+          Column('institution_id', String),
+          Column('institution', String),
+          Column('institution_name', String),
+    )
+    Table('DIM_CORPORATION', metadata,
+          Column('corporation_id', String),
+          Column('corp_id', String),
+          Column('corporation', String),
+          Column('corporation_name', String),
+          Column('sub_corporation', String),
+          Column('sub_corporation_id', String),
+          Column('sub_corporation_name', String),
+          Column('master_corporation_dim_key', String),
+          Column('association', String),
+          Column('bin', String),
+          Column('company', String),
+          Column('company_id', String),
+          Column('company_name', String),
+    )
+    Table('DIM_PRODUCT', metadata,
+          Column('product_id', String),
+          Column('product', String),
+          Column('product_description', String),
+          Column('sub_product', String),
+          Column('processing_code', String),
+          Column('processing_code_description', String),
+          Column('processing_group', String),
+    )
+    metadata.create_all(engine)
+
+def teardown_tables(engine):
+    metadata = MetaData()
+    metadata.reflect(bind=engine)
+    metadata.drop_all(bind=engine)
+
+def run_fabric_merge_logic(engine):
+    # Simulate the Fabric SQL logic using Pandas and SQLAlchemy
+    conn = engine.connect()
+    stg_df = pd.read_sql('SELECT * FROM STG_DIMENSION_DATA', conn)
+
+    # 1. DIM_INSTITUTION
+    dim_inst_df = pd.read_sql('SELECT * FROM DIM_INSTITUTION', conn)
+    inst_source = stg_df[
+        (stg_df['institution_id'].notnull()) &
+        (stg_df['institution_id'].str.len() > 3)
+    ][['institution_id', 'institution', 'institution_name']].drop_duplicates()
+    new_inst = inst_source[~inst_source['institution_id'].isin(dim_inst_df['institution_id'])]
+    new_inst.to_sql('DIM_INSTITUTION', conn, if_exists='append', index=False)
+
+    # 2. DIM_CORPORATION
+    dim_corp_df = pd.read_sql('SELECT * FROM DIM_CORPORATION', conn)
+    corp_source = stg_df[
+        ~stg_df['corporation_name'].str.upper().str.startswith('TEST')
+    ][['corporation_id', 'corp_id', 'corporation', 'corporation_name',
+       'sub_corporation', 'sub_corporation_id', 'sub_corporation_name',
+       'master_corporation_dim_key', 'association', 'bin', 'company',
+       'company_id', 'company_name']].drop_duplicates()
+    new_corp = corp_source[~corp_source['corporation_id'].isin(dim_corp_df['corporation_id'])]
+    new_corp.to_sql('DIM_CORPORATION', conn, if_exists='append', index=False)
+
+    # 3. DIM_PRODUCT
+    dim_prod_df = pd.read_sql('SELECT * FROM DIM_PRODUCT', conn)
+    prod_source = stg_df[
+        ~stg_df['processing_group'].isin(['DEPRECATED', 'LEGACY'])
+    ][['product_id', 'product', 'product_description', 'sub_product',
+       'processing_code', 'processing_code_description', 'processing_group']].drop_duplicates()
+    new_prod = prod_source[~prod_source['product_id'].isin(dim_prod_df['product_id'])]
+    new_prod.to_sql('DIM_PRODUCT', conn, if_exists='append', index=False)
+
+    conn.close()
+
+# --- TEST CASES ---
+
+@pytest.fixture(scope="function")
+def db_engine():
+    engine = create_engine('sqlite:///:memory:')
+    setup_tables(engine)
+    yield engine
+    teardown_tables(engine)
+
+def insert_staging(engine, df):
+    df.to_sql('STG_DIMENSION_DATA', engine, if_exists='replace', index=False)
+
+def fetch_table(engine, table_name):
+    return pd.read_sql(f'SELECT * FROM {table_name}', engine)
+
+# TC01: Happy path
+def test_happy_path(db_engine):
+    data = [{
+        'institution_id': 'INST0001', 'institution': 'ABC', 'institution_name': 'Alpha Inst',
+        'corporation_id': 'CORP001', 'corp_id': 'C01', 'corporation': 'CorpA', 'corporation_name': 'Corporation A',
+        'sub_corporation': 'SubA', 'sub_corporation_id': 'SC01', 'sub_corporation_name': 'SubCorpA',
+        'master_corporation_dim_key': 'MCDK1', 'association': 'Assoc1', 'bin': 'BIN1', 'company': 'CompA',
+        'company_id': 'CMP01', 'company_name': 'Company A',
+        'product_id': 'PROD001', 'product': 'ProductA', 'product_description': 'DescA',
+        'sub_product': 'SubProdA', 'processing_code': 'PC01', 'processing_code_description': 'ProcDescA',
+        'processing_group': 'ACTIVE'
+    }]
+    df = pd.DataFrame(data)
+    insert_staging(db_engine, df)
+    run_fabric_merge_logic(db_engine)
+    inst = fetch_table(db_engine, 'DIM_INSTITUTION')
+    corp = fetch_table(db_engine, 'DIM_CORPORATION')
+    prod = fetch_table(db_engine, 'DIM_PRODUCT')
+    assert len(inst) == 1
+    assert len(corp) == 1
+    assert len(prod) == 1
+
+# TC02: NULL institution_id
+def test_null_institution_id(db_engine):
+    data = [{
+        'institution_id': None, 'institution': 'ABC', 'institution_name': 'Alpha Inst',
+        'corporation_id': 'CORP001', 'corp_id': 'C01', 'corporation': 'CorpA', 'corporation_name': 'Corporation A',
+        'sub_corporation': 'SubA', 'sub_corporation_id': 'SC01', 'sub_corporation_name': 'SubCorpA',
+        'master_corporation_dim_key': 'MCDK1', 'association': 'Assoc1', 'bin': 'BIN1', 'company': 'CompA',
+        'company_id': 'CMP01', 'company_name': 'Company A',
+        'product_id': 'PROD001', 'product': 'ProductA', 'product_description': 'DescA',
+        'sub_product': 'SubProdA', 'processing_code': 'PC01', 'processing_code_description': 'ProcDescA',
+        'processing_group': 'ACTIVE'
+    }]
+    df = pd.DataFrame(data)
+    insert_staging(db_engine, df)
+    run_fabric_merge_logic(db_engine)
+    inst = fetch_table(db_engine, 'DIM_INSTITUTION')
+    assert len(inst) == 0
+
+# TC03: Short institution_id
+def test_short_institution_id(db_engine):
+    data = [{
+        'institution_id': '123', 'institution': 'ABC', 'institution_name': 'Alpha Inst',
+        'corporation_id': 'CORP001', 'corp_id': 'C01', 'corporation': 'CorpA', 'corporation_name': 'Corporation A',
+        'sub_corporation': 'SubA', 'sub_corporation_id': 'SC01', 'sub_corporation_name': 'SubCorpA',
+        'master_corporation_dim_key': 'MCDK1', 'association': 'Assoc1', 'bin': 'BIN1', 'company': 'CompA',
+        'company_id': 'CMP01', 'company_name': 'Company A',
+        'product_id': 'PROD001', 'product': 'ProductA', 'product_description': 'DescA',
+        'sub_product': 'SubProdA', 'processing_code': 'PC01', 'processing_code_description': 'ProcDescA',
+        'processing_group': 'ACTIVE'
+    }]
+    df = pd.DataFrame(data)
+    insert_staging(db_engine, df)
+    run_fabric_merge_logic(db_engine)
+    inst = fetch_table(db_engine, 'DIM_INSTITUTION')
+    assert len(inst) == 0
+
+# TC04: corporation_name starts with 'TEST'
+def test_corporation_name_test_prefix(db_engine):
+    data = [{
+        'institution_id': 'INST0001', 'institution': 'ABC', 'institution_name': 'Alpha Inst',
+        'corporation_id': 'CORP001', 'corp_id': 'C01', 'corporation': 'CorpA', 'corporation_name': 'TEST Corporation',
+        'sub_corporation': 'SubA', 'sub_corporation_id': 'SC01', 'sub_corporation_name': 'SubCorpA',
+        'master_corporation_dim_key': 'MCDK1', 'association': 'Assoc1', 'bin': 'BIN1', 'company': 'CompA',
+        'company_id': 'CMP01', 'company_name': 'Company A',
+        'product_id': 'PROD001', 'product': 'ProductA', 'product_description': 'DescA',
+        'sub_product': 'SubProdA', 'processing_code': 'PC01', 'processing_code_description': 'ProcDescA',
+        'processing_group': 'ACTIVE'
+    }]
+    df = pd.DataFrame(data)
+    insert_staging(db_engine, df)
+    run_fabric_merge_logic(db_engine)
+    corp = fetch_table(db_engine, 'DIM_CORPORATION')
+    assert len(corp) == 0
+
+# TC05: processing_group is 'DEPRECATED' or 'LEGACY'
+@pytest.mark.parametrize("group", ['DEPRECATED', 'LEGACY'])
+def test_processing_group_excluded(db_engine, group):
+    data = [{
+        'institution_id': 'INST0001', 'institution': 'ABC', 'institution_name': 'Alpha Inst',
+        'corporation_id': 'CORP001', 'corp_id': 'C01', 'corporation': 'CorpA', 'corporation_name': 'Corporation A',
+        'sub_corporation': 'SubA', 'sub_corporation_id': 'SC01', 'sub_corporation_name': 'SubCorpA',
+        'master_corporation_dim_key': 'MCDK1', 'association': 'Assoc1', 'bin': 'BIN1', 'company': 'CompA',
+        'company_id': 'CMP01', 'company_name': 'Company A',
+        'product_id': 'PROD001', 'product': 'ProductA', 'product_description': 'DescA',
+        'sub_product': 'SubProdA', 'processing_code': 'PC01', 'processing_code_description': 'ProcDescA',
+        'processing_group': group
+    }]
+    df = pd.DataFrame(data)
+    insert_staging(db_engine, df)
+    run_fabric_merge_logic(db_engine)
+    prod = fetch_table(db_engine, 'DIM_PRODUCT')
+    assert len(prod) == 0
+
+# TC06: Missing columns in staging
+def test_missing_columns(db_engine):
+    # Remove required columns for DIM_PRODUCT
+    data = [{
+        'institution_id': 'INST0001', 'institution': 'ABC', 'institution_name': 'Alpha Inst',
+        'corporation_id': 'CORP001', 'corp_id': 'C01', 'corporation': 'CorpA', 'corporation_name': 'Corporation A',
+        'sub_corporation': 'SubA', 'sub_corporation_id': 'SC01', 'sub_corporation_name': 'SubCorpA',
+        'master_corporation_dim_key': 'MCDK1', 'association': 'Assoc1', 'bin': 'BIN1', 'company': 'CompA',
+        'company_id': 'CMP01', 'company_name': 'Company A',
+        # Missing product_id, product, etc.
+        'processing_group': 'ACTIVE'
+    }]
+    df = pd.DataFrame(data)
+    insert_staging(db_engine, df)
+    # Should raise KeyError or SQLAlchemyError
+    with pytest.raises((KeyError, SQLAlchemyError)):
+        run_fabric_merge_logic(db_engine)
+
+# TC07: Empty staging table
+def test_empty_staging_table(db_engine):
+    df = pd.DataFrame(columns=[
+        'institution_id', 'institution', 'institution_name',
+        'corporation_id', 'corp_id', 'corporation', 'corporation_name',
+        'sub_corporation', 'sub_corporation_id', 'sub_corporation_name',
+        'master_corporation_dim_key', 'association', 'bin', 'company',
+        'company_id', 'company_name', 'product_id', 'product',
+        'product_description', 'sub_product', 'processing_code',
+        'processing_code_description', 'processing_group'
+    ])
+    insert_staging(db_engine, df)
+    run_fabric_merge_logic(db_engine)
+    inst = fetch_table(db_engine, 'DIM_INSTITUTION')
+    corp = fetch_table(db_engine, 'DIM_CORPORATION')
+    prod = fetch_table(db_engine, 'DIM_PRODUCT')
+    assert len(inst) == 0
+    assert len(corp) == 0
+    assert len(prod) == 0
+
+# TC08: Duplicate records in staging
+def test_duplicate_records(db_engine):
+    data = [{
+        'institution_id': 'INST0001', 'institution': 'ABC', 'institution_name': 'Alpha Inst',
+        'corporation_id': 'CORP001', 'corp_id': 'C01', 'corporation': 'CorpA', 'corporation_name': 'Corporation A',
+        'sub_corporation': 'SubA', 'sub_corporation_id': 'SC01', 'sub_corporation_name': 'SubCorpA',
+        'master_corporation_dim_key': 'MCDK1', 'association': 'Assoc1', 'bin': 'BIN1', 'company': 'CompA',
+        'company_id': 'CMP01', 'company_name': 'Company A',
+        'product_id': 'PROD001', 'product': 'ProductA', 'product_description': 'DescA',
+        'sub_product': 'SubProdA', 'processing_code': 'PC01', 'processing_code_description': 'ProcDescA',
+        'processing_group': 'ACTIVE'
+    }]
+    df = pd.DataFrame(data * 3)  # 3 duplicates
+    insert_staging(db_engine, df)
+    run_fabric_merge_logic(db_engine)
+    inst = fetch_table(db_engine, 'DIM_INSTITUTION')
+    corp = fetch_table(db_engine, 'DIM_CORPORATION')
+    prod = fetch_table(db_engine, 'DIM_PRODUCT')
+    assert len(inst) == 1
+    assert len(corp) == 1
+    assert len(prod) == 1
+
+# TC09: Invalid data types
+def test_invalid_data_types(db_engine):
+    data = [{
+        'institution_id': 12345, 'institution': 'ABC', 'institution_name': 'Alpha Inst',  # int instead of str
+        'corporation_id': 'CORP001', 'corp_id': 'C01', 'corporation': 'CorpA', 'corporation_name': 'Corporation A',
+        'sub_corporation': 'SubA', 'sub_corporation_id': 'SC01', 'sub_corporation_name': 'SubCorpA',
+        'master_corporation_dim_key': 'MCDK1', 'association': 'Assoc1', 'bin': 'BIN1', 'company': 'CompA',
+        'company_id': 'CMP01', 'company_name': 'Company A',
+        'product_id': 'PROD001', 'product': 'ProductA', 'product_description': 'DescA',
+        'sub_product': 'SubProdA', 'processing_code': 'PC01', 'processing_code_description': 'ProcDescA',
+        'processing_group': 'ACTIVE'
+    }]
+    df = pd.DataFrame(data)
+    insert_staging(db_engine, df)
+    # Should raise TypeError or SQLAlchemyError
+    with pytest.raises((TypeError, SQLAlchemyError)):
+        run_fabric_merge_logic(db_engine)
+
+# TC10: Boundary values
+def test_boundary_values(db_engine):
+    data = [{
+        'institution_id': 'I'*255, 'institution': 'A'*255, 'institution_name': 'N'*255,
+        'corporation_id': 'C'*255, 'corp_id': 'C01', 'corporation': 'CorpA', 'corporation_name': 'Corporation A',
+        'sub_corporation': 'SubA', 'sub_corporation_id': 'SC01', 'sub_corporation_name': 'SubCorpA',
+        'master_corporation_dim_key': 'MCDK1', 'association': 'Assoc1', 'bin': 'BIN1', 'company': 'CompA',
+        'company_id': 'CMP01', 'company_name': 'Company A',
+        'product_id': 'P'*255, 'product': 'ProductA', 'product_description': 'DescA',
+        'sub_product': 'SubProdA', 'processing_code': 'PC01', 'processing_code_description': 'ProcDescA',
+        'processing_group': 'ACTIVE'
+    }]
+    df = pd.DataFrame(data)
+    insert_staging(db_engine, df)
+    run_fabric_merge_logic(db_engine)
+    inst = fetch_table(db_engine, 'DIM_INSTITUTION')
+    corp = fetch_table(db_engine, 'DIM_CORPORATION')
+    prod = fetch_table(db_engine, 'DIM_PRODUCT')
+    assert len(inst) == 1
+    assert len(corp) == 1
+    assert len(prod) == 1
+```
+
+---
+
+**API Cost Consumed in dollars:** 0.0047 USD
