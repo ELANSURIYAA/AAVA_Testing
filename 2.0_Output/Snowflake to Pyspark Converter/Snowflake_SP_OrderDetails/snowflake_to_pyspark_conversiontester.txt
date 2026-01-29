@@ -1,0 +1,211 @@
+Test Case List:
+
+Test Case ID: TC01
+Test case description: Happy path - Orders from the past month for multiple customers.
+Expected outcome: The summary DataFrame correctly aggregates total amount and order count for each customer.
+
+Test Case ID: TC02
+Test case description: Edge case - Empty orders DataFrame.
+Expected outcome: The summary DataFrame is empty.
+
+Test Case ID: TC03
+Test case description: Edge case - Orders DataFrame contains null values in Amount.
+Expected outcome: The summary DataFrame correctly handles nulls (sums ignore nulls, counts include all rows).
+
+Test Case ID: TC04
+Test case description: Edge case - Orders DataFrame contains only orders outside the past month.
+Expected outcome: The summary DataFrame is empty.
+
+Test Case ID: TC05
+Test case description: Edge case - Orders DataFrame contains only one customer.
+Expected outcome: The summary DataFrame contains only one row with correct aggregation.
+
+Test Case ID: TC06
+Test case description: Error handling - Orders DataFrame missing required columns.
+Expected outcome: The code raises an appropriate exception.
+
+Test Case ID: TC07
+Test case description: Boundary condition - Orders on the exact boundary date (30 days ago).
+Expected outcome: Orders with OrderDate exactly 30 days ago are included in the aggregation.
+
+Test Case ID: TC08
+Test case description: Edge case - Orders DataFrame with duplicate OrderIDs.
+Expected outcome: The summary DataFrame aggregates all rows regardless of duplicate OrderIDs.
+
+Pytest Script for each test case:
+
+```python
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql import Row
+from pyspark.sql.functions import col, sum as _sum, count as _count, expr
+import datetime
+
+@pytest.fixture(scope="function")
+def spark():
+    spark = SparkSession.builder.master("local[1]").appName("OrderDetailSummaryTest").getOrCreate()
+    yield spark
+    spark.stop()
+
+def create_orders_df(spark, rows):
+    return spark.createDataFrame(rows)
+
+def run_order_summary(orders_df):
+    # Filter orders from the past month
+    orders_last_month_df = (
+        orders_df
+        .filter(
+            col("OrderDate") >= expr("date_sub(current_timestamp(), 30)")
+        )
+    )
+    # Aggregate total amount and order count per customer
+    customer_summary_df = (
+        orders_last_month_df
+        .groupBy("CustomerID")
+        .agg(
+            _sum("Amount").alias("TotalAmount"),
+            count("*").alias("OrderCount")
+        )
+    )
+    return customer_summary_df
+
+# TC01: Happy path - Orders from the past month for multiple customers
+def test_happy_path_multiple_customers(spark):
+    now = datetime.datetime.now()
+    rows = [
+        Row(OrderID=1, CustomerID=101, OrderDate=now, Amount=100.0),
+        Row(OrderID=2, CustomerID=101, OrderDate=now, Amount=200.0),
+        Row(OrderID=3, CustomerID=102, OrderDate=now, Amount=300.0),
+        Row(OrderID=4, CustomerID=102, OrderDate=now, Amount=400.0),
+    ]
+    orders_df = create_orders_df(spark, rows)
+    result_df = run_order_summary(orders_df)
+    result = {row['CustomerID']: (row['TotalAmount'], row['OrderCount']) for row in result_df.collect()}
+    assert result[101] == (300.0, 2)
+    assert result[102] == (700.0, 2)
+
+# TC02: Edge case - Empty orders DataFrame
+def test_empty_orders_df(spark):
+    orders_df = create_orders_df(spark, [])
+    result_df = run_order_summary(orders_df)
+    assert result_df.count() == 0
+
+# TC03: Edge case - Orders DataFrame contains null values in Amount
+def test_orders_with_null_amount(spark):
+    now = datetime.datetime.now()
+    rows = [
+        Row(OrderID=1, CustomerID=101, OrderDate=now, Amount=None),
+        Row(OrderID=2, CustomerID=101, OrderDate=now, Amount=200.0),
+        Row(OrderID=3, CustomerID=102, OrderDate=now, Amount=None),
+        Row(OrderID=4, CustomerID=102, OrderDate=now, Amount=400.0),
+    ]
+    orders_df = create_orders_df(spark, rows)
+    result_df = run_order_summary(orders_df)
+    result = {row['CustomerID']: (row['TotalAmount'], row['OrderCount']) for row in result_df.collect()}
+    assert result[101] == (200.0, 2)
+    assert result[102] == (400.0, 2)
+
+# TC04: Edge case - Orders DataFrame contains only orders outside the past month
+def test_orders_outside_past_month(spark):
+    old_date = datetime.datetime.now() - datetime.timedelta(days=31)
+    rows = [
+        Row(OrderID=1, CustomerID=101, OrderDate=old_date, Amount=100.0),
+        Row(OrderID=2, CustomerID=102, OrderDate=old_date, Amount=200.0),
+    ]
+    orders_df = create_orders_df(spark, rows)
+    result_df = run_order_summary(orders_df)
+    assert result_df.count() == 0
+
+# TC05: Edge case - Orders DataFrame contains only one customer
+def test_single_customer(spark):
+    now = datetime.datetime.now()
+    rows = [
+        Row(OrderID=1, CustomerID=101, OrderDate=now, Amount=100.0),
+        Row(OrderID=2, CustomerID=101, OrderDate=now, Amount=200.0),
+    ]
+    orders_df = create_orders_df(spark, rows)
+    result_df = run_order_summary(orders_df)
+    result = result_df.collect()
+    assert len(result) == 1
+    assert result[0]['CustomerID'] == 101
+    assert result[0]['TotalAmount'] == 300.0
+    assert result[0]['OrderCount'] == 2
+
+# TC06: Error handling - Orders DataFrame missing required columns
+def test_missing_required_columns(spark):
+    now = datetime.datetime.now()
+    # Missing 'Amount' column
+    rows = [
+        Row(OrderID=1, CustomerID=101, OrderDate=now),
+    ]
+    orders_df = spark.createDataFrame(rows)
+    with pytest.raises(Exception):
+        run_order_summary(orders_df)
+
+# TC07: Boundary condition - Orders on the exact boundary date (30 days ago)
+def test_orders_on_boundary_date(spark):
+    boundary_date = datetime.datetime.now() - datetime.timedelta(days=30)
+    rows = [
+        Row(OrderID=1, CustomerID=101, OrderDate=boundary_date, Amount=100.0),
+        Row(OrderID=2, CustomerID=101, OrderDate=boundary_date, Amount=200.0),
+    ]
+    orders_df = create_orders_df(spark, rows)
+    result_df = run_order_summary(orders_df)
+    result = result_df.collect()
+    assert len(result) == 1
+    assert result[0]['CustomerID'] == 101
+    assert result[0]['TotalAmount'] == 300.0
+    assert result[0]['OrderCount'] == 2
+
+# TC08: Edge case - Orders DataFrame with duplicate OrderIDs
+def test_duplicate_order_ids(spark):
+    now = datetime.datetime.now()
+    rows = [
+        Row(OrderID=1, CustomerID=101, OrderDate=now, Amount=100.0),
+        Row(OrderID=1, CustomerID=101, OrderDate=now, Amount=200.0),
+    ]
+    orders_df = create_orders_df(spark, rows)
+    result_df = run_order_summary(orders_df)
+    result = result_df.collect()
+    assert len(result) == 1
+    assert result[0]['CustomerID'] == 101
+    assert result[0]['TotalAmount'] == 300.0
+    assert result[0]['OrderCount'] == 2
+```
+
+API cost consumed for this call:
+- List files in directory: 1 unit
+- Read a file's content: 1 unit
+Total cost: 2 units
+
+Syntax Change Detection & Manual Interventions:
+
+1. SQL function conversions:
+   - DATEADD in Snowflake → expr("date_sub(current_timestamp(), 30)") in PySpark.
+   - SUM, COUNT in SQL → _sum, _count in PySpark.
+   - Temporary tables replaced by ephemeral DataFrames.
+   - Cursor logic replaced by DataFrame collect() and iteration.
+
+2. Data type transformations:
+   - SQL types (STRING, NUMBER) → PySpark schema inferred from Row objects (StringType, DoubleType, etc.).
+   - No explicit VARIANT/OBJECT/ARRAY handling in this conversion.
+
+3. Query structure modifications:
+   - No explicit JOINs in the original or converted code.
+   - No QUALIFY, SEMI JOIN, ANTI JOIN in this use case.
+
+4. Aggregation and window function changes:
+   - No window functions used; groupBy and aggregation used instead.
+
+5. Handling of NULL values and case sensitivity:
+   - SUM ignores nulls by default in PySpark.
+   - COUNT counts all rows, including those with nulls in Amount.
+
+Recommended Manual Interventions:
+- Performance: Consider repartitioning DataFrames if data is large, or using broadcast joins if joining with small dimension tables.
+- Edge cases: If Amount can be null, ensure business logic matches expectations (e.g., sum ignores nulls).
+- Error handling: Add try/except blocks for missing columns or schema mismatches.
+- If semi-structured data (VARIANT/OBJECT/ARRAY) is present, use PySpark's from_json or explode functions.
+- For very large datasets, consider caching intermediate DataFrames.
+
+All requested outputs are included above.
