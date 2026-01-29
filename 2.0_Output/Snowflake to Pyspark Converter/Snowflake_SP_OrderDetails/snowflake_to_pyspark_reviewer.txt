@@ -1,0 +1,95 @@
+Summary
+--------
+This review compares the original Snowflake stored procedure `sp_Order_Detail` with its PySpark conversion. The Snowflake procedure creates a temporary table of orders from the past month, iterates over each customer using a cursor, and prints a summary of total amount and order count per customer. The PySpark implementation uses DataFrame operations to filter, aggregate, and print customer summaries. The conversion preserves business logic, adapts SQL operations to Spark, and leverages Spark's distributed processing.
+
+Conversion Accuracy
+-------------------
+- The PySpark code accurately filters orders from the past month using `col("OrderDate") >= expr("date_sub(current_timestamp(), 30)")`, matching the Snowflake `WHERE OrderDate >= DATEADD(MONTH, -1, CURRENT_TIMESTAMP())`.
+- Aggregation (`SUM(Amount), COUNT(*)`) is performed per customer in both implementations.
+- Iteration over customers and printing summaries is preserved via DataFrame `.collect()` and Python `print`.
+- Temporary table logic is replaced by ephemeral DataFrames, which is idiomatic in PySpark.
+- No business logic is lost in the conversion; all core steps are present.
+
+Discrepancies and Issues
+------------------------
+- **Temporary Table**: Snowflake uses a temporary table (`TempOrders`), while PySpark uses DataFrames. This is acceptable and preferred in Spark, but explicit cleanup (`DROP TABLE`) is not needed in PySpark.
+- **Cursor Iteration**: Snowflake uses a cursor to iterate customers; PySpark collects the result and iterates in Python. For very large datasets, `.collect()` may be inefficient.
+- **Error Handling**: The Snowflake procedure does not handle errors explicitly; neither does the PySpark code. If required columns are missing, PySpark will raise an exception.
+- **Printing**: Snowflake uses `PRINT` statements; PySpark uses Python `print`. For production, logging may be preferable.
+- **Date Calculation**: Snowflake uses `DATEADD(MONTH, -1, CURRENT_TIMESTAMP())`; PySpark uses `date_sub(current_timestamp(), 30)`. This is a close match, but if the business logic expects "last calendar month" rather than "last 30 days", this could be a subtle difference.
+- **Data Types**: Snowflake explicitly defines column types; PySpark infers schema from input data. This can cause issues if input data types are inconsistent.
+
+Optimization Suggestions
+------------------------
+- **Avoid `.collect()` for Large DataFrames**: For large customer bases, consider using `.toLocalIterator()` or writing results to storage rather than printing.
+- **Partitioning**: If the dataset is large, repartition by `CustomerID` before aggregation to improve parallelism.
+- **Caching**: If multiple operations are performed on `orders_last_month_df`, consider caching it.
+- **Error Handling**: Add try/except blocks to catch missing columns or schema mismatches.
+- **Schema Enforcement**: Explicitly define schema when loading data to prevent type inference errors.
+- **Date Logic**: If business logic requires "last calendar month", adjust date filtering accordingly.
+- **Logging**: Replace `print` with structured logging for production use.
+
+Overall Assessment
+------------------
+The PySpark conversion is accurate and complete, preserving all core business logic and data processing steps. The use of DataFrame operations is idiomatic and leverages Spark's distributed processing. Minor differences in date calculation and lack of error handling are noted but do not affect correctness for most use cases. The code is efficient for moderate-sized datasets, but `.collect()` may be a bottleneck for large customer bases.
+
+Recommendations
+---------------
+1. For large datasets, avoid `.collect()` and consider writing results to storage or using `.toLocalIterator()`.
+2. Add error handling for missing columns and schema mismatches.
+3. Explicitly define schema when loading data.
+4. Review date filtering logic to ensure it matches business requirements ("last 30 days" vs "last calendar month").
+5. Replace `print` with logging for production deployments.
+6. Consider repartitioning and caching DataFrames for performance if needed.
+
+API Cost Consumed
+-----------------
+- List files in directory: 1 unit
+- Read a file's content: 1 unit
+Total cost: 2 units
+
+Complete content of Snowflake stored procedure for reference:
+------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE sp_Order_Detail()
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+AS
+$$
+{
+    // Variable Declarations
+    var TotalAmount;
+    var OrderCount;
+    var CustomerId;
+
+    // Create a temporary table
+    snowflake.execute({sqlText: "CREATE TEMPORARY TABLE TempOrders (OrderID INT, CustomerID INT, OrderDate TIMESTAMP_NTZ, Amount DECIMAL(18,2))"});
+
+    // Insert data into the temporary table
+    snowflake.execute({sqlText: "INSERT INTO TempOrders (OrderID, CustomerID, OrderDate, Amount) SELECT OrderID, CustomerID, OrderDate, Amount FROM Orders WHERE OrderDate >= DATEADD(MONTH, -1, CURRENT_TIMESTAMP())"});
+
+    // Using a Cursor to iterate through each customer
+    var stmt = snowflake.createStatement({sqlText: "SELECT DISTINCT CustomerID FROM TempOrders"});
+    var rs = stmt.execute();
+
+    while (rs.next()) {
+        CustomerId = rs.getColumnValue(1);
+
+        // Calculate total amount and order count for the current customer
+        stmt = snowflake.createStatement({sqlText: "SELECT SUM(Amount), COUNT(*) FROM TempOrders WHERE CustomerID = ?"});
+        stmt.bindValue(1, CustomerId);
+        rs = stmt.execute();
+
+        if (rs.next()) {
+            TotalAmount = rs.getColumnValue(1);
+            OrderCount = rs.getColumnValue(2);
+
+            // Print customer summary
+            var summary = 'CustomerID: ' + CustomerId + ' | TotalAmount: ' + TotalAmount + ' | OrderCount: ' + OrderCount;
+            snowflake.execute({sqlText: "PRINT '" + summary + "'"});
+        }
+    }
+
+    // Clean up the temporary table
+    snowflake.execute({sqlText: "DROP TABLE IF EXISTS TempOrders"});
+}
+$$;
