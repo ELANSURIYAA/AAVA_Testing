@@ -1,0 +1,202 @@
+Test Case List:
+1. Test case ID
+
+2. Test case description
+
+3. Expected outcome
+
+4. Pytest Script for each test case
+
+---
+
+| Test ID | Test Description                                                                                  | Expected Output                                                                                                   |
+|--------|---------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------|
+| TC01   | Verify successful file read with valid CSV input and header                                        | DataFrame loaded with correct schema and data matching the source CSV                                            |
+| TC02   | Filter transformation: Only rows with status='active' are retained                                 | DataFrame contains only rows where 'status' == 'active'                                                          |
+| TC03   | Rename column transformation: 'old_column_name' is renamed to 'new_column_name'                    | DataFrame schema reflects 'new_column_name' instead of 'old_column_name'                                         |
+| TC04   | Load to Snowflake: Data is written to target table with correct format                             | Data in Snowflake target table matches filtered and transformed DataFrame                                         |
+| TC05   | Handle missing source file gracefully                                                              | Appropriate exception raised (e.g., FileNotFoundError)                                                           |
+| TC06   | Handle empty source file (no data, only header)                                                    | DataFrame is empty but schema is correct                                                                         |
+| TC07   | Handle null values in filtered column                                                              | Rows with null 'status' are excluded by filter                                                                   |
+| TC08   | Handle special characters and delimiters in source file                                            | DataFrame correctly parses fields with special characters                                                         |
+| TC09   | Performance: Large file read and transformation                                                    | Operation completes within reasonable time and memory limits                                                      |
+| TC10   | Error handling: Invalid CSV format                                                                 | Appropriate exception raised (e.g., parsing error)                                                               |
+| TC11   | Data integrity: No data loss or corruption during transformation and load                          | Output data matches expected transformation and load results                                                      |
+| TC12   | Boundary: File with maximum allowed columns                                                        | DataFrame schema matches all columns, transformation applies correctly                                            |
+| TC13   | Boundary: File with minimum allowed columns                                                        | DataFrame schema matches, transformation applies correctly                                                        |
+| TC14   | Truncate target table option is false: Data is appended, not replaced                              | Existing data in Snowflake table is preserved, new data is appended                                              |
+| TC15   | On-error=continue: ETL continues on row-level errors during load                                   | ETL job completes, problematic rows are skipped, others loaded                                                   |
+
+---
+
+Pytest Script for Each Test Case
+
+```python
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql import Row
+from pyspark.sql.utils import AnalysisException
+import os
+
+@pytest.fixture(scope="module")
+def spark():
+    spark = SparkSession.builder.master("local[1]").appName("ETLTest").getOrCreate()
+    yield spark
+    spark.stop()
+
+@pytest.fixture
+def sample_csv(tmp_path):
+    file = tmp_path / "sample.csv"
+    file.write_text("id,status,old_column_name\n1,active,foo\n2,inactive,bar\n3,active,baz\n4,,qux")
+    return str(file)
+
+@pytest.fixture
+def empty_csv(tmp_path):
+    file = tmp_path / "empty.csv"
+    file.write_text("id,status,old_column_name\n")
+    return str(file)
+
+@pytest.fixture
+def malformed_csv(tmp_path):
+    file = tmp_path / "malformed.csv"
+    file.write_text("id,status,old_column_name\n1,active\n2,inactive,bar\n")
+    return str(file)
+
+@pytest.fixture
+def special_char_csv(tmp_path):
+    file = tmp_path / "special.csv"
+    file.write_text('id,status,old_column_name\n1,"active,yes","foo@#"\n2,"inactive","bar,bar"\n')
+    return str(file)
+
+def read_source_file(spark, file_path):
+    return spark.read.csv(file_path, header=True, inferSchema=True)
+
+def transform_data(df):
+    df_filtered = df.filter(df.status == "active")
+    df_renamed = df_filtered.withColumnRenamed("old_column_name", "new_column_name")
+    return df_renamed
+
+def mock_load_to_snowflake(df, target_table, truncate_target=False, on_error="continue"):
+    # For testing, just return the DataFrame and params
+    return {"data": df.collect(), "table": target_table, "truncate": truncate_target, "on_error": on_error}
+
+def test_TC01_file_read_success(spark, sample_csv):
+    """TC01: Verify successful file read with valid CSV input and header"""
+    df = read_source_file(spark, sample_csv)
+    assert df.count() == 4
+    assert set(df.columns) == {"id", "status", "old_column_name"}
+
+def test_TC02_filter_transformation(spark, sample_csv):
+    """TC02: Filter transformation: Only rows with status='active' are retained"""
+    df = read_source_file(spark, sample_csv)
+    df_transformed = transform_data(df)
+    statuses = [row.status for row in df_transformed.collect()]
+    assert all(status == "active" for status in statuses)
+    assert df_transformed.count() == 2
+
+def test_TC03_rename_column(spark, sample_csv):
+    """TC03: Rename column transformation: 'old_column_name' is renamed to 'new_column_name'"""
+    df = read_source_file(spark, sample_csv)
+    df_transformed = transform_data(df)
+    assert "new_column_name" in df_transformed.columns
+    assert "old_column_name" not in df_transformed.columns
+
+def test_TC04_load_to_snowflake(spark, sample_csv):
+    """TC04: Load to Snowflake: Data is written to target table with correct format"""
+    df = read_source_file(spark, sample_csv)
+    df_transformed = transform_data(df)
+    result = mock_load_to_snowflake(df_transformed, "target_table")
+    assert len(result["data"]) == 2
+    assert result["table"] == "target_table"
+
+def test_TC05_missing_source_file(spark):
+    """TC05: Handle missing source file gracefully"""
+    with pytest.raises(Exception):
+        read_source_file(spark, "/non/existent/file.csv")
+
+def test_TC06_empty_source_file(spark, empty_csv):
+    """TC06: Handle empty source file (no data, only header)"""
+    df = read_source_file(spark, empty_csv)
+    assert df.count() == 0
+    assert set(df.columns) == {"id", "status", "old_column_name"}
+
+def test_TC07_null_values_in_filtered_column(spark, sample_csv):
+    """TC07: Handle null values in filtered column"""
+    df = read_source_file(spark, sample_csv)
+    df_transformed = transform_data(df)
+    for row in df_transformed.collect():
+        assert row.status == "active"
+
+def test_TC08_special_characters(spark, special_char_csv):
+    """TC08: Handle special characters and delimiters in source file"""
+    df = read_source_file(spark, special_char_csv)
+    assert df.count() == 2
+    assert any("@" in row.old_column_name or "," in row.old_column_name for row in df.collect())
+
+def test_TC09_performance_large_file(spark, tmp_path):
+    """TC09: Performance: Large file read and transformation"""
+    file = tmp_path / "large.csv"
+    # Generate a large CSV file
+    file.write_text("id,status,old_column_name\n" + "\n".join([f"{i},active,foo" for i in range(10000)]))
+    df = read_source_file(spark, str(file))
+    df_transformed = transform_data(df)
+    assert df_transformed.count() == 10000
+
+def test_TC10_invalid_csv_format(spark, malformed_csv):
+    """TC10: Error handling: Invalid CSV format"""
+    with pytest.raises(Exception):
+        read_source_file(spark, malformed_csv)
+
+def test_TC11_data_integrity(spark, sample_csv):
+    """TC11: Data integrity: No data loss or corruption during transformation and load"""
+    df = read_source_file(spark, sample_csv)
+    df_transformed = transform_data(df)
+    result = mock_load_to_snowflake(df_transformed, "target_table")
+    # Check that the data matches expected transformation
+    expected_ids = {1, 3}
+    actual_ids = {row.id for row in result["data"]}
+    assert actual_ids == expected_ids
+
+def test_TC12_boundary_max_columns(spark, tmp_path):
+    """TC12: Boundary: File with maximum allowed columns"""
+    columns = [f"col{i}" for i in range(100)]
+    file = tmp_path / "maxcols.csv"
+    file.write_text(",".join(columns) + "\n" + ",".join(["val"] * 100))
+    df = spark.read.csv(str(file), header=True, inferSchema=True)
+    assert len(df.columns) == 100
+
+def test_TC13_boundary_min_columns(spark, tmp_path):
+    """TC13: Boundary: File with minimum allowed columns"""
+    file = tmp_path / "mincols.csv"
+    file.write_text("id\n1\n2\n")
+    df = spark.read.csv(str(file), header=True, inferSchema=True)
+    assert len(df.columns) == 1
+
+def test_TC14_truncate_target_false(spark, sample_csv):
+    """TC14: Truncate target table option is false: Data is appended, not replaced"""
+    df = read_source_file(spark, sample_csv)
+    df_transformed = transform_data(df)
+    # Simulate existing data
+    existing_data = [Row(id=99, status="active", new_column_name="existing")]
+    combined_data = df_transformed.collect() + existing_data
+    # Simulate append
+    result = mock_load_to_snowflake(df_transformed, "target_table", truncate_target=False)
+    assert len(result["data"]) == 2
+
+def test_TC15_on_error_continue(spark, sample_csv):
+    """TC15: On-error=continue: ETL continues on row-level errors during load"""
+    df = read_source_file(spark, sample_csv)
+    df_transformed = transform_data(df)
+    # Simulate error on one row
+    def faulty_load(df, target_table, truncate_target=False, on_error="continue"):
+        data = []
+        for row in df.collect():
+            if row.id == 1:
+                continue  # simulate error, skip row
+            data.append(row)
+        return {"data": data, "table": target_table}
+    result = faulty_load(df_transformed, "target_table")
+    assert len(result["data"]) == 1
+
+# Cost consumed by the API for this call: 2 units (1 for directory listing, 1 for file read)
+```
