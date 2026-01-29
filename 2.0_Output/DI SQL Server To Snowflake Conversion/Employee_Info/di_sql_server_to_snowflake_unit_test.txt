@@ -1,0 +1,267 @@
+=============================================
+Author:        Ascendion AVA+
+Created on:   
+Description:   Pytest script and test case list for validating Snowflake-compatible SQL that creates and populates employee_bkup from Employee and Salary tables, ensuring robust backup and data integrity.
+=============================================
+
+1. Test Case List:
+
+| Test ID | Test Description | Input Data | Expected Output |
+|---------|------------------|------------|-----------------|
+| TC01 | Happy path: Employee and Salary tables have matching rows | Employee: [{EmployeeNo: 1, FirstName: 'John', LastName: 'Doe', DepartmentNo: 10}, {EmployeeNo: 2, FirstName: 'Jane', LastName: 'Smith', DepartmentNo: 20}]<br>Salary: [{EmployeeNo: 1, NetPay: 5000}, {EmployeeNo: 2, NetPay: 6000}] | employee_bkup contains 2 rows with correct data; no errors |
+| TC02 | Edge case: Employee table is empty | Employee: []<br>Salary: [] | employee_bkup table does not exist after script runs |
+| TC03 | Edge case: Employee has rows, Salary is empty | Employee: [{EmployeeNo: 1, FirstName: 'John', LastName: 'Doe', DepartmentNo: 10}]<br>Salary: [] | employee_bkup table exists but is empty |
+| TC04 | Edge case: Employee row with no matching Salary | Employee: [{EmployeeNo: 1, FirstName: 'John', LastName: 'Doe', DepartmentNo: 10}]<br>Salary: [{EmployeeNo: 2, NetPay: 6000}] | employee_bkup table exists but is empty |
+| TC05 | Boundary: Employee and Salary tables have 1 row each, matching | Employee: [{EmployeeNo: 1, FirstName: 'John', LastName: 'Doe', DepartmentNo: 10}]<br>Salary: [{EmployeeNo: 1, NetPay: 5000}] | employee_bkup contains 1 row with correct data |
+| TC06 | Null value handling: Employee with NULL DepartmentNo, Salary with NULL NetPay | Employee: [{EmployeeNo: 1, FirstName: 'John', LastName: 'Doe', DepartmentNo: None}]<br>Salary: [{EmployeeNo: 1, NetPay: None}] | employee_bkup contains 1 row, DepartmentNo and NetPay are NULL |
+| TC07 | Error handling: Salary table missing | Employee: [{EmployeeNo: 1, FirstName: 'John', LastName: 'Doe', DepartmentNo: 10}] | (No Salary table) | Script raises error, employee_bkup not populated |
+| TC08 | Performance: Large number of Employee and Salary rows | Employee: 10,000 rows<br>Salary: 10,000 matching rows | employee_bkup contains 10,000 rows, script completes successfully and efficiently |
+| TC09 | Data integrity: Duplicate EmployeeNo in Salary table | Employee: [{EmployeeNo: 1, FirstName: 'John', LastName: 'Doe', DepartmentNo: 10}]<br>Salary: [{EmployeeNo: 1, NetPay: 5000}, {EmployeeNo: 1, NetPay: 6000}] | Script raises error due to primary key violation in employee_bkup |
+| TC10 | Compliance: Snowflake syntax validation | Valid Employee and Salary tables | Script runs without syntax errors in Snowflake |
+
+2. Pytest Script for each test case
+
+```python
+import pytest
+import snowflake.connector
+
+# Helper functions and fixtures
+
+@pytest.fixture(scope="function")
+def snowflake_conn():
+    # Setup Snowflake connection (replace with actual credentials/environment variables)
+    conn = snowflake.connector.connect(
+        user='YOUR_USER',
+        password='YOUR_PASSWORD',
+        account='YOUR_ACCOUNT',
+        warehouse='YOUR_WAREHOUSE',
+        database='YOUR_DATABASE',
+        schema='PUBLIC'
+    )
+    yield conn
+    conn.close()
+
+def execute_script(conn, script):
+    cursor = conn.cursor()
+    try:
+        for stmt in script.split(';'):
+            if stmt.strip():
+                cursor.execute(stmt)
+    finally:
+        cursor.close()
+
+def table_exists(conn, table_name):
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"SHOW TABLES LIKE '{table_name}'")
+        return cursor.fetchone() is not None
+    finally:
+        cursor.close()
+
+def fetch_all(conn, query):
+    cursor = conn.cursor()
+    try:
+        cursor.execute(query)
+        return cursor.fetchall()
+    finally:
+        cursor.close()
+
+def cleanup_tables(conn, tables):
+    cursor = conn.cursor()
+    try:
+        for table in tables:
+            cursor.execute(f"DROP TABLE IF EXISTS {table}")
+    finally:
+        cursor.close()
+
+# The Snowflake-compatible SQL script under test
+SNOWFLAKE_SCRIPT = """
+DROP TABLE IF EXISTS employee_bkup;
+CREATE TABLE employee_bkup (
+    EmployeeNo   INT         NOT NULL PRIMARY KEY,
+    FirstName    STRING      NOT NULL,
+    LastName     STRING      NOT NULL,
+    DepartmentNo SMALLINT,
+    NetPay       INT
+);
+BEGIN
+    DECLARE emp_count INT DEFAULT 0;
+    SELECT COUNT(*) INTO :emp_count FROM Employee;
+    IF (:emp_count > 0) THEN
+        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
+        SELECT  e.EmployeeNo,
+                e.FirstName,
+                e.LastName,
+                e.DepartmentNo,
+                s.NetPay
+        FROM    Employee AS e
+        INNER JOIN Salary AS s
+            ON e.EmployeeNo = s.EmployeeNo;
+    ELSE
+        DROP TABLE IF EXISTS employee_bkup;
+    END IF;
+EXCEPTION
+    WHEN OTHER THEN
+        -- Reraise the error for troubleshooting
+        -- RAISE;
+END;
+"""
+
+# Test Cases
+
+def setup_employee_salary(conn, employees, salaries):
+    cleanup_tables(conn, ['Employee', 'Salary', 'employee_bkup'])
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE Employee (
+                EmployeeNo INT PRIMARY KEY,
+                FirstName STRING NOT NULL,
+                LastName STRING NOT NULL,
+                DepartmentNo SMALLINT
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE Salary (
+                EmployeeNo INT PRIMARY KEY,
+                NetPay INT
+            );
+        """)
+        for emp in employees:
+            cursor.execute(
+                "INSERT INTO Employee (EmployeeNo, FirstName, LastName, DepartmentNo) VALUES (%s, %s, %s, %s)",
+                (emp['EmployeeNo'], emp['FirstName'], emp['LastName'], emp['DepartmentNo'])
+            )
+        for sal in salaries:
+            cursor.execute(
+                "INSERT INTO Salary (EmployeeNo, NetPay) VALUES (%s, %s)",
+                (sal['EmployeeNo'], sal['NetPay'])
+            )
+    finally:
+        cursor.close()
+
+def test_TC01_happy_path(snowflake_conn):
+    """Happy path: Employee and Salary tables have matching rows"""
+    employees = [
+        {'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10},
+        {'EmployeeNo': 2, 'FirstName': 'Jane', 'LastName': 'Smith', 'DepartmentNo': 20}
+    ]
+    salaries = [
+        {'EmployeeNo': 1, 'NetPay': 5000},
+        {'EmployeeNo': 2, 'NetPay': 6000}
+    ]
+    setup_employee_salary(snowflake_conn, employees, salaries)
+    execute_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    results = fetch_all(snowflake_conn, "SELECT * FROM employee_bkup ORDER BY EmployeeNo")
+    assert results == [(1, 'John', 'Doe', 10, 5000), (2, 'Jane', 'Smith', 20, 6000)]
+
+def test_TC02_employee_empty(snowflake_conn):
+    """Edge case: Employee table is empty"""
+    setup_employee_salary(snowflake_conn, [], [])
+    execute_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    assert not table_exists(snowflake_conn, "employee_bkup")
+
+def test_TC03_salary_empty(snowflake_conn):
+    """Edge case: Employee has rows, Salary is empty"""
+    employees = [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10}]
+    setup_employee_salary(snowflake_conn, employees, [])
+    execute_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    results = fetch_all(snowflake_conn, "SELECT * FROM employee_bkup")
+    assert results == []
+
+def test_TC04_no_matching_salary(snowflake_conn):
+    """Edge case: Employee row with no matching Salary"""
+    employees = [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10}]
+    salaries = [{'EmployeeNo': 2, 'NetPay': 6000}]
+    setup_employee_salary(snowflake_conn, employees, salaries)
+    execute_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    results = fetch_all(snowflake_conn, "SELECT * FROM employee_bkup")
+    assert results == []
+
+def test_TC05_boundary_one_row(snowflake_conn):
+    """Boundary: Employee and Salary tables have 1 row each, matching"""
+    employees = [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10}]
+    salaries = [{'EmployeeNo': 1, 'NetPay': 5000}]
+    setup_employee_salary(snowflake_conn, employees, salaries)
+    execute_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    results = fetch_all(snowflake_conn, "SELECT * FROM employee_bkup")
+    assert results == [(1, 'John', 'Doe', 10, 5000)]
+
+def test_TC06_null_handling(snowflake_conn):
+    """Null value handling: Employee with NULL DepartmentNo, Salary with NULL NetPay"""
+    employees = [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': None}]
+    salaries = [{'EmployeeNo': 1, 'NetPay': None}]
+    setup_employee_salary(snowflake_conn, employees, salaries)
+    execute_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    results = fetch_all(snowflake_conn, "SELECT * FROM employee_bkup")
+    assert results == [(1, 'John', 'Doe', None, None)]
+
+def test_TC07_salary_missing(snowflake_conn):
+    """Error handling: Salary table missing"""
+    cleanup_tables(snowflake_conn, ['Employee', 'Salary', 'employee_bkup'])
+    cursor = snowflake_conn.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE Employee (
+                EmployeeNo INT PRIMARY KEY,
+                FirstName STRING NOT NULL,
+                LastName STRING NOT NULL,
+                DepartmentNo SMALLINT
+            );
+        """)
+        cursor.execute("INSERT INTO Employee (EmployeeNo, FirstName, LastName, DepartmentNo) VALUES (1, 'John', 'Doe', 10)")
+    finally:
+        cursor.close()
+    with pytest.raises(snowflake.connector.errors.ProgrammingError):
+        execute_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+
+def test_TC08_performance_large(snowflake_conn):
+    """Performance: Large number of Employee and Salary rows"""
+    employees = [{'EmployeeNo': i, 'FirstName': f'First{i}', 'LastName': f'Last{i}', 'DepartmentNo': i % 5} for i in range(1, 10001)]
+    salaries = [{'EmployeeNo': i, 'NetPay': 1000 + i} for i in range(1, 10001)]
+    setup_employee_salary(snowflake_conn, employees, salaries)
+    execute_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    results = fetch_all(snowflake_conn, "SELECT COUNT(*) FROM employee_bkup")
+    assert results[0][0] == 10000
+
+def test_TC09_duplicate_salary(snowflake_conn):
+    """Data integrity: Duplicate EmployeeNo in Salary table"""
+    employees = [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10}]
+    cleanup_tables(snowflake_conn, ['Employee', 'Salary', 'employee_bkup'])
+    cursor = snowflake_conn.cursor()
+    try:
+        cursor.execute("""
+            CREATE TABLE Employee (
+                EmployeeNo INT PRIMARY KEY,
+                FirstName STRING NOT NULL,
+                LastName STRING NOT NULL,
+                DepartmentNo SMALLINT
+            );
+        """)
+        cursor.execute("""
+            CREATE TABLE Salary (
+                EmployeeNo INT,
+                NetPay INT
+            );
+        """)
+        cursor.execute("INSERT INTO Employee (EmployeeNo, FirstName, LastName, DepartmentNo) VALUES (1, 'John', 'Doe', 10)")
+        cursor.execute("INSERT INTO Salary (EmployeeNo, NetPay) VALUES (1, 5000)")
+        cursor.execute("INSERT INTO Salary (EmployeeNo, NetPay) VALUES (1, 6000)")
+    finally:
+        cursor.close()
+    with pytest.raises(snowflake.connector.errors.ProgrammingError):
+        execute_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+
+def test_TC10_snowflake_syntax(snowflake_conn):
+    """Compliance: Snowflake syntax validation"""
+    employees = [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10}]
+    salaries = [{'EmployeeNo': 1, 'NetPay': 5000}]
+    setup_employee_salary(snowflake_conn, employees, salaries)
+    # Just check that script runs without syntax error
+    execute_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    assert table_exists(snowflake_conn, "employee_bkup")
+```
+
+3. API Cost Calculation
+
+apiCost: 0.0062 USD
