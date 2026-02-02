@@ -1,0 +1,12 @@
+# Agent Comparison Report: SqlServer_to_DBT_Reconciliation
+ 
+Generated: 2026-02-02 20:27:43
+Execution ID: 9b726f32-815b-483c-b06c-6ab88b7de21a
+ 
+## Files Compared
+- AAVA 1.0: SqlServer_to_DBT_Reconciliation.txt
+- AAVA 2.0: sqlserver_to_dbt_reconciliation.txt
+ 
+## Outputs
+- 📄 TXT: `SqlServer_to_DBT_Reconciliation.txt` - Full comparison report
+- 📊 CSV: `SqlServer_to_DBT_Reconciliation.csv` - Structured comparison data (uploaded by agent)
