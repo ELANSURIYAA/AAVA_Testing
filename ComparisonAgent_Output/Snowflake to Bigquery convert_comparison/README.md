@@ -1,0 +1,37 @@
+# AAVA Comparison Results
+ 
+Generated: 2026-02-04 11:35:37
+ 
+## Workflows Compared
+- AAVA 1.0: Snowflake_to_Bigquery_convert
+- AAVA 2.0: Snowflake to Bigquery convert
+ 
+## Agent Comparisons
+ 
+Total Agents: 5
+ 
+### SNOWFLAKE_DOCUMENTATION
+- AAVA 1.0: `SNOWFLAKE_DOCUMENTATION.txt`
+- AAVA 2.0: `snowflake_documentation.txt`
+- Results: [SNOWFLAKE_DOCUMENTATION/](./SNOWFLAKE_DOCUMENTATION/)
+
+### SNOWFLAKE_TO_BIGQUERY_CONVERSION_TESTER
+- AAVA 1.0: `SNOWFLAKE_TO_BIGQUERY_CONVERSION_TESTER.txt`
+- AAVA 2.0: `snowflake_to_bigquery_conversion_tester.txt`
+- Results: [SNOWFLAKE_TO_BIGQUERY_CONVERSION_TESTER/](./SNOWFLAKE_TO_BIGQUERY_CONVERSION_TESTER/)
+
+### SNOWFLAKE_TO_BIGQUERY_RECON_TESTER
+- AAVA 1.0: `SNOWFLAKE_TO_BIGQUERY_RECON_TESTER.txt`
+- AAVA 2.0: `snowflake_to_bigquery_recon_tester.txt`
+- Results: [SNOWFLAKE_TO_BIGQUERY_RECON_TESTER/](./SNOWFLAKE_TO_BIGQUERY_RECON_TESTER/)
+
+### SNOWFLAKE_TO_BIGQUERY_REVIEWER
+- AAVA 1.0: `SNOWFLAKE_TO_BIGQUERY_REVIEWER.txt`
+- AAVA 2.0: `snowflake_to_bigquery_reviewer.txt`
+- Results: [SNOWFLAKE_TO_BIGQUERY_REVIEWER/](./SNOWFLAKE_TO_BIGQUERY_REVIEWER/)
+
+### SNOWFLAKE_TO_BIGQUERY_UNIT_TESTER
+- AAVA 1.0: `SNOWFLAKE_TO_BIGQUERY_UNIT_TESTER.txt`
+- AAVA 2.0: `snowflake_to_bigquery_unit_tester.txt`
+- Results: [SNOWFLAKE_TO_BIGQUERY_UNIT_TESTER/](./SNOWFLAKE_TO_BIGQUERY_UNIT_TESTER/)
+
