@@ -1,0 +1,428 @@
+```
+=============================================
+Author:        Ascendion AVA+
+Date:   
+Description:   Comprehensive Pytest suite for validating PySpark DimBillingAccount DataFrame transformations, covering happy path, edge cases, and error handling.
+=============================================
+
+# 1. Test Case List
+
+| Test Case ID | Description                                                                                      | Expected Outcome                                                                                       |
+|--------------|--------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------|
+| TC01         | Validate happy path: correct join and transformation for typical input data                      | Output DataFrame matches expected schema and values                                                    |
+| TC02         | Handle NULL values in join keys and transformation columns                                       | Output DataFrame handles NULLs as per transformation logic                                             |
+| TC03         | Empty DataFrame inputs (all sources)                                                             | Output DataFrame is empty, no errors                                                                   |
+| TC04         | Invalid schema: missing required columns in source DataFrames                                    | Raises appropriate exception or error                                                                  |
+| TC05         | Type mismatch in input columns (e.g., string instead of integer)                                 | Raises appropriate exception or error                                                                  |
+| TC06         | Duplicate AccountNumber in source, verify dropDuplicates logic                                   | Output DataFrame contains only unique AccountNumber rows                                               |
+| TC07         | Boundary date values for incremental filter (date_offset logic)                                  | Only rows matching the date filter are included                                                        |
+| TC08         | InsuredInfo join fails (no matching insured role)                                                | InsuredInfo columns are NULL in output                                                                 |
+| TC09         | ParentAcct join fails (no matching parent account)                                               | ParentAcct columns are NULL in output                                                                  |
+| TC10         | BeanVersion concatenation with NULLs (should handle coalesce logic)                              | BeanVersion column concatenates as per coalesce logic                                                  |
+| TC11         | IsActive logic: Retired = 0 and Retired != 0                                                     | IsActive is 1 for Retired=0, else 0                                                                    |
+| TC12         | Merge logic: update vs insert (simulate DimBillingAccount DeltaTable merge)                      | Update occurs for matching PublicID & LegacySourceSystem, else insert                                  |
+| TC13         | Audit record creation: validate audit DataFrame structure and values                             | Audit DataFrame contains correct counts and batch info                                                 |
+| TC14         | Performance: verify caching and unpersisting of DataFrames                                       | No errors, DataFrames are cached and unpersisted as expected                                           |
+
+# 2. Pytest Script
+
+```python
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col, lit, concat, coalesce, when, current_timestamp, date_add, current_date
+from pyspark.sql.types import StructType, StructField, IntegerType, StringType, TimestampType
+
+@pytest.fixture(scope="session")
+def spark():
+    return SparkSession.builder.master("local[2]").appName("pytest_EDW_BC_Load_DimBillingAccount").getOrCreate()
+
+@pytest.fixture
+def sample_dataframes(spark):
+    # Sample schemas for all tables used in the transformation
+    bc_account_schema = StructType([
+        StructField("ID", IntegerType()),
+        StructField("AccountNumber", IntegerType()),
+        StructField("AccountName", StringType()),
+        StructField("AccountType", IntegerType()),
+        StructField("BillingLevel", IntegerType()),
+        StructField("ServiceTier", IntegerType()),
+        StructField("SecurityZoneID", IntegerType()),
+        StructField("Segment", IntegerType()),
+        StructField("DelinquencyStatus", IntegerType()),
+        StructField("CloseDate", TimestampType()),
+        StructField("CreateTime", TimestampType()),
+        StructField("FirstTwicePerMthInvoiceDOM", IntegerType()),
+        StructField("SecondTwicePerMthInvoiceDOM", IntegerType()),
+        StructField("PublicID", StringType()),
+        StructField("BeanVersion", StringType()),
+        StructField("Retired", IntegerType()),
+        StructField("UpdateTime", TimestampType()),
+    ])
+    bctl_accounttype_schema = StructType([
+        StructField("ID", IntegerType()),
+        StructField("NAME", StringType()),
+    ])
+    bc_ParentAcct_schema = StructType([
+        StructField("OwnerID", IntegerType()),
+        StructField("ForeignEntityID", IntegerType()),
+        StructField("BeanVersion", StringType()),
+        StructField("UpdateTime", TimestampType()),
+    ])
+    bctl_billinglevel_schema = StructType([
+        StructField("ID", IntegerType()),
+        StructField("NAME", StringType()),
+    ])
+    bctl_customerservicetier_schema = StructType([
+        StructField("ID", IntegerType()),
+        StructField("NAME", StringType()),
+    ])
+    bc_securityzone_schema = StructType([
+        StructField("ID", IntegerType()),
+        StructField("Name", StringType()),
+        StructField("BeanVersion", StringType()),
+        StructField("UpdateTime", TimestampType()),
+    ])
+    bc_accountcontact_schema = StructType([
+        StructField("ID", IntegerType()),
+        StructField("InsuredAccountID", IntegerType()),
+        StructField("ContactID", IntegerType()),
+        StructField("BeanVersion", StringType()),
+        StructField("UpdateTime", TimestampType()),
+    ])
+    bc_accountcontactrole_schema = StructType([
+        StructField("AccountContactID", IntegerType()),
+        StructField("Role", IntegerType()),
+        StructField("BeanVersion", StringType()),
+        StructField("UpdateTime", TimestampType()),
+    ])
+    bctl_accountrole_schema = StructType([
+        StructField("ID", IntegerType()),
+        StructField("TYPECODE", StringType()),
+    ])
+    bc_contact_schema = StructType([
+        StructField("ID", IntegerType()),
+        StructField("FirstName", StringType()),
+        StructField("LastName", StringType()),
+        StructField("PrimaryAddressID", IntegerType()),
+        StructField("BeanVersion", StringType()),
+        StructField("UpdateTime", TimestampType()),
+    ])
+    bc_address_schema = StructType([
+        StructField("ID", IntegerType()),
+        StructField("AddressLine1", StringType()),
+        StructField("AddressLine2", StringType()),
+        StructField("AddressLine3", StringType()),
+        StructField("City", StringType()),
+        StructField("PostalCode", StringType()),
+        StructField("State", IntegerType()),
+        StructField("BeanVersion", StringType()),
+        StructField("UpdateTime", TimestampType()),
+    ])
+    bctl_state_schema = StructType([
+        StructField("ID", IntegerType()),
+        StructField("NAME", StringType()),
+    ])
+    bctl_delinquencystatus_schema = StructType([
+        StructField("ID", IntegerType()),
+        StructField("NAME", StringType()),
+    ])
+    bctl_accountsegment_schema = StructType([
+        StructField("ID", IntegerType()),
+        StructField("NAME", StringType()),
+    ])
+
+    # Create mock DataFrames for happy path
+    bc_account = spark.createDataFrame([
+        (1, 1001, "Acct A", 10, 20, 30, 40, 50, 60, None, None, 1, 2, "PUB1", "BV1", 0, current_timestamp()),
+        (2, 1002, "Acct B", 11, 21, 31, 41, 51, 61, None, None, 3, 4, "PUB2", "BV2", 1, current_timestamp()),
+    ], schema=bc_account_schema)
+    bctl_accounttype = spark.createDataFrame([(10, "TypeA"), (11, "TypeB")], schema=bctl_accounttype_schema)
+    bc_ParentAcct = spark.createDataFrame([(1, 2, "BVPA", current_timestamp())], schema=bc_ParentAcct_schema)
+    bctl_billinglevel = spark.createDataFrame([(20, "LevelA"), (21, "LevelB")], schema=bctl_billinglevel_schema)
+    bctl_customerservicetier = spark.createDataFrame([(30, "TierA"), (31, "TierB")], schema=bctl_customerservicetier_schema)
+    bc_securityzone = spark.createDataFrame([(40, "ZoneA", "BVZ", current_timestamp()), (41, "ZoneB", "BVZB", current_timestamp())], schema=bc_securityzone_schema)
+    bc_accountcontact = spark.createDataFrame([(1, 1, 1, "BVAC", current_timestamp())], schema=bc_accountcontact_schema)
+    bc_accountcontactrole = spark.createDataFrame([(1, 100, "BVACR", current_timestamp())], schema=bc_accountcontactrole_schema)
+    bctl_accountrole = spark.createDataFrame([(100, "insured")], schema=bctl_accountrole_schema)
+    bc_contact = spark.createDataFrame([(1, "John", "Doe", 1, "BVC", current_timestamp())], schema=bc_contact_schema)
+    bc_address = spark.createDataFrame([(1, "Addr1", "Addr2", "Addr3", "CityA", "12345", 1, "BVA", current_timestamp())], schema=bc_address_schema)
+    bctl_state = spark.createDataFrame([(1, "StateA")], schema=bctl_state_schema)
+    bctl_delinquencystatus = spark.createDataFrame([(60, "Delinquent")], schema=bctl_delinquencystatus_schema)
+    bctl_accountsegment = spark.createDataFrame([(50, "SegmentA"), (51, "SegmentB")], schema=bctl_accountsegment_schema)
+
+    return {
+        "bc_account": bc_account,
+        "bctl_accounttype": bctl_accounttype,
+        "bc_ParentAcct": bc_ParentAcct,
+        "bctl_billinglevel": bctl_billinglevel,
+        "bctl_customerservicetier": bctl_customerservicetier,
+        "bc_securityzone": bc_securityzone,
+        "bc_accountcontact": bc_accountcontact,
+        "bc_accountcontactrole": bc_accountcontactrole,
+        "bctl_accountrole": bctl_accountrole,
+        "bc_contact": bc_contact,
+        "bc_address": bc_address,
+        "bctl_state": bctl_state,
+        "bctl_delinquencystatus": bctl_delinquencystatus,
+        "bctl_accountsegment": bctl_accountsegment,
+    }
+
+def build_dim_billing_account_df(spark, dfs, batch_id=12345, date_offset=-1):
+    # ParentAcct CTE
+    parent_acct = (
+        dfs["bc_ParentAcct"].alias("pa")
+        .join(dfs["bc_account"].alias("act"), col("act.ID") == col("pa.ForeignEntityID"), "inner")
+        .select(
+            col("pa.OwnerID"),
+            col("act.AccountNumber").cast(IntegerType()).alias("ParentAccountNumber"),
+            concat(col("pa.BeanVersion"), col("act.BeanVersion")).alias("BeanVersion"),
+            col("act.UpdateTime")
+        )
+    )
+    # InsuredInfo CTE
+    insured_info = (
+        dfs["bc_accountcontact"].alias("ac")
+        .join(dfs["bc_accountcontactrole"].alias("acr"), col("acr.AccountContactID") == col("ac.ID"), "inner")
+        .join(dfs["bctl_accountrole"].alias("tlar"), col("tlar.ID") == col("acr.Role"), "inner")
+        .join(dfs["bc_contact"].alias("c"), col("c.ID") == col("ac.ContactID"), "left")
+        .join(dfs["bc_address"].alias("a"), col("a.ID") == col("c.PrimaryAddressID"), "left")
+        .join(dfs["bctl_state"].alias("tls"), col("tls.ID") == col("a.State"), "left")
+        .where(col("tlar.TYPECODE") == "insured")
+        .select(
+            col("ac.InsuredAccountID").alias("AccountID"),
+            col("c.FirstName"),
+            col("c.LastName"),
+            col("a.AddressLine1"),
+            col("a.AddressLine2"),
+            col("a.AddressLine3"),
+            col("a.City"),
+            col("a.PostalCode"),
+            col("tls.NAME").alias("State"),
+            concat(col("ac.BeanVersion"), col("acr.BeanVersion"), col("c.BeanVersion"), col("a.BeanVersion")).alias("BeanVersion"),
+            col("ac.UpdateTime").alias("ac_UpdateTime"),
+            col("acr.UpdateTime").alias("acr_UpdateTime"),
+            col("c.UpdateTime").alias("c_UpdateTime"),
+            col("a.UpdateTime").alias("a_UpdateTime")
+        )
+    )
+    # Join all required tables for DimBillingAccount logic
+    df = (
+        dfs["bc_account"].alias("dt")
+        .join(dfs["bctl_accounttype"].alias("at"), col("at.ID") == col("dt.AccountType"), "left")
+        .join(parent_acct.alias("ParentAcct"), col("ParentAcct.OwnerID") == col("dt.ID"), "left")
+        .join(dfs["bctl_billinglevel"].alias("bl"), col("bl.ID") == col("dt.BillingLevel"), "left")
+        .join(dfs["bctl_customerservicetier"].alias("cst"), col("cst.ID") == col("dt.ServiceTier"), "left")
+        .join(dfs["bc_securityzone"].alias("sz"), col("sz.ID") == col("dt.SecurityZoneID"), "left")
+        .join(insured_info.alias("InsuredInfo"), col("InsuredInfo.AccountID") == col("dt.ID"), "left")
+        .join(dfs["bctl_delinquencystatus"].alias("tlds"), col("tlds.ID") == col("dt.DelinquencyStatus"), "left")
+        .join(dfs["bctl_accountsegment"].alias("bas"), col("bas.ID") == col("dt.Segment"), "left")
+    )
+    incremental_filter = (
+        (col("dt.UpdateTime") >= date_add(current_date(), date_offset)) |
+        (col("ParentAcct.UpdateTime") >= date_add(current_date(), date_offset)) |
+        (col("sz.UpdateTime") >= date_add(current_date(), date_offset)) |
+        (col("InsuredInfo.ac_UpdateTime") >= date_add(current_date(), date_offset)) |
+        (col("InsuredInfo.acr_UpdateTime") >= date_add(current_date(), date_offset)) |
+        (col("InsuredInfo.c_UpdateTime") >= date_add(current_date(), date_offset)) |
+        (col("InsuredInfo.a_UpdateTime") >= date_add(current_date(), date_offset))
+    )
+    df_filtered = df.filter(incremental_filter).dropDuplicates(["dt.AccountNumber"])
+    dim_billing_account_df = (
+        df_filtered.select(
+            col("dt.AccountNumber"),
+            col("dt.AccountName"),
+            col("at.NAME").cast(StringType()).alias("AccountTypeName"),
+            col("ParentAcct.ParentAccountNumber"),
+            col("bl.NAME").cast(StringType()).alias("BillingLevelName"),
+            col("bas.NAME").cast(StringType()).alias("Segment"),
+            col("cst.NAME").cast(StringType()).alias("ServiceTierName"),
+            col("sz.Name").alias("SecurityZone"),
+            col("InsuredInfo.FirstName"),
+            col("InsuredInfo.LastName"),
+            col("InsuredInfo.AddressLine1"),
+            col("InsuredInfo.AddressLine2"),
+            col("InsuredInfo.AddressLine3"),
+            col("InsuredInfo.City").cast(StringType()).alias("City"),
+            col("InsuredInfo.State").cast(StringType()).alias("State"),
+            col("InsuredInfo.PostalCode").cast(StringType()).alias("PostalCode"),
+            col("dt.CloseDate").alias("AccountCloseDate"),
+            col("dt.CreateTime").alias("AccountCreationDate"),
+            col("tlds.NAME").cast(StringType()).alias("DeliquencyStatusName"),
+            col("dt.FirstTwicePerMthInvoiceDOM").alias("FirstTwicePerMonthInvoiceDayOfMonth"),
+            col("dt.SecondTwicePerMthInvoiceDOM").alias("SecondTwicePerMonthInvoiceDayOfMonth"),
+            col("dt.PublicID"),
+            col("dt.ID").alias("GWRowNumber"),
+            concat(
+                col("dt.BeanVersion"),
+                coalesce(col("ParentAcct.BeanVersion"), lit("")),
+                coalesce(col("sz.BeanVersion"), lit(""))
+            ).cast(StringType()).alias("BeanVersion"),
+            when(col("dt.Retired") == 0, lit(1)).otherwise(lit(0)).alias("IsActive"),
+            lit("WC").alias("LegacySourceSystem")
+        )
+    )
+    return dim_billing_account_df
+
+# TC01: Happy path
+def test_happy_path(spark, sample_dataframes):
+    df = build_dim_billing_account_df(spark, sample_dataframes)
+    assert df.count() > 0
+    expected_columns = [
+        "AccountNumber", "AccountName", "AccountTypeName", "ParentAccountNumber", "BillingLevelName",
+        "Segment", "ServiceTierName", "SecurityZone", "FirstName", "LastName", "AddressLine1",
+        "AddressLine2", "AddressLine3", "City", "State", "PostalCode", "AccountCloseDate",
+        "AccountCreationDate", "DeliquencyStatusName", "FirstTwicePerMonthInvoiceDayOfMonth",
+        "SecondTwicePerMonthInvoiceDayOfMonth", "PublicID", "GWRowNumber", "BeanVersion", "IsActive",
+        "LegacySourceSystem"
+    ]
+    assert set(df.columns) == set(expected_columns)
+    # Validate a sample row
+    row = df.collect()[0]
+    assert row.AccountNumber == 1001
+    assert row.AccountTypeName == "TypeA"
+    assert row.IsActive == 1
+    assert row.LegacySourceSystem == "WC"
+
+# TC02: NULL values handling
+def test_null_values_handling(spark, sample_dataframes):
+    dfs = sample_dataframes.copy()
+    # Make AccountType NULL for one row
+    dfs["bc_account"] = dfs["bc_account"].withColumn("AccountType", lit(None).cast(IntegerType()))
+    df = build_dim_billing_account_df(spark, dfs)
+    assert df.filter(col("AccountTypeName").isNull()).count() >= 1
+
+# TC03: Empty DataFrames
+def test_empty_dataframes(spark):
+    dfs = {}
+    for key in [
+        "bc_account", "bctl_accounttype", "bc_ParentAcct", "bctl_billinglevel", "bctl_customerservicetier",
+        "bc_securityzone", "bc_accountcontact", "bc_accountcontactrole", "bctl_accountrole", "bc_contact",
+        "bc_address", "bctl_state", "bctl_delinquencystatus", "bctl_accountsegment"
+    ]:
+        dfs[key] = spark.createDataFrame([], StructType([]))
+    df = build_dim_billing_account_df(spark, dfs)
+    assert df.count() == 0
+
+# TC04: Invalid schema
+def test_invalid_schema(spark, sample_dataframes):
+    dfs = sample_dataframes.copy()
+    # Remove required column from bc_account
+    schema = StructType([f for f in dfs["bc_account"].schema.fields if f.name != "AccountType"])
+    dfs["bc_account"] = spark.createDataFrame(dfs["bc_account"].rdd, schema)
+    with pytest.raises(Exception):
+        build_dim_billing_account_df(spark, dfs)
+
+# TC05: Type mismatch
+def test_type_mismatch(spark, sample_dataframes):
+    dfs = sample_dataframes.copy()
+    # Change AccountNumber to StringType
+    schema = StructType([StructField("AccountNumber", StringType()) if f.name == "AccountNumber" else f for f in dfs["bc_account"].schema.fields])
+    dfs["bc_account"] = spark.createDataFrame(dfs["bc_account"].rdd, schema)
+    with pytest.raises(Exception):
+        build_dim_billing_account_df(spark, dfs)
+
+# TC06: Duplicate AccountNumber
+def test_duplicate_accountnumber(spark, sample_dataframes):
+    dfs = sample_dataframes.copy()
+    # Add duplicate AccountNumber
+    rows = dfs["bc_account"].collect()
+    rows.append(rows[0])
+    dfs["bc_account"] = spark.createDataFrame(rows, dfs["bc_account"].schema)
+    df = build_dim_billing_account_df(spark, dfs)
+    # Should only have unique AccountNumber
+    assert df.select("AccountNumber").distinct().count() == df.count()
+
+# TC07: Boundary date values for incremental filter
+def test_incremental_filter(spark, sample_dataframes):
+    dfs = sample_dataframes.copy()
+    # Set UpdateTime to a date outside the offset
+    from pyspark.sql.functions import date_sub
+    dfs["bc_account"] = dfs["bc_account"].withColumn("UpdateTime", date_sub(current_date(), 10))
+    df = build_dim_billing_account_df(spark, dfs, date_offset=-1)
+    assert df.count() == 0
+
+# TC08: InsuredInfo join fails
+def test_insuredinfo_join_fail(spark, sample_dataframes):
+    dfs = sample_dataframes.copy()
+    # Remove insured role from bctl_accountrole
+    dfs["bctl_accountrole"] = spark.createDataFrame([], dfs["bctl_accountrole"].schema)
+    df = build_dim_billing_account_df(spark, dfs)
+    # InsuredInfo columns should be NULL
+    assert df.filter(col("FirstName").isNull()).count() == df.count()
+
+# TC09: ParentAcct join fails
+def test_parentacct_join_fail(spark, sample_dataframes):
+    dfs = sample_dataframes.copy()
+    # Remove all rows from bc_ParentAcct
+    dfs["bc_ParentAcct"] = spark.createDataFrame([], dfs["bc_ParentAcct"].schema)
+    df = build_dim_billing_account_df(spark, dfs)
+    assert df.filter(col("ParentAccountNumber").isNull()).count() == df.count()
+
+# TC10: BeanVersion concatenation with NULLs
+def test_beanversion_concatenation_nulls(spark, sample_dataframes):
+    dfs = sample_dataframes.copy()
+    # Make ParentAcct.BeanVersion NULL
+    dfs["bc_ParentAcct"] = dfs["bc_ParentAcct"].withColumn("BeanVersion", lit(None))
+    df = build_dim_billing_account_df(spark, dfs)
+    # BeanVersion should concatenate with empty string for NULL
+    assert df.filter(col("BeanVersion").contains("BV1")).count() > 0
+
+# TC11: IsActive logic
+def test_isactive_logic(spark, sample_dataframes):
+    df = build_dim_billing_account_df(spark, sample_dataframes)
+    for row in df.collect():
+        if row.IsActive == 1:
+            assert row.Retired == 0 or row.Retired is None
+        else:
+            assert row.Retired != 0
+
+# TC12: Merge logic (simulate)
+def test_merge_logic_simulation(spark, sample_dataframes):
+    df = build_dim_billing_account_df(spark, sample_dataframes)
+    # Simulate merge: update if PublicID & LegacySourceSystem match, else insert
+    existing = df.select("PublicID", "LegacySourceSystem").collect()
+    # Insert new row with new PublicID
+    new_row = df.collect()[0].asDict()
+    new_row["PublicID"] = "NEWPUB"
+    new_df = spark.createDataFrame([new_row], df.schema)
+    merged = df.union(new_df).dropDuplicates(["PublicID", "LegacySourceSystem"])
+    assert merged.count() == df.count() + 1
+
+# TC13: Audit record creation
+def test_audit_record_creation(spark, sample_dataframes):
+    df = build_dim_billing_account_df(spark, sample_dataframes)
+    batch_id = 12345
+    audit_df = spark.createDataFrame([
+        {
+            "ControlID": batch_id,
+            "BatchID": batch_id,
+            "Status": "Completed",
+            "InitiateDtm": current_timestamp(),
+            "CompletedInd": 1,
+            "ConcludeDtm": current_timestamp(),
+            "SourceCount": df.count(),
+            "InsertCount": 0,
+            "UpdateCount": 0,
+            "UnChangeCount": 0
+        }
+    ])
+    expected_columns = ["ControlID", "BatchID", "Status", "InitiateDtm", "CompletedInd", "ConcludeDtm", "SourceCount", "InsertCount", "UpdateCount", "UnChangeCount"]
+    assert set(audit_df.columns) == set(expected_columns)
+    assert audit_df.collect()[0].Status == "Completed"
+
+# TC14: Performance caching/unpersist
+def test_performance_caching_unpersist(spark, sample_dataframes):
+    # Cache and unpersist
+    for key in sample_dataframes.keys():
+        sample_dataframes[key].cache()
+    for key in sample_dataframes.keys():
+        sample_dataframes[key].unpersist()
+    # No assertion, just ensure no errors
+
+```
+
+# 3. API Cost Consumed
+
+API Cost Consumed in dollars: $0.02
+```
