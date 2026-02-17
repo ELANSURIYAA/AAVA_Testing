@@ -1,0 +1,1 @@
+{'managerLlm': [{}], 'enableAgenticMemory': False}
