@@ -1,0 +1,157 @@
+-- =============================================
+-- Author:       Ascendion AVA+
+-- Created on:   2024-06-10
+-- Description:  Executes DQ validation checks on MEMBERSDATA and logs violations to DQ_ISSUE_LOG
+-- =============================================
+
+CREATE OR REPLACE PROCEDURE sp_run_dq_checks()
+RETURNS STRING
+LANGUAGE JAVASCRIPT
+AS
+$$
+/*
+  Executes DQ validation checks on MEMBERSDATA and logs violations to DQ_ISSUE_LOG.
+  Author: Ascendion AVA+
+  Created on: 2024-06-10
+*/
+
+var schema = 'MY_SAMPLE_DB.PUBLIC';
+var source_table = 'MEMBERSDATA';
+var issue_log_table = 'DQ_ISSUE_LOG';
+var batch_seq = 'SEQ_BATCH_ID';
+
+// 1. Ensure SEQ_BATCH_ID exists
+try {
+    var seq_check_sql = `CREATE SEQUENCE IF NOT EXISTS ${schema}.${batch_seq}`;
+    snowflake.createStatement({sqlText: seq_check_sql}).execute();
+} catch (err) {
+    // Ignore if already exists
+}
+
+// 2. Generate new batch id
+var batch_id_stmt = snowflake.createStatement({sqlText: `SELECT ${schema}.${batch_seq}.NEXTVAL AS BATCH_ID`});
+var batch_id_result = batch_id_stmt.execute();
+batch_id_result.next();
+var batch_id = batch_id_result.getColumnValue('BATCH_ID');
+
+// 3. DQ Rules
+var dq_rules = [
+    // Column, Rule Type, Rule Description, Severity
+    {cols: ['FIRSTNAME'], type: 'NotNullCheck', desc: 'Ensure the first name is provided for every member.', severity: 'High'},
+    {cols: ['LASTNAME'], type: 'NotNullCheck', desc: 'Ensure the last name is provided for every member.', severity: 'High'},
+    {cols: ['COMPANY'], type: 'StringLengthCheck', desc: 'Ensure the company name does not exceed 255 characters.', severity: 'Medium', maxlen: 255},
+    {cols: ['ADDRESS'], type: 'StringLengthCheck', desc: 'Ensure the address does not exceed 16777216 characters.', severity: 'Low', maxlen: 16777216},
+    {cols: ['CITY'], type: 'ValueCheck', desc: 'Ensure the city is one of the approved locations: Los Angeles, New York, or London.', severity: 'High', values: ['Los Angeles', 'New York', 'London']},
+    {cols: ['COUNTRY'], type: 'NotNullCheck', desc: 'Ensure the country is provided for every member.', severity: 'High'},
+    {cols: ['STATE'], type: 'StringLengthCheck', desc: 'Ensure the state name does not exceed 100 characters.', severity: 'Medium', maxlen: 100},
+    {cols: ['ZIP'], type: 'FormatCheck', desc: 'Ensure the ZIP code matches the expected format (e.g., numeric or alphanumeric).', severity: 'Medium', regex: '^[A-Za-z0-9-]{5,10}$'},
+    {cols: ['PHONENUMBER1'], type: 'NotNullCheck', desc: 'Ensure the primary phone number is provided.', severity: 'High'},
+    {cols: ['PHONENUMBER2'], type: 'UniquenessCheck', desc: 'Ensure PHONENUMBER2 is distinct from PHONENUMBER1 for each member.', severity: 'High'},
+    {cols: ['EMAIL'], type: 'FormatCheck', desc: 'Ensure the email matches a valid email format.', severity: 'High', regex: '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$'},
+    {cols: ['WEB'], type: 'FormatCheck', desc: 'Ensure the website URL matches a valid URL format.', severity: 'Medium', regex: '^(https?://)?([\\w.-]+)\\.([a-zA-Z]{2,6})([/\\w .-]*)*/?$'},
+    {cols: ['MEMBER_ID'], type: 'UniquenessCheck', desc: 'Ensure MEMBER_ID is unique for each member.', severity: 'High'},
+    {cols: ['MEMBER_ID'], type: 'RangeCheck', desc: 'Ensure MEMBER_ID is within the range of 10000000 to 99999999.', severity: 'High', min: 10000000, max: 99999999},
+    {cols: ['PHONENUMBER1', 'EMAIL', 'WEB'], type: 'MultiNotNullCheck', desc: 'Ensure at least one valid form of contact information is provided (Phone, Email, or Website).', severity: 'High'}
+];
+
+// 4. Utility function to escape SQL literals
+function escapeSql(val) {
+    if (typeof val === 'string') {
+        return val.replace(/'/g, "''");
+    }
+    return val;
+}
+
+// 5. Loop through rules and execute checks
+for (var i = 0; i < dq_rules.length; i++) {
+    var rule = dq_rules[i];
+    var failed_sql = '';
+    var col_name = rule.cols.join(', ');
+    var rule_desc = escapeSql(rule.desc);
+    var severity = escapeSql(rule.severity);
+
+    if (rule.type === 'NotNullCheck') {
+        failed_sql = `SELECT MEMBER_ID FROM ${schema}.${source_table} WHERE ${rule.cols[0]} IS NULL`;
+    }
+    else if (rule.type === 'StringLengthCheck') {
+        failed_sql = `SELECT MEMBER_ID FROM ${schema}.${source_table} WHERE LENGTH(${rule.cols[0]}) > ${rule.maxlen}`;
+    }
+    else if (rule.type === 'ValueCheck') {
+        var values_list = rule.values.map(v => `'${escapeSql(v)}'`).join(', ');
+        failed_sql = `SELECT MEMBER_ID FROM ${schema}.${source_table} WHERE ${rule.cols[0]} IS NOT NULL AND ${rule.cols[0]} NOT IN (${values_list})`;
+    }
+    else if (rule.type === 'FormatCheck') {
+        // Use valid regex, hyphen at end of character class, RLIKE for Snowflake
+        failed_sql = `SELECT MEMBER_ID FROM ${schema}.${source_table} WHERE ${rule.cols[0]} IS NOT NULL AND NOT (${rule.cols[0]} RLIKE '${escapeSql(rule.regex)}')`;
+    }
+    else if (rule.type === 'UniquenessCheck') {
+        if (rule.cols.length === 1) {
+            // MEMBER_ID uniqueness
+            failed_sql = `
+                SELECT MEMBER_ID FROM ${schema}.${source_table}
+                GROUP BY MEMBER_ID
+                HAVING COUNT(*) > 1
+            `;
+        } else {
+            // PHONENUMBER2 distinct from PHONENUMBER1
+            failed_sql = `SELECT MEMBER_ID FROM ${schema}.${source_table} WHERE PHONENUMBER2 IS NOT NULL AND PHONENUMBER2 = PHONENUMBER1`;
+        }
+    }
+    else if (rule.type === 'RangeCheck') {
+        failed_sql = `SELECT MEMBER_ID FROM ${schema}.${source_table} WHERE MEMBER_ID < ${rule.min} OR MEMBER_ID > ${rule.max}`;
+    }
+    else if (rule.type === 'MultiNotNullCheck') {
+        // At least one of PHONENUMBER1, EMAIL, WEB is not null
+        failed_sql = `
+            SELECT MEMBER_ID FROM ${schema}.${source_table}
+            WHERE (PHONENUMBER1 IS NULL OR TRIM(PHONENUMBER1) = '')
+              AND (EMAIL IS NULL OR TRIM(EMAIL) = '')
+              AND (WEB IS NULL OR TRIM(WEB) = '')
+        `;
+    }
+
+    // Execute failed_sql and insert violations into issue log
+    if (failed_sql) {
+        try {
+            var failed_stmt = snowflake.createStatement({sqlText: failed_sql});
+            var failed_rs = failed_stmt.execute();
+            while (failed_rs.next()) {
+                var member_id = failed_rs.getColumnValue('MEMBER_ID');
+                var insert_sql = `
+                    INSERT INTO ${schema}.${issue_log_table}
+                    (TABLE_NAME, COLUMN_NAME, RULE_DESCRIPTION, SEVERITY, LOGGED_AT, BATCH_ID, MEMBER_ID)
+                    VALUES (
+                        '${escapeSql(source_table)}',
+                        '${escapeSql(col_name)}',
+                        '${rule_desc}',
+                        '${severity}',
+                        CURRENT_TIMESTAMP(),
+                        ${batch_id},
+                        ${member_id}
+                    )
+                `;
+                snowflake.createStatement({sqlText: insert_sql}).execute();
+            }
+        } catch (err) {
+            var error_sql = `
+                INSERT INTO ${schema}.${issue_log_table}
+                (TABLE_NAME, COLUMN_NAME, RULE_DESCRIPTION, SEVERITY, LOGGED_AT, BATCH_ID, MEMBER_ID)
+                VALUES (
+                    '${escapeSql(source_table)}',
+                    '${escapeSql(col_name)}',
+                    'DQ check failed: ${escapeSql(rule_desc)}. Error: ${escapeSql(err.message)}',
+                    '${severity}',
+                    CURRENT_TIMESTAMP(),
+                    ${batch_id},
+                    NULL
+                )
+            `;
+            snowflake.createStatement({sqlText: error_sql}).execute();
+        }
+    }
+}
+
+return 'DQ checks executed and violations logged with batch ID ' + batch_id;
+
+$$;
+-- =============================================
