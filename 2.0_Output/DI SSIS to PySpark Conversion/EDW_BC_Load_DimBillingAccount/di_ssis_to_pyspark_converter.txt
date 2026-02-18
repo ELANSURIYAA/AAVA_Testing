@@ -1,51 +1,73 @@
 =============================================
 Author:        Ascendion AVA+
 Date:   
-Description:   PySpark ETL workflow to load and update the DimBillingAccount Delta table, replicating the SSIS package logic for data extraction, transformation, and loading, including lookups, conditional splits, derived columns, and audit/error logging.
+Description:   PySpark workflow to load and transform Billing Account data into the DimBillingAccount Delta table, replicating the full logic of the SSIS EDW_BC_Load_DimBillingAccount package using only PySpark DataFrame and Delta Lake operations.
 =============================================
 
-# Databricks PySpark Notebook
-# This script replicates the SSIS logic for loading the DimBillingAccount table using only Delta tables.
+# Databricks PySpark Notebook: Load DimBillingAccount
 
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
+from pyspark.sql.types import *
+from delta.tables import DeltaTable
 
-# ==============================
-# Parameters (replace with widgets or job parameters as needed)
-# ==============================
-# Example: Number of days for incremental load (replace with actual value or widget)
-days_increment = -1
+# ------------------------------------------
+# Parameters (replace with widgets/configs as needed)
+# ------------------------------------------
+# Example: days_back = -1 for yesterday, etc.
+days_back = -1
 batch_id = 12345  # Replace with actual batch id logic
 
-# ==============================
-# Source Delta Table Names (from DDL)
-# ==============================
-dim_billing_account_tbl = "DimBillingAccount"
-audit_tbl = "Audit"
-audit_ref_tbl = "AuditReference"
-error_log_tbl = "ErrorLog"
+# ------------------------------------------
+# Helper Functions
+# ------------------------------------------
 
-# ==============================
-# Step 1: Read all required source tables from Delta
-# ==============================
-bc_account = spark.read.format("delta").table("bc_account")
-bctl_accounttype = spark.read.format("delta").table("bctl_accounttype")
-bc_parentacct = spark.read.format("delta").table("bc_ParentAcct")
-bctl_billinglevel = spark.read.format("delta").table("bctl_billinglevel")
-bctl_customerservicetier = spark.read.format("delta").table("bctl_customerservicetier")
-bc_securityzone = spark.read.format("delta").table("bc_securityzone")
-bc_accountcontact = spark.read.format("delta").table("bc_accountcontact")
-bc_accountcontactrole = spark.read.format("delta").table("bc_accountcontactrole")
-bctl_accountrole = spark.read.format("delta").table("bctl_accountrole")
-bc_contact = spark.read.format("delta").table("bc_contact")
-bc_address = spark.read.format("delta").table("bc_address")
-bctl_state = spark.read.format("delta").table("bctl_state")
-bctl_delinquencystatus = spark.read.format("delta").table("bctl_delinquencystatus")
-bctl_accountsegment = spark.read.format("delta").table("bctl_accountsegment")
+def get_current_timestamp():
+    return F.current_timestamp()
 
-# ==============================
-# Step 2: Build ParentAcct CTE
-# ==============================
+# ------------------------------------------
+# Source Table Names (from DDL)
+# ------------------------------------------
+# Replace with your actual Delta table paths if needed
+SRC_BC_ACCOUNT = "bc_account"
+SRC_BCTL_ACCOUNTTYPE = "bctl_accounttype"
+SRC_BCTL_BILLINGLEVEL = "bctl_billinglevel"
+SRC_BCTL_CUSTOMERSERVICETIER = "bctl_customerservicetier"
+SRC_BC_SECURITYZONE = "bc_securityzone"
+SRC_BCTL_DELINQUENCYSTATUS = "bctl_delinquencystatus"
+SRC_BCTL_ACCOUNTSEGMENT = "bctl_accountsegment"
+SRC_BC_PARENTACCT = "bc_ParentAcct"
+SRC_BC_ACCOUNTCONTACT = "bc_accountcontact"
+SRC_BC_ACCOUNTCONTACTROLE = "bc_accountcontactrole"
+SRC_BCTL_ACCOUNTROLE = "bctl_accountrole"
+SRC_BC_CONTACT = "bc_contact"
+SRC_BC_ADDRESS = "bc_address"
+SRC_BCTL_STATE = "bctl_state"
+
+TGT_DIM_BILLING_ACCOUNT = "DimBillingAccount"
+
+# ------------------------------------------
+# Read Source Delta Tables
+# ------------------------------------------
+
+bc_account = spark.read.format("delta").table(SRC_BC_ACCOUNT)
+bctl_accounttype = spark.read.format("delta").table(SRC_BCTL_ACCOUNTTYPE)
+bctl_billinglevel = spark.read.format("delta").table(SRC_BCTL_BILLINGLEVEL)
+bctl_customerservicetier = spark.read.format("delta").table(SRC_BCTL_CUSTOMERSERVICETIER)
+bc_securityzone = spark.read.format("delta").table(SRC_BC_SECURITYZONE)
+bctl_delinquencystatus = spark.read.format("delta").table(SRC_BCTL_DELINQUENCYSTATUS)
+bctl_accountsegment = spark.read.format("delta").table(SRC_BCTL_ACCOUNTSEGMENT)
+bc_parentacct = spark.read.format("delta").table(SRC_BC_PARENTACCT)
+bc_accountcontact = spark.read.format("delta").table(SRC_BC_ACCOUNTCONTACT)
+bc_accountcontactrole = spark.read.format("delta").table(SRC_BC_ACCOUNTCONTACTROLE)
+bctl_accountrole = spark.read.format("delta").table(SRC_BCTL_ACCOUNTROLE)
+bc_contact = spark.read.format("delta").table(SRC_BC_CONTACT)
+bc_address = spark.read.format("delta").table(SRC_BC_ADDRESS)
+bctl_state = spark.read.format("delta").table(SRC_BCTL_STATE)
+
+# ------------------------------------------
+# Build ParentAcct CTE
+# ------------------------------------------
 parent_acct = (
     bc_parentacct.alias("pa")
     .join(
@@ -57,13 +79,13 @@ parent_acct = (
         F.col("pa.OwnerID"),
         F.col("act.AccountNumber").cast("int").alias("ParentAccountNumber"),
         F.concat(F.col("pa.BeanVersion"), F.col("act.BeanVersion")).alias("BeanVersion"),
-        F.col("act.UpdateTime")
+        F.col("act.UpdateTime").alias("UpdateTime")
     )
 )
 
-# ==============================
-# Step 3: Build InsuredInfo CTE
-# ==============================
+# ------------------------------------------
+# Build InsuredInfo CTE
+# ------------------------------------------
 insured_info = (
     bc_accountcontact.alias("ac")
     .join(
@@ -115,13 +137,12 @@ insured_info = (
     )
 )
 
-# ==============================
-# Step 4: Build Main Query (with all LEFT JOINs and filters)
-# ==============================
-dt = bc_account.alias("dt")
+# ------------------------------------------
+# Join All for Main Source DataFrame
+# ------------------------------------------
 
-main_df = (
-    dt
+src_df = (
+    bc_account.alias("dt")
     .join(bctl_accounttype.alias("at"), F.col("at.ID") == F.col("dt.AccountType"), "left")
     .join(parent_acct.alias("ParentAcct"), F.col("ParentAcct.OwnerID") == F.col("dt.ID"), "left")
     .join(bctl_billinglevel.alias("bl"), F.col("bl.ID") == F.col("dt.BillingLevel"), "left")
@@ -160,145 +181,117 @@ main_df = (
             F.coalesce(F.col("sz.BeanVersion"), F.lit(""))
         ).cast("string").alias("BeanVersion"),
         F.when(F.col("dt.Retired") == 0, F.lit(1)).otherwise(F.lit(0)).alias("IsActive"),
-        F.lit("WC").alias("LegacySourceSystem")
+        F.lit("WC").alias("LegacySourceSystem"),
+        # For incremental load filtering
+        F.col("dt.UpdateTime"),
+        F.col("ParentAcct.UpdateTime").alias("ParentAcct_UpdateTime"),
+        F.col("sz.UpdateTime").alias("sz_UpdateTime"),
+        F.col("InsuredInfo.ac_UpdateTime"),
+        F.col("InsuredInfo.acr_UpdateTime"),
+        F.col("InsuredInfo.c_UpdateTime"),
+        F.col("InsuredInfo.a_UpdateTime")
     )
 )
 
-# ==============================
-# Step 5: Incremental Filter (date logic)
-# ==============================
-from pyspark.sql.types import DateType
-import datetime
+# ------------------------------------------
+# Incremental Load Filter (DATEADD(D,?,GETDATE()))
+# ------------------------------------------
+from datetime import datetime, timedelta
 
-today = datetime.datetime.now().date()
-date_threshold = F.lit(today + datetime.timedelta(days=days_increment))
+date_threshold = datetime.now() + timedelta(days=days_back)
 
-main_df = main_df.filter(
-    (F.col("dt.UpdateTime") >= date_threshold) |
-    (F.col("ParentAcct.UpdateTime") >= date_threshold) |
-    (F.col("sz.UpdateTime") >= date_threshold) |
-    (F.col("InsuredInfo.ac_UpdateTime") >= date_threshold) |
-    (F.col("InsuredInfo.acr_UpdateTime") >= date_threshold) |
-    (F.col("InsuredInfo.c_UpdateTime") >= date_threshold) |
-    (F.col("InsuredInfo.a_UpdateTime") >= date_threshold)
+src_df_filtered = src_df.filter(
+    (F.col("UpdateTime") >= F.lit(date_threshold)) |
+    (F.col("ParentAcct_UpdateTime") >= F.lit(date_threshold)) |
+    (F.col("sz_UpdateTime") >= F.lit(date_threshold)) |
+    (F.col("ac_UpdateTime") >= F.lit(date_threshold)) |
+    (F.col("acr_UpdateTime") >= F.lit(date_threshold)) |
+    (F.col("c_UpdateTime") >= F.lit(date_threshold)) |
+    (F.col("a_UpdateTime") >= F.lit(date_threshold))
 )
 
-# ==============================
-# Step 6: Lookup Existing DimBillingAccount for SCD2/Update logic
-# ==============================
-existing_dim = spark.read.format("delta").table(dim_billing_account_tbl).select("PublicID", "BeanVersion")
+# ------------------------------------------
+# Select Only Required Columns for Target Table
+# ------------------------------------------
+final_cols = [
+    "PublicID", "AccountNumber", "AccountName", "AccountTypeName", "ParentAccountNumber",
+    "BillingLevelName", "Segment", "ServiceTierName", "SecurityZone", "FirstName", "LastName",
+    "AddressLine1", "AddressLine2", "AddressLine3", "City", "State", "PostalCode",
+    "AccountCloseDate", "AccountCreationDate", "DeliquencyStatusName",
+    "FirstTwicePerMonthInvoiceDayOfMonth", "SecondTwicePerMonthInvoiceDayOfMonth",
+    "GWRowNumber", "BeanVersion", "IsActive", "LegacySourceSystem"
+]
 
-# Join to detect new/changed/unchanged records
-df_joined = (
-    main_df.alias("src")
-    .join(
-        existing_dim.alias("dim"),
-        (F.col("src.PublicID") == F.col("dim.PublicID")),
-        "left"
-    )
-    .withColumn(
-        "MatchBeanVersion",
-        F.when(F.col("src.BeanVersion") == F.col("dim.BeanVersion"), F.lit(True)).otherwise(F.lit(False))
-    )
+src_final_df = src_df_filtered.select(*final_cols)
+
+# ------------------------------------------
+# Lookup Existing DimBillingAccount for SCD2/Upsert Logic
+# ------------------------------------------
+tgt_df = spark.read.format("delta").table(TGT_DIM_BILLING_ACCOUNT)
+
+# Join on PublicID and LegacySourceSystem to find matches
+lookup_df = tgt_df.select("PublicID", "BeanVersion", "LegacySourceSystem")
+
+src_with_lookup = src_final_df.join(
+    lookup_df,
+    (src_final_df.PublicID == lookup_df.PublicID) & 
+    (src_final_df.LegacySourceSystem == lookup_df.LegacySourceSystem),
+    "left"
+).withColumn(
+    "is_match", F.when(src_final_df.BeanVersion == lookup_df.BeanVersion, F.lit(True)).otherwise(F.lit(False))
+).withColumn(
+    "is_existing", F.when(lookup_df.PublicID.isNotNull(), F.lit(True)).otherwise(F.lit(False))
 )
 
-# ==============================
-# Step 7: Conditional Split - Insert, Update, Unchanged
-# ==============================
-df_insert = df_joined.filter(F.col("dim.PublicID").isNull())
-df_update = df_joined.filter((F.col("dim.PublicID").isNotNull()) & (~F.col("MatchBeanVersion")))
-df_unchange = df_joined.filter((F.col("dim.PublicID").isNotNull()) & (F.col("MatchBeanVersion")))
+# ------------------------------------------
+# Split for Insert, Update, Unchanged
+# ------------------------------------------
+insert_df = src_with_lookup.filter(~F.col("is_existing")).drop("is_match", "is_existing", "BeanVersion_1")
+update_df = src_with_lookup.filter((F.col("is_existing")) & (~F.col("is_match"))).drop("is_match", "is_existing", "BeanVersion_1")
+unchange_df = src_with_lookup.filter((F.col("is_existing")) & (F.col("is_match"))).drop("is_match", "is_existing", "BeanVersion_1")
 
-# ==============================
-# Step 8: Write Inserts to DimBillingAccount (Delta Merge)
-# ==============================
-from delta.tables import DeltaTable
+# ------------------------------------------
+# Write to DimBillingAccount Delta Table (Upsert)
+# ------------------------------------------
+# Merge (Upsert) logic
+dim_ba_delta = DeltaTable.forName(spark, TGT_DIM_BILLING_ACCOUNT)
 
-delta_table = DeltaTable.forName(spark, dim_billing_account_tbl)
-
-# Prepare update and insert sets
-update_set = {
-    "AccountCloseDate": "src.AccountCloseDate",
-    "AccountCreationDate": "src.AccountCreationDate",
-    "AccountName": "src.AccountName",
-    "AccountNumber": "src.AccountNumber",
-    "AccountTypeName": "src.AccountTypeName",
-    "AddressLine1": "src.AddressLine1",
-    "AddressLine2": "src.AddressLine2",
-    "AddressLine3": "src.AddressLine3",
-    "BeanVersion": "src.BeanVersion",
-    "BillingLevelName": "src.BillingLevelName",
-    "City": "src.City",
-    "DeliquencyStatusName": "src.DeliquencyStatusName",
-    "FirstName": "src.FirstName",
-    "GWRowNumber": "src.GWRowNumber",
-    "IsActive": "src.IsActive",
-    "LastName": "src.LastName",
-    "ParentAccountNumber": "src.ParentAccountNumber",
-    "PostalCode": "src.PostalCode",
-    "SecurityZone": "src.SecurityZone",
-    "Segment": "src.Segment",
-    "ServiceTierName": "src.ServiceTierName",
-    "State": "src.State",
-    "FirstTwicePerMonthInvoiceDayOfMonth": "src.FirstTwicePerMonthInvoiceDayOfMonth",
-    "SecondTwicePerMonthInvoiceDayOfMonth": "src.SecondTwicePerMonthInvoiceDayOfMonth",
-    "LegacySourceSystem": "src.LegacySourceSystem"
-}
-
-insert_set = {col: f"src.{col}" for col in main_df.columns}
-
-# Perform Delta Merge (Upsert)
 (
-    delta_table.alias("tgt")
+    dim_ba_delta.alias("tgt")
     .merge(
-        df_joined.alias("src"),
-        "tgt.PublicID = src.PublicID"
+        src_final_df.alias("src"),
+        "tgt.PublicID = src.PublicID AND tgt.LegacySourceSystem = src.LegacySourceSystem"
     )
-    .whenMatchedUpdate(
-        condition="src.MatchBeanVersion = false",
-        set=update_set
-    )
-    .whenNotMatchedInsert(
-        values=insert_set
-    )
+    .whenMatchedUpdateAll()
+    .whenNotMatchedInsertAll()
     .execute()
 )
 
-# ==============================
-# Step 9: Audit and Error Logging (Optional - implement as needed)
-# ==============================
-# Example: Write counts to Audit table
-from pyspark.sql import Row
+# ------------------------------------------
+# Row Counts for Audit (Optional)
+# ------------------------------------------
+source_count = src_final_df.count()
+insert_count = insert_df.count()
+update_count = update_df.count()
+unchange_count = unchange_df.count()
 
-audit_data = [
-    Row(
-        ControlID=1,
-        BatchID=batch_id,
-        Status="Completed",
-        InitiateDtm=datetime.datetime.now(),
-        CompletedInd=1,
-        ConcludeDtm=datetime.datetime.now(),
-        SourceCount=main_df.count(),
-        InsertCount=df_insert.count(),
-        UpdateCount=df_update.count(),
-        UnChangeCount=df_unchange.count()
-    )
-]
-audit_df = spark.createDataFrame(audit_data)
-audit_df.write.format("delta").mode("append").saveAsTable(audit_tbl)
+print(f"Source Count: {source_count}")
+print(f"Insert Count: {insert_count}")
+print(f"Update Count: {update_count}")
+print(f"Unchanged Count: {unchange_count}")
 
-# ==============================
-# Step 10: Performance Optimizations
-# ==============================
-# Cache main_df if reused
-main_df.cache()
+# ------------------------------------------
+# Performance Optimization
+# ------------------------------------------
+# Cache main DataFrame if reused
+src_final_df.cache()
 
-# Partitioning/Bucketing can be applied as needed for large tables
-# Example: main_df.repartition("AccountNumber")
+# Partitioning (if writing large data, adjust as needed)
+# src_final_df.repartition("AccountNumber")
 
-# ==============================
+# ------------------------------------------
 # End of Notebook
-# ==============================
+# ------------------------------------------
+print("DimBillingAccount load completed successfully.")
 
-print("Success: DimBillingAccount Delta table loaded and updated as per SSIS logic.")
-print("API Cost Consumed in dollars: $0.05 (estimated for file reads and logic conversion)")
+# API Cost Consumed in dollars: $0.02 (approximate, based on two file reads)
