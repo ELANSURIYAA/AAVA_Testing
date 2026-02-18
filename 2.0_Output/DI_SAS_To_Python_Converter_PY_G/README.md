@@ -6,5 +6,5 @@ Triggered By: manas.thiruveedhula@ascendion.com
 Inputs:
 - marketing_healthcare_extract
  
-Execution ID: d30c7044-227c-4aac-a8eb-566f9c681c45
-Execution Time: 2026-02-18 10:13:55 UTC
+Execution ID: c5be3e58-b6e8-4536-b2ac-5fe66175f36e
+Execution Time: 2026-02-18 10:58:45 UTC
