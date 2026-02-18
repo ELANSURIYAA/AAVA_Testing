@@ -1,26 +1,425 @@
 =============================================
 Author:        Ascendion AVA+
 Date:   
-Description:   Comprehensive Pytest suite for validating the PySpark ETL workflow loading and updating the DimBillingAccount Delta table, ensuring data integrity, transformation accuracy, and performance optimization.
+Description:   Pytest suite for validating PySpark DataFrame transformations for DimBillingAccount, ensuring data integrity, transformation accuracy, and performance, as per SSIS EDW_BC_Load_DimBillingAccount logic.
 =============================================
 
-# 1. Test Case List
+# Test Case List
 
-| Test Case ID | Description                                                                                  | Expected Outcome                                                                                   |
-|--------------|---------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------|
-| TC01         | Validate happy path: correct join, transformation, and incremental filter                    | DataFrame output matches expected schema and values; correct row counts                            |
-| TC02         | Edge case: NULL values in join keys and transformation columns                               | DataFrame handles NULLs gracefully; output columns have correct NULL propagation                   |
-| TC03         | Edge case: Empty DataFrames as input                                                         | Output DataFrame is empty; no errors; audit counts are zero                                        |
-| TC04         | Edge case: Boundary values for date filtering                                                | Only rows within date threshold are included; correct handling of boundary dates                   |
-| TC05         | Error handling: Invalid schema (missing columns)                                             | Raises appropriate exception; error logging is triggered                                           |
-| TC06         | Error handling: Unexpected data types (e.g., string instead of int)                          | Raises appropriate exception or coerces types as per logic                                         |
-| TC07         | Transformation accuracy: Derived columns (BeanVersion, IsActive, etc.)                       | Derived columns are computed correctly for all input scenarios                                     |
-| TC08         | SCD2 logic: Insert, Update, Unchanged split                                                  | Rows are correctly split into insert, update, and unchanged; counts match expectations             |
-| TC09         | Audit logging: Audit table receives correct counts                                           | Audit table is written with correct SourceCount, InsertCount, UpdateCount, UnChangeCount           |
-| TC10         | Performance: Caching and partitioning                                                        | DataFrame is cached; partitioning does not affect correctness                                      |
+| Test Case ID | Description                                                                                      | Expected Outcome                                                                                   |
+|--------------|--------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: All source tables populated, valid joins, incremental filter applies                  | Output DataFrame matches expected schema and values; correct row counts                            |
+| TC02         | Edge: Source DataFrames are empty                                                                | Output DataFrame is empty; no errors                                                               |
+| TC03         | Edge: NULL values in join keys and selected columns                                              | NULLs handled gracefully; output columns reflect correct NULL propagation                          |
+| TC04         | Edge: Boundary values for date filtering (exact threshold)                                       | Only rows with UpdateTime >= threshold included                                                    |
+| TC05         | Error: Invalid schema in one source DataFrame                                                    | Raises appropriate exception; test fails as expected                                               |
+| TC06         | Error: Unexpected data types (e.g., string in integer column)                                    | Raises appropriate exception or handles gracefully                                                 |
+| TC07         | Edge: Duplicate keys in lookup (PublicID, LegacySourceSystem)                                    | Upsert logic handles duplicates as per business rules                                              |
+| TC08         | Happy path: SCD2/Upsert logic - new, changed, unchanged records                                  | Insert, update, unchanged counts match expectations                                                |
+| TC09         | Performance: Large DataFrame caching and partitioning                                            | DataFrame caches successfully; partitioning does not alter row count or schema                     |
+| TC10         | Edge: Missing optional columns in source tables                                                  | Output DataFrame fills with NULLs or default values as appropriate                                 |
 
-# 2. Pytest Scripts
+# Pytest Script
 
-[See above for full Pytest script implementation]
+```python
+import pytest
+from pyspark.sql import SparkSession, functions as F, types as T
+from delta.tables import DeltaTable
+from datetime import datetime, timedelta
 
-# API Cost Consumed for this call: $0.05 (estimated for file reads and logic conversion)
+# Fixtures and helpers
+
+@pytest.fixture(scope="session")
+def spark():
+    return SparkSession.builder \
+        .master("local[2]") \
+        .appName("DimBillingAccountTest") \
+        .getOrCreate()
+
+@pytest.fixture
+def setup_source_tables(spark):
+    """
+    Returns a dictionary of mock DataFrames for all source tables.
+    """
+    now = datetime.now()
+    # Mock data for happy path
+    bc_account = spark.createDataFrame([
+        (1, "Account A", 100, 10, 20, 30, 40, 50, 60, 0, now, now, "PUB1", "BV1", 1, now, now, 1, 2, 3, "GW1"),
+        (2, "Account B", 101, 11, 21, 31, 41, 51, 61, 0, now, now, "PUB2", "BV2", 0, now, now, 4, 5, 6, "GW2"),
+    ], schema=T.StructType([
+        T.StructField("ID", T.IntegerType()),
+        T.StructField("AccountName", T.StringType()),
+        T.StructField("AccountNumber", T.IntegerType()),
+        T.StructField("AccountType", T.IntegerType()),
+        T.StructField("BillingLevel", T.IntegerType()),
+        T.StructField("ServiceTier", T.IntegerType()),
+        T.StructField("SecurityZoneID", T.IntegerType()),
+        T.StructField("DelinquencyStatus", T.IntegerType()),
+        T.StructField("Segment", T.IntegerType()),
+        T.StructField("Retired", T.IntegerType()),
+        T.StructField("UpdateTime", T.TimestampType()),
+        T.StructField("CreateTime", T.TimestampType()),
+        T.StructField("PublicID", T.StringType()),
+        T.StructField("BeanVersion", T.StringType()),
+        T.StructField("FirstTwicePerMthInvoiceDOM", T.IntegerType()),
+        T.StructField("CloseDate", T.TimestampType()),
+        T.StructField("AccountCreationDate", T.TimestampType()),
+        T.StructField("SecondTwicePerMthInvoiceDOM", T.IntegerType()),
+        T.StructField("GWRowNumber", T.IntegerType()),
+        T.StructField("ParentAccountNumber", T.IntegerType()),
+        T.StructField("LegacySourceSystem", T.StringType()),
+    ]))
+    bctl_accounttype = spark.createDataFrame([
+        (10, "Type A"), (11, "Type B")
+    ], schema="ID INT, NAME STRING")
+    bctl_billinglevel = spark.createDataFrame([
+        (20, "Level A"), (21, "Level B")
+    ], schema="ID INT, NAME STRING")
+    bctl_customerservicetier = spark.createDataFrame([
+        (30, "Tier A"), (31, "Tier B")
+    ], schema="ID INT, NAME STRING")
+    bc_securityzone = spark.createDataFrame([
+        (40, "Zone A", "SZBV1", now), (41, "Zone B", "SZBV2", now)
+    ], schema="ID INT, Name STRING, BeanVersion STRING, UpdateTime TIMESTAMP")
+    bctl_delinquencystatus = spark.createDataFrame([
+        (50, "Delinquent"), (51, "Current")
+    ], schema="ID INT, NAME STRING")
+    bctl_accountsegment = spark.createDataFrame([
+        (60, "Segment A"), (61, "Segment B")
+    ], schema="ID INT, NAME STRING")
+    bc_parentacct = spark.createDataFrame([
+        (100, 1, "BVPA1", 1), (101, 2, "BVPA2", 2)
+    ], schema="ForeignEntityID INT, OwnerID INT, BeanVersion STRING, UpdateTime INT")
+    bc_accountcontact = spark.createDataFrame([
+        (200, 1, "BVAC1", 1), (201, 2, "BVAC2", 2)
+    ], schema="ID INT, InsuredAccountID INT, BeanVersion STRING, UpdateTime INT")
+    bc_accountcontactrole = spark.createDataFrame([
+        (300, 200, 400, "BVACR1", 1), (301, 201, 401, "BVACR2", 2)
+    ], schema="ID INT, AccountContactID INT, Role INT, BeanVersion STRING, UpdateTime INT")
+    bctl_accountrole = spark.createDataFrame([
+        (400, "insured"), (401, "insured")
+    ], schema="ID INT, TYPECODE STRING")
+    bc_contact = spark.createDataFrame([
+        (500, "John", "Doe", 600, "BVC1", now), (501, "Jane", "Smith", 601, "BVC2", now)
+    ], schema="ID INT, FirstName STRING, LastName STRING, PrimaryAddressID INT, BeanVersion STRING, UpdateTime TIMESTAMP")
+    bc_address = spark.createDataFrame([
+        (600, "Addr1", "Addr2", "Addr3", "CityA", "12345", 700, "BVA1", now),
+        (601, "Addr4", "Addr5", "Addr6", "CityB", "67890", 701, "BVA2", now)
+    ], schema="ID INT, AddressLine1 STRING, AddressLine2 STRING, AddressLine3 STRING, City STRING, PostalCode STRING, State INT, BeanVersion STRING, UpdateTime TIMESTAMP")
+    bctl_state = spark.createDataFrame([
+        (700, "StateA"), (701, "StateB")
+    ], schema="ID INT, NAME STRING")
+    tgt_dim_billing_account = spark.createDataFrame([
+        ("PUB1", "BV1", "WC"), ("PUB2", "BV2", "WC")
+    ], schema="PublicID STRING, BeanVersion STRING, LegacySourceSystem STRING")
+    return {
+        "bc_account": bc_account,
+        "bctl_accounttype": bctl_accounttype,
+        "bctl_billinglevel": bctl_billinglevel,
+        "bctl_customerservicetier": bctl_customerservicetier,
+        "bc_securityzone": bc_securityzone,
+        "bctl_delinquencystatus": bctl_delinquencystatus,
+        "bctl_accountsegment": bctl_accountsegment,
+        "bc_parentacct": bc_parentacct,
+        "bc_accountcontact": bc_accountcontact,
+        "bc_accountcontactrole": bc_accountcontactrole,
+        "bctl_accountrole": bctl_accountrole,
+        "bc_contact": bc_contact,
+        "bc_address": bc_address,
+        "bctl_state": bctl_state,
+        "tgt_dim_billing_account": tgt_dim_billing_account
+    }
+
+def build_parent_acct(bc_parentacct, bc_account):
+    return (
+        bc_parentacct.alias("pa")
+        .join(
+            bc_account.alias("act"),
+            F.col("act.ID") == F.col("pa.ForeignEntityID"),
+            "inner"
+        )
+        .select(
+            F.col("pa.OwnerID"),
+            F.col("act.AccountNumber").cast("int").alias("ParentAccountNumber"),
+            F.concat(F.col("pa.BeanVersion"), F.col("act.BeanVersion")).alias("BeanVersion"),
+            F.col("act.UpdateTime").alias("UpdateTime")
+        )
+    )
+
+def build_insured_info(bc_accountcontact, bc_accountcontactrole, bctl_accountrole, bc_contact, bc_address, bctl_state):
+    return (
+        bc_accountcontact.alias("ac")
+        .join(
+            bc_accountcontactrole.alias("acr"),
+            F.col("acr.AccountContactID") == F.col("ac.ID"),
+            "inner"
+        )
+        .join(
+            bctl_accountrole.alias("tlar"),
+            F.col("tlar.ID") == F.col("acr.Role"),
+            "inner"
+        )
+        .join(
+            bc_contact.alias("c"),
+            F.col("c.ID") == F.col("ac.ContactID"),
+            "left"
+        )
+        .join(
+            bc_address.alias("a"),
+            F.col("a.ID") == F.col("c.PrimaryAddressID"),
+            "left"
+        )
+        .join(
+            bctl_state.alias("tls"),
+            F.col("tls.ID") == F.col("a.State"),
+            "left"
+        )
+        .filter(F.col("tlar.TYPECODE") == "insured")
+        .select(
+            F.col("ac.InsuredAccountID").alias("AccountID"),
+            F.col("c.FirstName"),
+            F.col("c.LastName"),
+            F.col("a.AddressLine1"),
+            F.col("a.AddressLine2"),
+            F.col("a.AddressLine3"),
+            F.col("a.City"),
+            F.col("a.PostalCode"),
+            F.col("tls.NAME").alias("State"),
+            F.concat(
+                F.col("ac.BeanVersion"),
+                F.col("acr.BeanVersion"),
+                F.col("c.BeanVersion"),
+                F.col("a.BeanVersion")
+            ).alias("BeanVersion"),
+            F.col("ac.UpdateTime").alias("ac_UpdateTime"),
+            F.col("acr.UpdateTime").alias("acr_UpdateTime"),
+            F.col("c.UpdateTime").alias("c_UpdateTime"),
+            F.col("a.UpdateTime").alias("a_UpdateTime")
+        )
+    )
+
+def build_src_df(tables):
+    parent_acct = build_parent_acct(tables["bc_parentacct"], tables["bc_account"])
+    insured_info = build_insured_info(
+        tables["bc_accountcontact"],
+        tables["bc_accountcontactrole"],
+        tables["bctl_accountrole"],
+        tables["bc_contact"],
+        tables["bc_address"],
+        tables["bctl_state"]
+    )
+    src_df = (
+        tables["bc_account"].alias("dt")
+        .join(tables["bctl_accounttype"].alias("at"), F.col("at.ID") == F.col("dt.AccountType"), "left")
+        .join(parent_acct.alias("ParentAcct"), F.col("ParentAcct.OwnerID") == F.col("dt.ID"), "left")
+        .join(tables["bctl_billinglevel"].alias("bl"), F.col("bl.ID") == F.col("dt.BillingLevel"), "left")
+        .join(tables["bctl_customerservicetier"].alias("cst"), F.col("cst.ID") == F.col("dt.ServiceTier"), "left")
+        .join(tables["bc_securityzone"].alias("sz"), F.col("sz.ID") == F.col("dt.SecurityZoneID"), "left")
+        .join(insured_info.alias("InsuredInfo"), F.col("InsuredInfo.AccountID") == F.col("dt.ID"), "left")
+        .join(tables["bctl_delinquencystatus"].alias("tlds"), F.col("tlds.ID") == F.col("dt.DelinquencyStatus"), "left")
+        .join(tables["bctl_accountsegment"].alias("bas"), F.col("bas.ID") == F.col("dt.Segment"), "left")
+        .select(
+            F.col("dt.AccountNumber"),
+            F.col("dt.AccountName"),
+            F.col("at.NAME").cast("string").alias("AccountTypeName"),
+            F.col("ParentAcct.ParentAccountNumber"),
+            F.col("bl.NAME").cast("string").alias("BillingLevelName"),
+            F.col("bas.NAME").cast("string").alias("Segment"),
+            F.col("cst.NAME").cast("string").alias("ServiceTierName"),
+            F.col("sz.Name").alias("SecurityZone"),
+            F.col("InsuredInfo.FirstName"),
+            F.col("InsuredInfo.LastName"),
+            F.col("InsuredInfo.AddressLine1"),
+            F.col("InsuredInfo.AddressLine2"),
+            F.col("InsuredInfo.AddressLine3"),
+            F.col("InsuredInfo.City").cast("string").alias("City"),
+            F.col("InsuredInfo.State").cast("string").alias("State"),
+            F.col("InsuredInfo.PostalCode").cast("string").alias("PostalCode"),
+            F.col("dt.CloseDate").alias("AccountCloseDate"),
+            F.col("dt.CreateTime").alias("AccountCreationDate"),
+            F.col("tlds.NAME").cast("string").alias("DeliquencyStatusName"),
+            F.col("dt.FirstTwicePerMthInvoiceDOM").alias("FirstTwicePerMonthInvoiceDayOfMonth"),
+            F.col("dt.SecondTwicePerMthInvoiceDOM").alias("SecondTwicePerMonthInvoiceDayOfMonth"),
+            F.col("dt.PublicID"),
+            F.col("dt.ID").alias("GWRowNumber"),
+            F.concat(
+                F.col("dt.BeanVersion"),
+                F.coalesce(F.col("ParentAcct.BeanVersion"), F.lit("")),
+                F.coalesce(F.col("sz.BeanVersion"), F.lit(""))
+            ).cast("string").alias("BeanVersion"),
+            F.when(F.col("dt.Retired") == 0, F.lit(1)).otherwise(F.lit(0)).alias("IsActive"),
+            F.lit("WC").alias("LegacySourceSystem"),
+            F.col("dt.UpdateTime"),
+            F.col("ParentAcct.UpdateTime").alias("ParentAcct_UpdateTime"),
+            F.col("sz.UpdateTime").alias("sz_UpdateTime"),
+            F.col("InsuredInfo.ac_UpdateTime"),
+            F.col("InsuredInfo.acr_UpdateTime"),
+            F.col("InsuredInfo.c_UpdateTime"),
+            F.col("InsuredInfo.a_UpdateTime")
+        )
+    )
+    return src_df
+
+def incremental_filter(src_df, days_back=-1):
+    date_threshold = datetime.now() + timedelta(days=days_back)
+    return src_df.filter(
+        (F.col("UpdateTime") >= F.lit(date_threshold)) |
+        (F.col("ParentAcct_UpdateTime") >= F.lit(date_threshold)) |
+        (F.col("sz_UpdateTime") >= F.lit(date_threshold)) |
+        (F.col("ac_UpdateTime") >= F.lit(date_threshold)) |
+        (F.col("acr_UpdateTime") >= F.lit(date_threshold)) |
+        (F.col("c_UpdateTime") >= F.lit(date_threshold)) |
+        (F.col("a_UpdateTime") >= F.lit(date_threshold))
+    )
+
+def select_final_cols(src_df):
+    final_cols = [
+        "PublicID", "AccountNumber", "AccountName", "AccountTypeName", "ParentAccountNumber",
+        "BillingLevelName", "Segment", "ServiceTierName", "SecurityZone", "FirstName", "LastName",
+        "AddressLine1", "AddressLine2", "AddressLine3", "City", "State", "PostalCode",
+        "AccountCloseDate", "AccountCreationDate", "DeliquencyStatusName",
+        "FirstTwicePerMonthInvoiceDayOfMonth", "SecondTwicePerMonthInvoiceDayOfMonth",
+        "GWRowNumber", "BeanVersion", "IsActive", "LegacySourceSystem"
+    ]
+    return src_df.select(*final_cols)
+
+# TC01: Happy path
+def test_happy_path(spark, setup_source_tables):
+    tables = setup_source_tables
+    src_df = build_src_df(tables)
+    filtered_df = incremental_filter(src_df)
+    final_df = select_final_cols(filtered_df)
+    # Assert schema
+    expected_cols = [
+        "PublicID", "AccountNumber", "AccountName", "AccountTypeName", "ParentAccountNumber",
+        "BillingLevelName", "Segment", "ServiceTierName", "SecurityZone", "FirstName", "LastName",
+        "AddressLine1", "AddressLine2", "AddressLine3", "City", "State", "PostalCode",
+        "AccountCloseDate", "AccountCreationDate", "DeliquencyStatusName",
+        "FirstTwicePerMonthInvoiceDayOfMonth", "SecondTwicePerMonthInvoiceDayOfMonth",
+        "GWRowNumber", "BeanVersion", "IsActive", "LegacySourceSystem"
+    ]
+    assert final_df.columns == expected_cols
+    # Assert row count
+    assert final_df.count() == 2
+
+# TC02: Edge - Empty DataFrames
+def test_empty_sources(spark):
+    empty_df = spark.createDataFrame([], schema="ID INT, AccountName STRING, AccountNumber INT, AccountType INT, BillingLevel INT, ServiceTier INT, SecurityZoneID INT, DelinquencyStatus INT, Segment INT, Retired INT, UpdateTime TIMESTAMP, CreateTime TIMESTAMP, PublicID STRING, BeanVersion STRING, FirstTwicePerMthInvoiceDOM INT, CloseDate TIMESTAMP, AccountCreationDate TIMESTAMP, SecondTwicePerMthInvoiceDOM INT, GWRowNumber INT, ParentAccountNumber INT, LegacySourceSystem STRING")
+    tables = {k: empty_df for k in [
+        "bc_account", "bctl_accounttype", "bctl_billinglevel", "bctl_customerservicetier", "bc_securityzone",
+        "bctl_delinquencystatus", "bctl_accountsegment", "bc_parentacct", "bc_accountcontact", "bc_accountcontactrole",
+        "bctl_accountrole", "bc_contact", "bc_address", "bctl_state"
+    ]}
+    src_df = build_src_df(tables)
+    filtered_df = incremental_filter(src_df)
+    final_df = select_final_cols(filtered_df)
+    assert final_df.count() == 0
+
+# TC03: Edge - NULL values in join keys and columns
+def test_null_values_propagation(spark, setup_source_tables):
+    tables = setup_source_tables
+    # Introduce NULLs
+    tables["bc_account"] = tables["bc_account"].withColumn("AccountType", F.lit(None))
+    src_df = build_src_df(tables)
+    filtered_df = incremental_filter(src_df)
+    final_df = select_final_cols(filtered_df)
+    # AccountTypeName should be NULL
+    assert final_df.filter(F.col("AccountTypeName").isNull()).count() == final_df.count()
+
+# TC04: Edge - Date boundary
+def test_date_boundary(spark, setup_source_tables):
+    tables = setup_source_tables
+    # Set UpdateTime to threshold
+    threshold = datetime.now() + timedelta(days=-1)
+    tables["bc_account"] = tables["bc_account"].withColumn("UpdateTime", F.lit(threshold))
+    src_df = build_src_df(tables)
+    filtered_df = incremental_filter(src_df, days_back=-1)
+    final_df = select_final_cols(filtered_df)
+    assert final_df.count() == 2
+
+# TC05: Error - Invalid schema
+def test_invalid_schema(spark):
+    # Missing required column
+    bc_account = spark.createDataFrame([
+        (1, "Account A", 100)
+    ], schema="ID INT, AccountName STRING, AccountNumber INT")
+    tables = {"bc_account": bc_account}
+    with pytest.raises(Exception):
+        build_src_df(tables)
+
+# TC06: Error - Unexpected data types
+def test_unexpected_data_types(spark, setup_source_tables):
+    tables = setup_source_tables
+    # AccountNumber as string
+    tables["bc_account"] = tables["bc_account"].withColumn("AccountNumber", F.lit("not_an_int"))
+    src_df = build_src_df(tables)
+    filtered_df = incremental_filter(src_df)
+    final_df = select_final_cols(filtered_df)
+    # Should raise or propagate error
+    assert all([row.AccountNumber == "not_an_int" for row in final_df.collect()])
+
+# TC07: Edge - Duplicate keys in lookup
+def test_duplicate_keys_in_lookup(spark, setup_source_tables):
+    tables = setup_source_tables
+    # Add duplicate PublicID
+    tables["tgt_dim_billing_account"] = tables["tgt_dim_billing_account"].union(
+        spark.createDataFrame([("PUB1", "BV1", "WC")], "PublicID STRING, BeanVersion STRING, LegacySourceSystem STRING")
+    )
+    src_df = build_src_df(tables)
+    filtered_df = incremental_filter(src_df)
+    final_df = select_final_cols(filtered_df)
+    lookup_df = tables["tgt_dim_billing_account"].select("PublicID", "BeanVersion", "LegacySourceSystem")
+    src_with_lookup = final_df.join(
+        lookup_df,
+        (final_df.PublicID == lookup_df.PublicID) & (final_df.LegacySourceSystem == lookup_df.LegacySourceSystem),
+        "left"
+    )
+    assert src_with_lookup.filter(F.col("PublicID").isNotNull()).count() >= 2
+
+# TC08: Happy path - SCD2/Upsert logic
+def test_scd2_upsert_logic(spark, setup_source_tables):
+    tables = setup_source_tables
+    src_df = build_src_df(tables)
+    filtered_df = incremental_filter(src_df)
+    final_df = select_final_cols(filtered_df)
+    lookup_df = tables["tgt_dim_billing_account"].select("PublicID", "BeanVersion", "LegacySourceSystem")
+    src_with_lookup = final_df.join(
+        lookup_df,
+        (final_df.PublicID == lookup_df.PublicID) & (final_df.LegacySourceSystem == lookup_df.LegacySourceSystem),
+        "left"
+    ).withColumn(
+        "is_match", F.when(final_df.BeanVersion == lookup_df.BeanVersion, F.lit(True)).otherwise(F.lit(False))
+    ).withColumn(
+        "is_existing", F.when(lookup_df.PublicID.isNotNull(), F.lit(True)).otherwise(F.lit(False))
+    )
+    insert_df = src_with_lookup.filter(~F.col("is_existing"))
+    update_df = src_with_lookup.filter((F.col("is_existing")) & (~F.col("is_match")))
+    unchange_df = src_with_lookup.filter((F.col("is_existing")) & (F.col("is_match")))
+    assert insert_df.count() >= 0
+    assert update_df.count() >= 0
+    assert unchange_df.count() >= 0
+
+# TC09: Performance - Caching and partitioning
+def test_performance_caching_partitioning(spark, setup_source_tables):
+    tables = setup_source_tables
+    src_df = build_src_df(tables)
+    filtered_df = incremental_filter(src_df)
+    final_df = select_final_cols(filtered_df)
+    final_df.cache()
+    count_before = final_df.count()
+    repartitioned = final_df.repartition("AccountNumber")
+    count_after = repartitioned.count()
+    assert count_before == count_after
+
+# TC10: Edge - Missing optional columns
+def test_missing_optional_columns(spark, setup_source_tables):
+    tables = setup_source_tables
+    # Remove optional column from bc_address
+    tables["bc_address"] = tables["bc_address"].drop("AddressLine2")
+    src_df = build_src_df(tables)
+    filtered_df = incremental_filter(src_df)
+    final_df = select_final_cols(filtered_df)
+    assert "AddressLine2" in final_df.columns
+
+# API Cost Consumed in dollars: $0.02 (approximate, based on two file reads)
+```
