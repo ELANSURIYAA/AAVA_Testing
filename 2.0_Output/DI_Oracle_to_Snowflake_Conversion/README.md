@@ -1,11 +1,11 @@
 # DI_Oracle_to_Snowflake_Conversion
  
 Pipeline ID: 3745
-Triggered By: manas.thiruveedhula@ascendion.com
+Triggered By: sreeharsha.makula@ascendion.com
  
 Inputs:
 - Agent_SP_O
 - Oracle_to_Snowflake_Analyzer
  
-Execution ID: 59c09774-d2d1-4511-80e9-009afd32f933
-Execution Time: 2026-02-18 10:29:17 UTC
+Execution ID: dbc15bce-5b6b-4c55-8955-25897ad6479f
+Execution Time: 2026-02-18 10:33:50 UTC
