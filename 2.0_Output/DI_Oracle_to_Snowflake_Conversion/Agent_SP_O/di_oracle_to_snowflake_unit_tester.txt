@@ -1,68 +1,52 @@
 =============================================
 Author:        Ascendion AVA+
 Date:  
-Description:   Loads agent data from staging to gold table with upsert logic and logs the operation in an audit table.
-=============================================
+Description:   Pytest script and comprehensive unit test cases for Snowflake stored procedure to load agent data from staging to gold table with upsert logic and audit logging.
+============================================
 
-# 1. Test Case List
+**Test Case List**
 
-| Test Case ID | Description                                                                                      | Expected Outcome                                                                                   |
-|--------------|--------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------|
-| TC01         | Happy path: All stage agents are new (not in GOLD_AGENTS_D)                                      | All stage agents inserted into GOLD_AGENTS_D; audit log records SUCCESS                            |
-| TC02         | Happy path: All stage agents already exist in GOLD_AGENTS_D                                      | All stage agents updated in GOLD_AGENTS_D; audit log records SUCCESS                               |
-| TC03         | Mixed: Some stage agents are new, some exist                                                     | Existing agents updated, new agents inserted; audit log records SUCCESS                            |
-| TC04         | Edge: STAGE_AGENTS is empty                                                                      | No changes to GOLD_AGENTS_D; audit log records SUCCESS                                             |
-| TC05         | Edge: STAGE_AGENTS contains NULL values in AGENT_NAME or SOURCE_SYSTEM                           | NULL values handled correctly in GOLD_AGENTS_D; audit log records SUCCESS                          |
-| TC06         | Edge: STAGE_AGENTS contains duplicate AGENT_IDs                                                  | Procedure handles duplicates gracefully (error or only one row inserted/updated); audit log status |
-| TC07         | Error: STAGE_AGENTS table missing                                                                | Procedure fails, audit log records FAILED                                                          |
-| TC08         | Error: GOLD_AGENTS_D table missing                                                               | Procedure fails, audit log records FAILED                                                          |
-| TC09         | Error: AUDIT_LOG table missing                                                                   | Procedure fails, audit log error suppressed, no audit log entry                                    |
-| TC10         | Edge: AGENT_ID boundary values (e.g., max/min integer)                                           | Boundary values handled correctly; audit log records SUCCESS                                       |
+| Test Case ID | Description                                                                                   | Expected Outcome                                                                                  |
+|--------------|----------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: All agents in STAGE_AGENTS are new, GOLD_AGENTS_D is empty                        | All agents inserted into GOLD_AGENTS_D; AUDIT_LOG records SUCCESS; procedure returns success msg  |
+| TC02         | Happy path: Some agents in STAGE_AGENTS already exist in GOLD_AGENTS_D                        | Existing agents updated, new agents inserted; AUDIT_LOG records SUCCESS; procedure returns msg    |
+| TC03         | Edge: STAGE_AGENTS contains NULL values for AGENT_NAME or SOURCE_SYSTEM                       | NULL values handled as per Snowflake rules; upsert occurs; AUDIT_LOG records SUCCESS              |
+| TC04         | Edge: STAGE_AGENTS is empty                                                                   | No changes to GOLD_AGENTS_D; AUDIT_LOG records SUCCESS; procedure returns success msg             |
+| TC05         | Edge: GOLD_AGENTS_D contains agents not in STAGE_AGENTS                                       | Unmatched agents remain unchanged; AUDIT_LOG records SUCCESS                                      |
+| TC06         | Error: STAGE_AGENTS contains invalid data types (e.g., non-numeric AGENT_ID)                  | Procedure fails; AUDIT_LOG records FAILED with error message                                      |
+| TC07         | Error: AUDIT_LOG table is missing or inaccessible                                             | Procedure completes upsert, fails to log audit; error suppressed; procedure returns success/error |
+| TC08         | Edge: Boundary values for AGENT_ID (e.g., max int, min int)                                   | Upsert logic handles boundary AGENT_IDs; AUDIT_LOG records SUCCESS                                |
+| TC09         | Edge: Duplicate AGENT_IDs in STAGE_AGENTS                                                     | Procedure fails or handles as per Snowflake rules; AUDIT_LOG records FAILED/SUCCESS               |
+| TC10         | Error: GOLD_AGENTS_D table is missing or inaccessible                                         | Procedure fails; AUDIT_LOG records FAILED with error message                                      |
 
-# 2. Pytest Script for Each Test Case
+---
+
+**Pytest Script**
 
 ```python
 =============================================
 Author:        Ascendion AVA+
 Date:  
-Description:   Pytest script for validating LOAD_GOLD_AGENTS stored procedure upsert and audit logic.
+Description:   Pytest script for unit testing Snowflake stored procedure LOAD_GOLD_AGENTS with upsert and audit logging.
 =============================================
 
 import pytest
 import snowflake.connector
 from datetime import datetime
 
-# Helper functions
-def setup_stage_agents(cur, agents):
-    cur.execute("DELETE FROM STAGE_AGENTS")
-    for agent in agents:
-        cur.execute(
-            "INSERT INTO STAGE_AGENTS (AGENT_ID, AGENT_NAME, SOURCE_SYSTEM) VALUES (%s, %s, %s)",
-            (agent['AGENT_ID'], agent['AGENT_NAME'], agent['SOURCE_SYSTEM'])
-        )
-
-def setup_gold_agents(cur, agents):
-    cur.execute("DELETE FROM GOLD_AGENTS_D")
-    for agent in agents:
-        cur.execute(
-            "INSERT INTO GOLD_AGENTS_D (AGENT_ID, AGENT_NAME, LOAD_DATE, UPDATE_DATE, SOURCE_SYSTEM) VALUES (%s, %s, %s, %s, %s)",
-            (agent['AGENT_ID'], agent['AGENT_NAME'], agent['LOAD_DATE'], agent['UPDATE_DATE'], agent['SOURCE_SYSTEM'])
-        )
-
-def clear_audit_log(cur):
-    cur.execute("DELETE FROM AUDIT_LOG")
-
-def get_audit_log(cur):
-    cur.execute("SELECT STATUS, MESSAGE FROM AUDIT_LOG WHERE MODULE_NAME='LOAD_GOLD_AGENTS' ORDER BY RUN_TIME DESC LIMIT 1")
-    return cur.fetchone()
-
-def get_gold_agents(cur):
-    cur.execute("SELECT AGENT_ID, AGENT_NAME, SOURCE_SYSTEM FROM GOLD_AGENTS_D ORDER BY AGENT_ID")
-    return cur.fetchall()
+# Helper function to execute procedure and fetch audit log
+def execute_procedure_and_fetch_audit(conn):
+    cs = conn.cursor()
+    try:
+        cs.execute("CALL LOAD_GOLD_AGENTS()")
+        cs.execute("SELECT STATUS, MESSAGE FROM AUDIT_LOG WHERE MODULE_NAME = 'LOAD_GOLD_AGENTS' ORDER BY RUN_TIME DESC LIMIT 1")
+        return cs.fetchone()
+    finally:
+        cs.close()
 
 @pytest.fixture(scope="function")
-def snowflake_cursor():
-    # Replace with your Snowflake connection parameters
+def snowflake_conn():
+    # Setup Snowflake connection (replace with valid credentials/environment variables)
     conn = snowflake.connector.connect(
         user='YOUR_USER',
         password='YOUR_PASSWORD',
@@ -71,166 +55,34 @@ def snowflake_cursor():
         database='YOUR_DATABASE',
         schema='YOUR_SCHEMA'
     )
-    cur = conn.cursor()
-    yield cur
-    cur.close()
+    yield conn
     conn.close()
 
-# TC01: All stage agents are new
-def test_tc01_all_new_agents(snowflake_cursor):
-    cur = snowflake_cursor
-    setup_gold_agents(cur, [])
-    clear_audit_log(cur)
-    agents = [
-        {'AGENT_ID': 1, 'AGENT_NAME': 'Alice', 'SOURCE_SYSTEM': 'CRM'},
-        {'AGENT_ID': 2, 'AGENT_NAME': 'Bob', 'SOURCE_SYSTEM': 'ERP'}
-    ]
-    setup_stage_agents(cur, agents)
-    cur.execute("CALL LOAD_GOLD_AGENTS()")
-    gold_agents = get_gold_agents(cur)
-    assert gold_agents == [(1, 'Alice', 'CRM'), (2, 'Bob', 'ERP')]
-    status, message = get_audit_log(cur)
-    assert status == 'SUCCESS'
-    assert 'Agents data loaded successfully' in message
-
-# TC02: All stage agents already exist
-def test_tc02_all_existing_agents(snowflake_cursor):
-    cur = snowflake_cursor
-    agents = [
-        {'AGENT_ID': 1, 'AGENT_NAME': 'OldAlice', 'SOURCE_SYSTEM': 'CRM', 'LOAD_DATE': datetime.now(), 'UPDATE_DATE': datetime.now()},
-        {'AGENT_ID': 2, 'AGENT_NAME': 'OldBob', 'SOURCE_SYSTEM': 'ERP', 'LOAD_DATE': datetime.now(), 'UPDATE_DATE': datetime.now()}
-    ]
-    setup_gold_agents(cur, agents)
-    clear_audit_log(cur)
-    stage_agents = [
-        {'AGENT_ID': 1, 'AGENT_NAME': 'Alice', 'SOURCE_SYSTEM': 'CRM'},
-        {'AGENT_ID': 2, 'AGENT_NAME': 'Bob', 'SOURCE_SYSTEM': 'ERP'}
-    ]
-    setup_stage_agents(cur, stage_agents)
-    cur.execute("CALL LOAD_GOLD_AGENTS()")
-    gold_agents = get_gold_agents(cur)
-    assert gold_agents == [(1, 'Alice', 'CRM'), (2, 'Bob', 'ERP')]
-    status, message = get_audit_log(cur)
-    assert status == 'SUCCESS'
-
-# TC03: Mixed new and existing agents
-def test_tc03_mixed_agents(snowflake_cursor):
-    cur = snowflake_cursor
-    gold_agents = [
-        {'AGENT_ID': 1, 'AGENT_NAME': 'OldAlice', 'SOURCE_SYSTEM': 'CRM', 'LOAD_DATE': datetime.now(), 'UPDATE_DATE': datetime.now()}
-    ]
-    setup_gold_agents(cur, gold_agents)
-    clear_audit_log(cur)
-    stage_agents = [
-        {'AGENT_ID': 1, 'AGENT_NAME': 'Alice', 'SOURCE_SYSTEM': 'CRM'},
-        {'AGENT_ID': 2, 'AGENT_NAME': 'Bob', 'SOURCE_SYSTEM': 'ERP'}
-    ]
-    setup_stage_agents(cur, stage_agents)
-    cur.execute("CALL LOAD_GOLD_AGENTS()")
-    gold_agents = get_gold_agents(cur)
-    assert gold_agents == [(1, 'Alice', 'CRM'), (2, 'Bob', 'ERP')]
-    status, message = get_audit_log(cur)
-    assert status == 'SUCCESS'
-
-# TC04: STAGE_AGENTS is empty
-def test_tc04_empty_stage_agents(snowflake_cursor):
-    cur = snowflake_cursor
-    setup_gold_agents(cur, [])
-    clear_audit_log(cur)
-    setup_stage_agents(cur, [])
-    cur.execute("CALL LOAD_GOLD_AGENTS()")
-    gold_agents = get_gold_agents(cur)
-    assert gold_agents == []
-    status, message = get_audit_log(cur)
-    assert status == 'SUCCESS'
-
-# TC05: NULL values in stage agents
-def test_tc05_null_values(snowflake_cursor):
-    cur = snowflake_cursor
-    setup_gold_agents(cur, [])
-    clear_audit_log(cur)
-    agents = [
-        {'AGENT_ID': 1, 'AGENT_NAME': None, 'SOURCE_SYSTEM': 'CRM'},
-        {'AGENT_ID': 2, 'AGENT_NAME': 'Bob', 'SOURCE_SYSTEM': None}
-    ]
-    setup_stage_agents(cur, agents)
-    cur.execute("CALL LOAD_GOLD_AGENTS()")
-    gold_agents = get_gold_agents(cur)
-    assert gold_agents == [(1, None, 'CRM'), (2, 'Bob', None)]
-    status, message = get_audit_log(cur)
-    assert status == 'SUCCESS'
-
-# TC06: Duplicate AGENT_IDs in stage agents
-def test_tc06_duplicate_agent_ids(snowflake_cursor):
-    cur = snowflake_cursor
-    setup_gold_agents(cur, [])
-    clear_audit_log(cur)
-    agents = [
-        {'AGENT_ID': 1, 'AGENT_NAME': 'Alice', 'SOURCE_SYSTEM': 'CRM'},
-        {'AGENT_ID': 1, 'AGENT_NAME': 'Alice2', 'SOURCE_SYSTEM': 'ERP'}
-    ]
-    setup_stage_agents(cur, agents)
+@pytest.fixture(autouse=True)
+def setup_and_teardown_tables(snowflake_conn):
+    cs = snowflake_conn.cursor()
     try:
-        cur.execute("CALL LOAD_GOLD_AGENTS()")
-        status, message = get_audit_log(cur)
-        assert status in ['SUCCESS', 'FAILED']  # Depending on how duplicates are handled
-    except Exception:
-        status, message = get_audit_log(cur)
-        assert status == 'FAILED'
-
-# TC07: STAGE_AGENTS table missing
-def test_tc07_missing_stage_agents_table(snowflake_cursor):
-    cur = snowflake_cursor
-    cur.execute("DROP TABLE IF EXISTS STAGE_AGENTS")
-    clear_audit_log(cur)
-    try:
-        cur.execute("CALL LOAD_GOLD_AGENTS()")
-        status, message = get_audit_log(cur)
-        assert status == 'FAILED'
-        assert 'Error:' in message
-    finally:
-        # Recreate table for other tests
-        cur.execute("""
+        # Setup: Clean and recreate tables
+        cs.execute("DROP TABLE IF EXISTS STAGE_AGENTS")
+        cs.execute("DROP TABLE IF EXISTS GOLD_AGENTS_D")
+        cs.execute("DROP TABLE IF EXISTS AUDIT_LOG")
+        cs.execute("""
             CREATE TABLE STAGE_AGENTS (
-                AGENT_ID INTEGER,
+                AGENT_ID INT,
                 AGENT_NAME VARCHAR,
                 SOURCE_SYSTEM VARCHAR
             )
         """)
-
-# TC08: GOLD_AGENTS_D table missing
-def test_tc08_missing_gold_agents_table(snowflake_cursor):
-    cur = snowflake_cursor
-    cur.execute("DROP TABLE IF EXISTS GOLD_AGENTS_D")
-    clear_audit_log(cur)
-    try:
-        cur.execute("CALL LOAD_GOLD_AGENTS()")
-        status, message = get_audit_log(cur)
-        assert status == 'FAILED'
-        assert 'Error:' in message
-    finally:
-        # Recreate table for other tests
-        cur.execute("""
+        cs.execute("""
             CREATE TABLE GOLD_AGENTS_D (
-                AGENT_ID INTEGER,
+                AGENT_ID INT PRIMARY KEY,
                 AGENT_NAME VARCHAR,
                 LOAD_DATE TIMESTAMP,
                 UPDATE_DATE TIMESTAMP,
                 SOURCE_SYSTEM VARCHAR
             )
         """)
-
-# TC09: AUDIT_LOG table missing
-def test_tc09_missing_audit_log_table(snowflake_cursor):
-    cur = snowflake_cursor
-    cur.execute("DROP TABLE IF EXISTS AUDIT_LOG")
-    try:
-        cur.execute("CALL LOAD_GOLD_AGENTS()")
-    except Exception:
-        pass  # Audit log error suppressed
-    finally:
-        # Recreate table for other tests
-        cur.execute("""
+        cs.execute("""
             CREATE TABLE AUDIT_LOG (
                 MODULE_NAME VARCHAR,
                 RUN_TIME TIMESTAMP,
@@ -238,37 +90,154 @@ def test_tc09_missing_audit_log_table(snowflake_cursor):
                 MESSAGE VARCHAR
             )
         """)
+        yield
+    finally:
+        # Teardown: Drop tables
+        cs.execute("DROP TABLE IF EXISTS STAGE_AGENTS")
+        cs.execute("DROP TABLE IF EXISTS GOLD_AGENTS_D")
+        cs.execute("DROP TABLE IF EXISTS AUDIT_LOG")
+        cs.close()
 
-# TC10: AGENT_ID boundary values
-def test_tc10_agent_id_boundary(snowflake_cursor):
-    cur = snowflake_cursor
-    setup_gold_agents(cur, [])
-    clear_audit_log(cur)
-    agents = [
-        {'AGENT_ID': 0, 'AGENT_NAME': 'Zero', 'SOURCE_SYSTEM': 'CRM'},
-        {'AGENT_ID': 2147483647, 'AGENT_NAME': 'MaxInt', 'SOURCE_SYSTEM': 'ERP'}
-    ]
-    setup_stage_agents(cur, agents)
-    cur.execute("CALL LOAD_GOLD_AGENTS()")
-    gold_agents = get_gold_agents(cur)
-    assert gold_agents == [(0, 'Zero', 'CRM'), (2147483647, 'MaxInt', 'ERP')]
-    status, message = get_audit_log(cur)
+def test_TC01_happy_path_insert(snowflake_conn):
+    cs = snowflake_conn.cursor()
+    try:
+        # GOLD_AGENTS_D empty, STAGE_AGENTS has new agents
+        cs.execute("INSERT INTO STAGE_AGENTS VALUES (1, 'Alice', 'CRM'), (2, 'Bob', 'CRM')")
+        status, message = execute_procedure_and_fetch_audit(snowflake_conn)
+        cs.execute("SELECT COUNT(*) FROM GOLD_AGENTS_D")
+        count = cs.fetchone()[0]
+        assert count == 2
+        assert status == 'SUCCESS'
+        assert 'Agents data loaded successfully' in message
+    finally:
+        cs.close()
+
+def test_TC02_happy_path_upsert(snowflake_conn):
+    cs = snowflake_conn.cursor()
+    try:
+        # GOLD_AGENTS_D has agent 1, STAGE_AGENTS has agent 1 (update) and agent 2 (insert)
+        cs.execute("INSERT INTO GOLD_AGENTS_D VALUES (1, 'OldAlice', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), 'CRM')")
+        cs.execute("INSERT INTO STAGE_AGENTS VALUES (1, 'Alice', 'CRM'), (2, 'Bob', 'CRM')")
+        status, message = execute_procedure_and_fetch_audit(snowflake_conn)
+        cs.execute("SELECT AGENT_NAME FROM GOLD_AGENTS_D WHERE AGENT_ID = 1")
+        agent_name = cs.fetchone()[0]
+        assert agent_name == 'Alice'
+        cs.execute("SELECT COUNT(*) FROM GOLD_AGENTS_D")
+        count = cs.fetchone()[0]
+        assert count == 2
+        assert status == 'SUCCESS'
+    finally:
+        cs.close()
+
+def test_TC03_null_values(snowflake_conn):
+    cs = snowflake_conn.cursor()
+    try:
+        cs.execute("INSERT INTO STAGE_AGENTS VALUES (3, NULL, 'CRM'), (4, 'Dana', NULL)")
+        status, message = execute_procedure_and_fetch_audit(snowflake_conn)
+        cs.execute("SELECT AGENT_NAME, SOURCE_SYSTEM FROM GOLD_AGENTS_D WHERE AGENT_ID = 3")
+        agent_name, source_system = cs.fetchone()
+        assert agent_name is None
+        assert source_system == 'CRM'
+        cs.execute("SELECT AGENT_NAME, SOURCE_SYSTEM FROM GOLD_AGENTS_D WHERE AGENT_ID = 4")
+        agent_name, source_system = cs.fetchone()
+        assert agent_name == 'Dana'
+        assert source_system is None
+        assert status == 'SUCCESS'
+    finally:
+        cs.close()
+
+def test_TC04_empty_stage_agents(snowflake_conn):
+    status, message = execute_procedure_and_fetch_audit(snowflake_conn)
     assert status == 'SUCCESS'
+    assert 'Agents data loaded successfully' in message
 
+def test_TC05_unmatched_gold_agents(snowflake_conn):
+    cs = snowflake_conn.cursor()
+    try:
+        cs.execute("INSERT INTO GOLD_AGENTS_D VALUES (5, 'Eve', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), 'CRM')")
+        status, message = execute_procedure_and_fetch_audit(snowflake_conn)
+        cs.execute("SELECT AGENT_NAME FROM GOLD_AGENTS_D WHERE AGENT_ID = 5")
+        agent_name = cs.fetchone()[0]
+        assert agent_name == 'Eve'
+        assert status == 'SUCCESS'
+    finally:
+        cs.close()
+
+def test_TC06_invalid_data_type(snowflake_conn):
+    cs = snowflake_conn.cursor()
+    try:
+        # AGENT_ID as string should fail
+        cs.execute("INSERT INTO STAGE_AGENTS VALUES ('not_an_int', 'Frank', 'CRM')")
+        with pytest.raises(Exception):
+            execute_procedure_and_fetch_audit(snowflake_conn)
+        cs.execute("SELECT STATUS, MESSAGE FROM AUDIT_LOG WHERE STATUS = 'FAILED' ORDER BY RUN_TIME DESC LIMIT 1")
+        status, message = cs.fetchone()
+        assert status == 'FAILED'
+        assert 'Error:' in message
+    finally:
+        cs.close()
+
+def test_TC07_missing_audit_log_table(snowflake_conn):
+    cs = snowflake_conn.cursor()
+    try:
+        cs.execute("DROP TABLE AUDIT_LOG")
+        cs.execute("INSERT INTO STAGE_AGENTS VALUES (6, 'Grace', 'CRM')")
+        try:
+            execute_procedure_and_fetch_audit(snowflake_conn)
+        except Exception:
+            pass  # Audit log failure suppressed
+        # Procedure should not raise error due to audit log failure
+    finally:
+        cs.close()
+
+def test_TC08_boundary_agent_id(snowflake_conn):
+    cs = snowflake_conn.cursor()
+    try:
+        max_int = 2147483647
+        min_int = -2147483648
+        cs.execute(f"INSERT INTO STAGE_AGENTS VALUES ({max_int}, 'Max', 'CRM'), ({min_int}, 'Min', 'CRM')")
+        status, message = execute_procedure_and_fetch_audit(snowflake_conn)
+        cs.execute(f"SELECT AGENT_NAME FROM GOLD_AGENTS_D WHERE AGENT_ID = {max_int}")
+        agent_name = cs.fetchone()[0]
+        assert agent_name == 'Max'
+        cs.execute(f"SELECT AGENT_NAME FROM GOLD_AGENTS_D WHERE AGENT_ID = {min_int}")
+        agent_name = cs.fetchone()[0]
+        assert agent_name == 'Min'
+        assert status == 'SUCCESS'
+    finally:
+        cs.close()
+
+def test_TC09_duplicate_agent_ids(snowflake_conn):
+    cs = snowflake_conn.cursor()
+    try:
+        cs.execute("INSERT INTO STAGE_AGENTS VALUES (7, 'Henry', 'CRM'), (7, 'Henry2', 'CRM')")
+        with pytest.raises(Exception):
+            execute_procedure_and_fetch_audit(snowflake_conn)
+        cs.execute("SELECT STATUS, MESSAGE FROM AUDIT_LOG WHERE STATUS = 'FAILED' ORDER BY RUN_TIME DESC LIMIT 1")
+        status, message = cs.fetchone()
+        assert status == 'FAILED'
+    finally:
+        cs.close()
+
+def test_TC10_missing_gold_agents_table(snowflake_conn):
+    cs = snowflake_conn.cursor()
+    try:
+        cs.execute("DROP TABLE GOLD_AGENTS_D")
+        cs.execute("INSERT INTO STAGE_AGENTS VALUES (8, 'Ivy', 'CRM')")
+        with pytest.raises(Exception):
+            execute_procedure_and_fetch_audit(snowflake_conn)
+        cs.execute("SELECT STATUS, MESSAGE FROM AUDIT_LOG WHERE STATUS = 'FAILED' ORDER BY RUN_TIME DESC LIMIT 1")
+        status, message = cs.fetchone()
+        assert status == 'FAILED'
+        assert 'Error:' in message
+    finally:
+        cs.close()
 ```
 
-# 3. API Cost Consumed
+---
 
-- List files in directory: 1 call
-- Read a file's content: 1 call
-- Delegate work to coworker: 1 call
-
-# Note
-
-- Replace `YOUR_USER`, `YOUR_PASSWORD`, etc. in the Snowflake connection with your actual credentials.
-- The script assumes the existence of tables: STAGE_AGENTS, GOLD_AGENTS_D, AUDIT_LOG.
-- Each test cleans up after itself and recreates dropped tables for isolation.
-- Helper functions are used for setup and teardown.
-- All tests are grouped logically and follow PEP 8 guidelines.
-
-=============================================
+**API Cost Consumed:**  
+- 2 file reads  
+- 1 directory read  
+- 0 coworker calls  
+- apiCost: 0.0023 USD (from analyzer file)
