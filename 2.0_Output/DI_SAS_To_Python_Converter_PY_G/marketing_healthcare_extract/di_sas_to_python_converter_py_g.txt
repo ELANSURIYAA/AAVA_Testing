@@ -1,148 +1,143 @@
+# marketing_healthcare_extract.py
+
+"""
+This script replicates the SAS logic from marketing_healthcare_extract.sas for extracting, transforming, and exporting healthcare marketing data.
+- Connects to Teradata using SQLAlchemy.
+- Extracts and joins healthcare_plans and provider_network tables.
+- Applies all business logic, including age grouping and campaign eligibility.
+- Filters eligible members.
+- Exports the final result to CSV.
+
+Dependencies:
+- pandas
+- sqlalchemy
+- teradatasqlalchemy (for Teradata connection)
+- (Optional) python-dotenv for managing credentials
+
+Usage:
+    python marketing_healthcare_extract.py
+
+Author: [Your Name or Team Name]
+Created On: 10-Apr-2025
+"""
+
 import pandas as pd
-import teradatasql
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import os
 
-def get_teradata_connection(user, password, host, database=None):
-    """
-    Establish a secure connection to Teradata using SQLAlchemy and teradatasql.
-    Args:
-        user (str): Teradata username.
-        password (str): Teradata password.
-        host (str): Teradata server hostname or IP.
-        database (str, optional): Default database/schema.
-    Returns:
-        sqlalchemy.engine.base.Engine: SQLAlchemy engine object.
-    """
-    url = f"teradatasql://{user}:{password}@{host}/"
-    if database:
-        url += f"?database={database}"
-    engine = create_engine(url)
-    return engine
+# ---------------------------
+# CONFIGURATION
+# ---------------------------
+# Set your Teradata connection parameters here
+TERADATA_HOST = os.getenv('TERADATA_HOST', 'your_server_name')
+TERADATA_USERNAME = os.getenv('TERADATA_USERNAME', 'your_username')
+TERADATA_PASSWORD = os.getenv('TERADATA_PASSWORD', 'your_password')
+TERADATA_TDPID = os.getenv('TERADATA_TDPID', 'your_tdpid')
+OUTPATH = os.getenv('OUTPATH', '/folders/myfolders/final_marketing_campaign_extract_2025.csv')
 
-def extract_healthcare_data(engine):
+# ---------------------------
+# DATABASE CONNECTION
+# ---------------------------
+def get_teradata_engine():
     """
-    Extract and join healthcare plan and provider network data from Teradata.
-    Returns:
-        pd.DataFrame: Joined and raw data.
+    Create a SQLAlchemy engine for Teradata.
     """
-    query = """
-        SELECT 
-            hp.member_id,
-            TRIM(hp.member_first_name) AS member_first_name,
-            TRIM(hp.member_last_name) AS member_last_name,
-            hp.member_age,
-            hp.plan_id,
-            hp.plan_type,
-            hp.region,
-            hp.plan_status,
-            pn.network_type
-        FROM tdata.healthcare_plans hp
-        LEFT JOIN tdata.provider_network pn
-            ON hp.plan_id = pn.plan_id
-        WHERE hp.plan_status = 'ACTIVE'
-          AND hp.member_age IS NOT NULL
+    # Example Teradata SQLAlchemy URI: teradatasql://user:pass@host
+    # You may need to install teradatasqlalchemy: pip install teradatasqlalchemy
+    uri = f"teradatasql://{TERADATA_USERNAME}:{TERADATA_PASSWORD}@{TERADATA_HOST}/?TDPID={TERADATA_TDPID}"
+    return create_engine(uri)
+
+# ---------------------------
+# DATA EXTRACTION & TRANSFORMATION
+# ---------------------------
+def extract_and_transform(engine):
     """
-    df = pd.read_sql(query, engine)
+    Extracts data from Teradata, applies business rules, and returns a DataFrame.
+    """
+    # SQL replicating the SAS PROC SQL logic
+    sql = """
+    SELECT 
+        hp.member_id,
+        TRIM(hp.member_first_name) || ' ' || TRIM(hp.member_last_name) AS member_full_name,
+        hp.member_age,
+        CASE 
+            WHEN hp.member_age BETWEEN 25 AND 35 THEN 'YOUNG_ADULT'
+            WHEN hp.member_age BETWEEN 36 AND 50 THEN 'MID_AGE'
+            WHEN hp.member_age > 50 THEN 'SENIOR'
+            ELSE 'UNKNOWN'
+        END AS age_group,
+        hp.plan_id,
+        hp.plan_type,
+        hp.region,
+        pn.network_type,
+        UPPER(hp.plan_type) || '-' || hp.region AS marketing_segment,
+        CASE 
+            WHEN hp.plan_status = 'ACTIVE' 
+                 AND hp.member_age BETWEEN 25 AND 60 
+                 AND hp.plan_type IN ('PPO', 'HMO') 
+                 AND hp.region IN ('WEST', 'SOUTH')
+                 AND pn.network_type = 'IN_NETWORK'
+            THEN 1
+            ELSE 0
+        END AS is_campaign_eligible
+    FROM tdata.healthcare_plans hp
+    LEFT JOIN tdata.provider_network pn
+        ON hp.plan_id = pn.plan_id
+    WHERE hp.plan_status = 'ACTIVE'
+      AND hp.member_age IS NOT NULL
+    """
+    df = pd.read_sql(text(sql), engine)
     return df
 
-def assign_age_group(age):
-    """
-    Assign age group based on member_age.
-    """
-    if pd.isnull(age):
-        return 'UNKNOWN'
-    if 25 <= age <= 35:
-        return 'YOUNG_ADULT'
-    elif 36 <= age <= 50:
-        return 'MID_AGE'
-    elif age > 50:
-        return 'SENIOR'
-    else:
-        return 'UNKNOWN'
-
-def build_marketing_segment(plan_type, region):
-    """
-    Build marketing segment string.
-    """
-    if pd.isnull(plan_type) or pd.isnull(region):
-        return None
-    return f"{str(plan_type).upper()}-{region}"
-
-def is_campaign_eligible(row):
-    """
-    Apply campaign eligibility logic.
-    """
-    return int(
-        row['plan_status'] == 'ACTIVE'
-        and 25 <= row['member_age'] <= 60
-        and row['plan_type'] in ('PPO', 'HMO')
-        and row['region'] in ('WEST', 'SOUTH')
-        and row['network_type'] == 'IN_NETWORK'
-    )
-
-def enrich_data(df):
-    """
-    Create enriched dataframe with business rules and derived columns.
-    Args:
-        df (pd.DataFrame): Raw dataframe.
-    Returns:
-        pd.DataFrame: Enriched dataframe.
-    """
-    df['member_full_name'] = df['member_first_name'].str.strip() + ' ' + df['member_last_name'].str.strip()
-    df['age_group'] = df['member_age'].apply(assign_age_group)
-    df['marketing_segment'] = df.apply(lambda x: build_marketing_segment(x['plan_type'], x['region']), axis=1)
-    df['is_campaign_eligible'] = df.apply(is_campaign_eligible, axis=1)
-    return df
-
+# ---------------------------
+# FILTER ELIGIBLE MEMBERS
+# ---------------------------
 def filter_eligible_members(df):
     """
-    Filter dataframe to only eligible members.
-    Args:
-        df (pd.DataFrame): Enriched dataframe.
-    Returns:
-        pd.DataFrame: Filtered dataframe.
+    Filters DataFrame for campaign-eligible members.
     """
     return df[df['is_campaign_eligible'] == 1].copy()
 
-def export_to_csv(df, output_path):
+# ---------------------------
+# EXPORT TO CSV
+# ---------------------------
+def export_to_csv(df, outpath):
     """
-    Export dataframe to CSV.
-    Args:
-        df (pd.DataFrame): Data to export.
-        output_path (str): Path to output CSV file.
+    Exports DataFrame to CSV.
     """
-    df.to_csv(output_path, index=False)
+    df.to_csv(outpath, index=False)
+    print(f"Exported {len(df)} records to {outpath}")
 
+# ---------------------------
+# MAIN WORKFLOW
+# ---------------------------
 def main():
     """
-    Main function to orchestrate the ETL process.
+    Main orchestration function.
     """
-    # --- User configuration ---
-    TERADATA_USER = os.getenv('TERADATA_USER')
-    TERADATA_PASSWORD = os.getenv('TERADATA_PASSWORD')
-    TERADATA_HOST = os.getenv('TERADATA_HOST')
-    OUTPUT_PATH = '/folders/myfolders/final_marketing_campaign_extract_2025.csv'
-    # --------------------------
-
-    # Connect to Teradata
-    engine = get_teradata_connection(
-        user=TERADATA_USER,
-        password=TERADATA_PASSWORD,
-        host=TERADATA_HOST
-    )
-
-    # Extract data
-    raw_df = extract_healthcare_data(engine)
-
-    # Enrich data with business rules
-    enriched_df = enrich_data(raw_df)
-
-    # Filter only eligible members
-    final_df = filter_eligible_members(enriched_df)
-
-    # Export to CSV
-    export_to_csv(final_df, OUTPUT_PATH)
+    print("Connecting to Teradata...")
+    engine = get_teradata_engine()
+    print("Extracting and transforming data...")
+    df = extract_and_transform(engine)
+    print(f"Total records extracted: {len(df)}")
+    print("Filtering eligible members...")
+    eligible_df = filter_eligible_members(df)
+    print(f"Eligible records: {len(eligible_df)}")
+    print("Exporting to CSV...")
+    export_to_csv(eligible_df, OUTPATH)
+    print("Done.")
 
 if __name__ == '__main__':
     main()
+
+# ---------------------------
+# END OF SCRIPT
+# ---------------------------
+
+# Notes:
+# - Ensure you have the required Python packages installed:
+#   pip install pandas sqlalchemy teradatasqlalchemy
+# - You can set environment variables for credentials or replace them directly in the script.
+# - All SAS macro logic (e.g., &outpath) is mapped to Python variables.
+# - The SQL logic is executed directly in the database for efficiency.
+# - For large data, consider chunked reading/writing.
