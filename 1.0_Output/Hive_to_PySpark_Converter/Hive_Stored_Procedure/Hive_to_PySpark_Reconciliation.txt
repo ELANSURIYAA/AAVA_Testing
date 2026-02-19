@@ -1,154 +1,156 @@
+# Comprehensive Python Script for Hive to PySpark Migration and Validation
+
 ```python
 import os
 import pandas as pd
-from pyhive import hive
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, sum as _sum
-from datetime import datetime
+from pyhive import hive
 import pyarrow.parquet as pq
+from datetime import datetime
 
-# Environment Variables for Credentials
+# Environment variables for credentials
 HIVE_HOST = os.getenv("HIVE_HOST")
 HIVE_PORT = os.getenv("HIVE_PORT", 10000)
 HIVE_USERNAME = os.getenv("HIVE_USERNAME")
-DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
+HIVE_PASSWORD = os.getenv("HIVE_PASSWORD")
 DATABRICKS_HOST = os.getenv("DATABRICKS_HOST")
+DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
+DATABRICKS_STORAGE_PATH = os.getenv("DATABRICKS_STORAGE_PATH")
 
-# Hive Connection
+# Initialize Spark session
+spark = SparkSession.builder \
+    .appName("Hive to PySpark Migration Validation") \
+    .getOrCreate()
+
 def execute_hive_query(query):
-    conn = hive.Connection(host=HIVE_HOST, port=HIVE_PORT, username=HIVE_USERNAME)
+    """Execute Hive query and return results."""
+    conn = hive.Connection(host=HIVE_HOST, port=HIVE_PORT, username=HIVE_USERNAME, password=HIVE_PASSWORD)
     cursor = conn.cursor()
     cursor.execute(query)
     results = cursor.fetchall()
-    cursor.close()
     conn.close()
     return results
 
-# Export Hive Table to CSV
-def export_hive_table_to_csv(table_name, output_path):
+def export_hive_table_to_parquet(table_name, output_path):
+    """Export Hive table to Parquet format."""
     query = f"SELECT * FROM {table_name}"
-    data = execute_hive_query(query)
-    df = pd.DataFrame(data)
-    csv_path = os.path.join(output_path, f"{table_name}.csv")
-    df.to_csv(csv_path, index=False)
-    return csv_path
+    results = execute_hive_query(query)
+    df = pd.DataFrame(results)
+    parquet_file = os.path.join(output_path, f"{table_name}_{datetime.now().strftime('%Y%m%d%H%M%S')}.parquet")
+    df.to_parquet(parquet_file, engine='pyarrow')
+    return parquet_file
 
-# Convert CSV to Parquet
-def convert_csv_to_parquet(csv_path):
-    df = pd.read_csv(csv_path)
-    parquet_path = csv_path.replace(".csv", ".parquet")
-    df.to_parquet(parquet_path, engine='pyarrow')
-    return parquet_path
+def transfer_to_databricks(parquet_files):
+    """Transfer Parquet files to Databricks storage."""
+    for file in parquet_files:
+        # Assuming Databricks CLI or API is configured for file transfer
+        os.system(f"databricks fs cp {file} {DATABRICKS_STORAGE_PATH}")
 
-# Databricks File Transfer
-def transfer_to_databricks(parquet_path, dbfs_path):
-    os.system(f"databricks fs cp {parquet_path} {dbfs_path}")
-    return dbfs_path
+def create_external_table_in_pyspark(parquet_file, table_name):
+    """Create external table in PySpark."""
+    df = spark.read.parquet(parquet_file)
+    df.createOrReplaceTempView(table_name)
 
-# PySpark Execution
-def process_sales_data(start_date, end_date):
-    spark = SparkSession.builder.appName("ProcessSalesData").getOrCreate()
-    
-    # Step 1: Create a temporary summary table
-    temp_sales_summary = (
-        spark.table("sales_table")
-        .filter((col("sale_date") >= start_date) & (col("sale_date") <= end_date))
-        .groupBy("product_id")
-        .agg(_sum("sales").alias("total_sales"))
-    )
-    
-    # Step 2: Insert into summary_table
-    summary_table_data = temp_sales_summary.select("product_id", "total_sales")
-    summary_table_data.write.insertInto("summary_table", overwrite=False)
-    
-    # Step 3: Iterate through the temporary summary table and insert into detailed_sales_summary
-    temp_sales_summary_df = temp_sales_summary.collect()
-    detailed_sales_summary_data = [(row["product_id"], row["total_sales"]) for row in temp_sales_summary_df]
-    
-    detailed_sales_summary_df = spark.createDataFrame(
-        detailed_sales_summary_data, ["product_id", "total_sales"]
-    )
-    detailed_sales_summary_df.write.insertInto("detailed_sales_summary", overwrite=False)
+def compare_tables(hive_table, pyspark_table):
+    """Compare Hive table with PySpark table."""
+    hive_results = execute_hive_query(f"SELECT * FROM {hive_table}")
+    pyspark_results = spark.sql(f"SELECT * FROM {pyspark_table}").collect()
+    hive_df = pd.DataFrame(hive_results)
+    pyspark_df = pd.DataFrame(pyspark_results)
+    comparison = hive_df.equals(pyspark_df)
+    return comparison
 
-# Comparison Logic
-def compare_tables(hive_table, spark_table):
-    hive_data = execute_hive_query(f"SELECT * FROM {hive_table}")
-    spark = SparkSession.builder.appName("CompareTables").getOrCreate()
-    spark_data = spark.sql(f"SELECT * FROM {spark_table}").collect()
-    
-    hive_df = pd.DataFrame(hive_data)
-    spark_df = pd.DataFrame([row.asDict() for row in spark_data])
-    
-    if hive_df.equals(spark_df):
-        return "MATCH"
-    else:
-        differences = {
-            "row_count_difference": len(hive_df) - len(spark_df),
-            "column_discrepancies": list(set(hive_df.columns) ^ set(spark_df.columns)),
-            "sample_mismatches": hive_df.compare(spark_df, align_axis=0).head(5).to_dict()
-        }
-        return differences
+def generate_report(comparisons):
+    """Generate comparison report."""
+    report = []
+    for table, status in comparisons.items():
+        report.append(f"Table: {table}, Match Status: {'MATCH' if status else 'NO MATCH'}")
+    return "\n".join(report)
 
-# Main Script
 def main():
-    # Paths and Configurations
-    output_path = "/tmp"
-    dbfs_path = "dbfs:/mnt/data"
-    hive_tables = ["summary_table", "detailed_sales_summary"]
-    start_date = "2023-01-01"
-    end_date = "2023-01-31"
-    
-    # Step 1: Execute Hive SQL
-    hive_sql = """
+    # Hive SQL code
+    hive_sql_code = """
     CREATE PROCEDURE process_sales_data(
         IN start_date STRING,
         IN end_date STRING
     )
     BEGIN
         DECLARE total_sales FLOAT;
+    
         SET @dynamic_query = CONCAT(
             "INSERT INTO summary_table SELECT product_id, SUM(sales) AS total_sales ",
             "FROM sales_table WHERE sale_date BETWEEN '", start_date, "' AND '", end_date, "' ",
             "GROUP BY product_id"
         );
         EXECUTE IMMEDIATE @dynamic_query;
+    
         CREATE TEMPORARY TABLE temp_sales_summary AS
         SELECT product_id, SUM(sales) AS total_sales
         FROM sales_table
         WHERE sale_date BETWEEN start_date AND end_date
         GROUP BY product_id;
+    
         DECLARE cur CURSOR FOR SELECT product_id, total_sales FROM temp_sales_summary;
+    
         OPEN cur;
+    
         FETCH cur INTO product_id, total_sales;
         WHILE total_sales IS NOT NULL DO
             INSERT INTO detailed_sales_summary (product_id, total_sales)
             VALUES (product_id, total_sales);
             FETCH cur INTO product_id, total_sales;
         END WHILE;
+    
         CLOSE cur;
+    
         DROP TABLE temp_sales_summary;
     END;
     """
-    execute_hive_query(hive_sql)
-    
-    # Step 2: Export Hive Tables
-    parquet_files = []
-    for table in hive_tables:
-        csv_path = export_hive_table_to_csv(table, output_path)
-        parquet_path = convert_csv_to_parquet(csv_path)
-        parquet_files.append(parquet_path)
-    
-    # Step 3: Transfer to Databricks
-    for parquet_file in parquet_files:
-        transfer_to_databricks(parquet_file, dbfs_path)
-    
-    # Step 4: Execute PySpark Code
-    process_sales_data(start_date, end_date)
-    
-    # Step 5: Compare Tables
-    for table in hive_tables:
-        comparison_result = compare_tables(table, table)
-        print(f"Comparison result for {table}: {comparison_result}")
+
+    # PySpark code
+    def process_sales_data(start_date, end_date):
+        sales_table = spark.read.format("parquet").load("path_to_sales_table")
+        summary_table = sales_table.filter(
+            (col("sale_date") >= start_date) & (col("sale_date") <= end_date)
+        ).groupBy("product_id").agg(
+            _sum("sales").alias("total_sales")
+        )
+        summary_table.write.format("parquet").mode("overwrite").save("path_to_summary_table")
+        temp_sales_summary = sales_table.filter(
+            (col("sale_date") >= start_date) & (col("sale_date") <= end_date)
+        ).groupBy("product_id").agg(
+            _sum("sales").alias("total_sales")
+        )
+        detailed_sales_summary = []
+        for row in temp_sales_summary.collect():
+            detailed_sales_summary.append((row["product_id"], row["total_sales"]))
+        detailed_sales_summary_df = spark.createDataFrame(
+            detailed_sales_summary, ["product_id", "total_sales"]
+        )
+        detailed_sales_summary_df.write.format("parquet").mode("overwrite").save("path_to_detailed_sales_summary")
+        temp_sales_summary.unpersist()
+
+    # Export Hive tables
+    hive_tables = ["sales_table", "summary_table", "detailed_sales_summary"]
+    parquet_files = [export_hive_table_to_parquet(table, "/tmp") for table in hive_tables]
+
+    # Transfer to Databricks
+    transfer_to_databricks(parquet_files)
+
+    # Create external tables in PySpark
+    for file, table in zip(parquet_files, hive_tables):
+        create_external_table_in_pyspark(file, table)
+
+    # Execute PySpark code
+    process_sales_data("2023-01-01", "2023-01-31")
+
+    # Compare tables
+    comparisons = {table: compare_tables(table, table) for table in hive_tables}
+
+    # Generate report
+    report = generate_report(comparisons)
+    print(report)
 
 if __name__ == "__main__":
     main()
