@@ -1,10 +1,11 @@
 # DI_SQL_Server_To_Snowflake_Document&Analyze
  
 Pipeline ID: 4294
-Triggered By: sreeharsha.makula@ascendion.com
+Triggered By: manas.thiruveedhula@ascendion.com
  
 Inputs:
 - Employee_Info
+- Snowflake%20Environment%20Details
  
-Execution ID: 709f5c3c-2da0-4c32-b680-999c6dd5ea2c
-Execution Time: 2026-02-19 09:35:52 UTC
+Execution ID: 5f31d215-71ae-42fb-803a-8764a9d7104f
+Execution Time: 2026-02-19 09:44:48 UTC
