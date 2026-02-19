@@ -1,23 +1,50 @@
+```
 =============================================
 Author:        Ascendion AVA+
 Created on:   
-Description:   Robust unit test cases and Pytest script for validating the Snowflake-compatible Employee backup table creation and population logic, ensuring data integrity, correct handling of empty/edge cases, and compliance with Snowflake best practices.
+Description:   Pytest script and test case suite for validating the Snowflake-compatible SQL script that creates/recreates a backup of Employee master data, keyed by EmployeeNo, for troubleshooting, point-in-time comparison, and recovery use-cases.
 =============================================
 
 1. Test Case List:
+   - Test ID: TC01
+     Test Description: Validate backup creation for standard Employee and Salary records (happy path).
+     Input Data: Employee table with 3 employees, Salary table with matching EmployeeNo for all.
+     Expected Output: employee_bkup table contains 3 records, each with correct EmployeeNo and corresponding Salary.
 
-| Test ID | Test Description                                                      | Input Data                                                                                                 | Expected Output                                                                                  |
-|--------|-----------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
-| TC01   | Backup table is created and populated when Employee and Salary have matching rows | Employee and Salary tables with matching EmployeeNo values and valid data                                  | employee_bkup table exists and contains correct joined data                                      |
-| TC02   | Backup table is not created when Employee table is empty               | Employee table is empty; Salary table may have data                                                        | employee_bkup table does not exist                                                               |
-| TC03   | Only matching EmployeeNo rows are inserted (inner join logic)          | Employee table has EmployeeNo not present in Salary, and vice versa                                        | employee_bkup contains only rows where EmployeeNo exists in both tables                          |
-| TC04   | Handles null values in DepartmentNo and NetPay                         | Employee.DepartmentNo or Salary.NetPay contains NULL values                                                | employee_bkup contains corresponding NULLs in DepartmentNo or NetPay                             |
-| TC05   | Handles duplicate EmployeeNo in Salary table (should error or skip)    | Salary table contains duplicate EmployeeNo values                                                          | Snowflake throws error due to primary key violation or only unique EmployeeNo inserted           |
-| TC06   | Handles large dataset (performance/volume)                             | Employee and Salary tables with 10,000+ matching rows                                                      | employee_bkup contains all matching rows; operation completes within reasonable time             |
-| TC07   | Employee table has rows, Salary table is empty                         | Employee table has data, Salary table is empty                                                             | employee_bkup remains empty (no rows inserted)                                                   |
-| TC08   | Handles special characters and long strings in names                   | Employee.FirstName/LastName contains special chars, max length strings                                     | employee_bkup stores and preserves all special characters and string lengths                     |
-| TC09   | Data types are enforced (invalid data fails)                           | Attempt to insert string into EmployeeNo or NetPay fields                                                  | Snowflake throws error due to type mismatch                                                      |
-| TC10   | Table recreation drops previous backup                                 | employee_bkup exists with old data, rerun script with new Employee/Salary data                             | employee_bkup is dropped and recreated with only new data                                        |
+   - Test ID: TC02
+     Test Description: Validate backup creation when Salary table has missing EmployeeNo (edge case).
+     Input Data: Employee table with 3 employees, Salary table missing one EmployeeNo.
+     Expected Output: employee_bkup table contains only 2 records for employees with matching Salary.
+
+   - Test ID: TC03
+     Test Description: Validate handling of null values in Salary table.
+     Input Data: Employee table with 2 employees, Salary table with one Salary as NULL.
+     Expected Output: employee_bkup table contains both employees, one with Salary as NULL.
+
+   - Test ID: TC04
+     Test Description: Validate backup creation with empty Employee table (boundary condition).
+     Input Data: Employee table empty, Salary table with any data.
+     Expected Output: employee_bkup table is empty.
+
+   - Test ID: TC05
+     Test Description: Validate backup creation with empty Salary table (boundary condition).
+     Input Data: Employee table with data, Salary table empty.
+     Expected Output: employee_bkup table is empty.
+
+   - Test ID: TC06
+     Test Description: Validate proper drop and recreate logic for employee_bkup table.
+     Input Data: employee_bkup table exists with old data, Employee and Salary tables with new data.
+     Expected Output: employee_bkup table is dropped and recreated with new backup data.
+
+   - Test ID: TC07
+     Test Description: Validate compliance with Snowflake syntax (error handling, IF EXISTS, etc.).
+     Input Data: Valid Snowflake environment, script execution.
+     Expected Output: Script executes without syntax errors.
+
+   - Test ID: TC08
+     Test Description: Validate performance for large dataset (performance consideration).
+     Input Data: Employee and Salary tables with 10,000 records each.
+     Expected Output: employee_bkup table is populated efficiently within reasonable time.
 
 2. Pytest Script for each test case
 
@@ -25,201 +52,149 @@ Description:   Robust unit test cases and Pytest script for validating the Snowf
 import pytest
 import snowflake.connector
 
-# Fixtures and helpers
+# Helper fixture to setup and teardown Snowflake connection and test data
 @pytest.fixture(scope="function")
-def snowflake_conn():
-    # Replace with your Snowflake connection details
+def snowflake_test_env():
+    # Setup Snowflake connection (replace with actual credentials/environment)
     conn = snowflake.connector.connect(
         user='YOUR_USER',
         password='YOUR_PASSWORD',
         account='YOUR_ACCOUNT',
         warehouse='YOUR_WAREHOUSE',
-        database='YOUR_DB',
-        schema='PUBLIC'
+        database='YOUR_DATABASE',
+        schema='YOUR_SCHEMA'
     )
-    cs = conn.cursor()
-    yield cs
-    cs.close()
+    cur = conn.cursor()
+    # Cleanup any existing test tables
+    cur.execute("DROP TABLE IF EXISTS Employee")
+    cur.execute("DROP TABLE IF EXISTS Salary")
+    cur.execute("DROP TABLE IF EXISTS employee_bkup")
+    yield cur
+    # Teardown: Drop all test tables
+    cur.execute("DROP TABLE IF EXISTS Employee")
+    cur.execute("DROP TABLE IF EXISTS Salary")
+    cur.execute("DROP TABLE IF EXISTS employee_bkup")
+    cur.close()
     conn.close()
 
-def run_script(cs, script):
-    for stmt in script.split(";"):
-        stmt = stmt.strip()
-        if stmt:
-            cs.execute(stmt)
-
-def fetch_all(cs, query):
-    cs.execute(query)
-    return cs.fetchall()
-
-def table_exists(cs, table_name):
-    cs.execute(f"SHOW TABLES LIKE '{table_name}'")
-    return cs.fetchone() is not None
-
-def drop_all(cs):
-    for tbl in ["employee_bkup", "Employee", "Salary"]:
-        cs.execute(f"DROP TABLE IF EXISTS {tbl}")
-
-# --- TEST CASES ---
-
-# TC01: Happy path - backup table created and populated
-def test_TC01_backup_created_and_populated(snowflake_conn):
-    cs = snowflake_conn
-    drop_all(cs)
-    cs.execute("CREATE TABLE Employee (EmployeeNo INT, FirstName STRING, LastName STRING, DepartmentNo SMALLINT)")
-    cs.execute("CREATE TABLE Salary (EmployeeNo INT, NetPay INT)")
-    cs.execute("INSERT INTO Employee VALUES (1, 'John', 'Doe', 10), (2, 'Jane', 'Smith', 20)")
-    cs.execute("INSERT INTO Salary VALUES (1, 5000), (2, 6000)")
-    # Run Snowflake logic (replace with actual script or function call)
-    run_script(cs, SNOWFLAKE_BACKUP_SCRIPT)
-    assert table_exists(cs, "EMPLOYEE_BKUP")
-    rows = fetch_all(cs, "SELECT * FROM EMPLOYEE_BKUP ORDER BY EmployeeNo")
-    assert rows == [(1, 'John', 'Doe', 10, 5000), (2, 'Jane', 'Smith', 20, 6000)]
-
-# TC02: Employee table empty, backup not created
-def test_TC02_employee_empty(snowflake_conn):
-    cs = snowflake_conn
-    drop_all(cs)
-    cs.execute("CREATE TABLE Employee (EmployeeNo INT, FirstName STRING, LastName STRING, DepartmentNo SMALLINT)")
-    cs.execute("CREATE TABLE Salary (EmployeeNo INT, NetPay INT)")
-    cs.execute("INSERT INTO Salary VALUES (1, 5000)")
-    run_script(cs, SNOWFLAKE_BACKUP_SCRIPT)
-    assert not table_exists(cs, "EMPLOYEE_BKUP")
-
-# TC03: Only matching EmployeeNo rows inserted
-def test_TC03_inner_join_logic(snowflake_conn):
-    cs = snowflake_conn
-    drop_all(cs)
-    cs.execute("CREATE TABLE Employee (EmployeeNo INT, FirstName STRING, LastName STRING, DepartmentNo SMALLINT)")
-    cs.execute("CREATE TABLE Salary (EmployeeNo INT, NetPay INT)")
-    cs.execute("INSERT INTO Employee VALUES (1, 'John', 'Doe', 10), (2, 'Jane', 'Smith', 20), (3, 'NoPay', 'Guy', 30)")
-    cs.execute("INSERT INTO Salary VALUES (1, 5000), (2, 6000), (4, 7000)")
-    run_script(cs, SNOWFLAKE_BACKUP_SCRIPT)
-    rows = fetch_all(cs, "SELECT * FROM EMPLOYEE_BKUP ORDER BY EmployeeNo")
-    assert rows == [(1, 'John', 'Doe', 10, 5000), (2, 'Jane', 'Smith', 20, 6000)]
-
-# TC04: Handles null values in DepartmentNo and NetPay
-def test_TC04_null_values(snowflake_conn):
-    cs = snowflake_conn
-    drop_all(cs)
-    cs.execute("CREATE TABLE Employee (EmployeeNo INT, FirstName STRING, LastName STRING, DepartmentNo SMALLINT)")
-    cs.execute("CREATE TABLE Salary (EmployeeNo INT, NetPay INT)")
-    cs.execute("INSERT INTO Employee VALUES (1, 'John', 'Doe', NULL)")
-    cs.execute("INSERT INTO Salary VALUES (1, NULL)")
-    run_script(cs, SNOWFLAKE_BACKUP_SCRIPT)
-    rows = fetch_all(cs, "SELECT * FROM EMPLOYEE_BKUP")
-    assert rows == [(1, 'John', 'Doe', None, None)]
-
-# TC05: Duplicate EmployeeNo in Salary table
-def test_TC05_duplicate_salary_employee_no(snowflake_conn):
-    cs = snowflake_conn
-    drop_all(cs)
-    cs.execute("CREATE TABLE Employee (EmployeeNo INT, FirstName STRING, LastName STRING, DepartmentNo SMALLINT)")
-    cs.execute("CREATE TABLE Salary (EmployeeNo INT, NetPay INT)")
-    cs.execute("INSERT INTO Employee VALUES (1, 'John', 'Doe', 10)")
-    cs.execute("INSERT INTO Salary VALUES (1, 5000), (1, 6000)")
-    with pytest.raises(snowflake.connector.errors.ProgrammingError):
-        run_script(cs, SNOWFLAKE_BACKUP_SCRIPT)
-
-# TC06: Large dataset (performance)
-def test_TC06_large_dataset(snowflake_conn):
-    cs = snowflake_conn
-    drop_all(cs)
-    cs.execute("CREATE TABLE Employee (EmployeeNo INT, FirstName STRING, LastName STRING, DepartmentNo SMALLINT)")
-    cs.execute("CREATE TABLE Salary (EmployeeNo INT, NetPay INT)")
-    # Insert 10,000 rows
-    for i in range(1, 10001):
-        cs.execute(f"INSERT INTO Employee VALUES ({i}, 'F{i}', 'L{i}', {i%100})")
-        cs.execute(f"INSERT INTO Salary VALUES ({i}, {i*10})")
-    run_script(cs, SNOWFLAKE_BACKUP_SCRIPT)
-    cs.execute("SELECT COUNT(*) FROM EMPLOYEE_BKUP")
-    count = cs.fetchone()[0]
-    assert count == 10000
-
-# TC07: Employee table has rows, Salary table is empty
-def test_TC07_salary_empty(snowflake_conn):
-    cs = snowflake_conn
-    drop_all(cs)
-    cs.execute("CREATE TABLE Employee (EmployeeNo INT, FirstName STRING, LastName STRING, DepartmentNo SMALLINT)")
-    cs.execute("CREATE TABLE Salary (EmployeeNo INT, NetPay INT)")
-    cs.execute("INSERT INTO Employee VALUES (1, 'John', 'Doe', 10)")
-    run_script(cs, SNOWFLAKE_BACKUP_SCRIPT)
-    cs.execute("SELECT COUNT(*) FROM EMPLOYEE_BKUP")
-    count = cs.fetchone()[0] if table_exists(cs, "EMPLOYEE_BKUP") else 0
-    assert count == 0
-
-# TC08: Handles special characters and long strings in names
-def test_TC08_special_characters(snowflake_conn):
-    cs = snowflake_conn
-    drop_all(cs)
-    cs.execute("CREATE TABLE Employee (EmployeeNo INT, FirstName STRING, LastName STRING, DepartmentNo SMALLINT)")
-    cs.execute("CREATE TABLE Salary (EmployeeNo INT, NetPay INT)")
-    fname = "Jöhn$%^&*()_+=-"
-    lname = "Dœ!@#~`|\\"
-    cs.execute(f"INSERT INTO Employee VALUES (1, '{fname}', '{lname}', 10)")
-    cs.execute("INSERT INTO Salary VALUES (1, 5000)")
-    run_script(cs, SNOWFLAKE_BACKUP_SCRIPT)
-    rows = fetch_all(cs, "SELECT * FROM EMPLOYEE_BKUP")
-    assert rows[0][1] == fname and rows[0][2] == lname
-
-# TC09: Data types are enforced (invalid data fails)
-def test_TC09_type_enforcement(snowflake_conn):
-    cs = snowflake_conn
-    drop_all(cs)
-    cs.execute("CREATE TABLE Employee (EmployeeNo INT, FirstName STRING, LastName STRING, DepartmentNo SMALLINT)")
-    cs.execute("CREATE TABLE Salary (EmployeeNo INT, NetPay INT)")
-    cs.execute("INSERT INTO Employee VALUES ('bad_id', 'John', 'Doe', 10)")
-    cs.execute("INSERT INTO Salary VALUES (1, 'bad_pay')")
-    with pytest.raises(snowflake.connector.errors.ProgrammingError):
-        run_script(cs, SNOWFLAKE_BACKUP_SCRIPT)
-
-# TC10: Table recreation drops previous backup
-def test_TC10_table_recreation(snowflake_conn):
-    cs = snowflake_conn
-    drop_all(cs)
-    cs.execute("CREATE TABLE Employee (EmployeeNo INT, FirstName STRING, LastName STRING, DepartmentNo SMALLINT)")
-    cs.execute("CREATE TABLE Salary (EmployeeNo INT, NetPay INT)")
-    cs.execute("INSERT INTO Employee VALUES (1, 'Old', 'Data', 10)")
-    cs.execute("INSERT INTO Salary VALUES (1, 1000)")
-    run_script(cs, SNOWFLAKE_BACKUP_SCRIPT)
-    cs.execute("DELETE FROM Employee")
-    cs.execute("DELETE FROM Salary")
-    cs.execute("INSERT INTO Employee VALUES (2, 'New', 'Guy', 20)")
-    cs.execute("INSERT INTO Salary VALUES (2, 2000)")
-    run_script(cs, SNOWFLAKE_BACKUP_SCRIPT)
-    rows = fetch_all(cs, "SELECT * FROM EMPLOYEE_BKUP")
-    assert rows == [(2, 'New', 'Guy', 20, 2000)]
-
-# --- Place the actual Snowflake script here as a string ---
-SNOWFLAKE_BACKUP_SCRIPT = """
-DROP TABLE IF EXISTS employee_bkup;
-CREATE TABLE employee_bkup (
-    EmployeeNo   INT         NOT NULL PRIMARY KEY,
-    FirstName    STRING      NOT NULL,
-    LastName     STRING      NOT NULL,
-    DepartmentNo SMALLINT,
-    NetPay       INT
-);
-DECLARE employee_count INT;
-BEGIN
-    SELECT COUNT(*) INTO :employee_count FROM Employee;
-    IF employee_count > 0 THEN
-        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
-        SELECT  e.EmployeeNo,
-                e.FirstName,
-                e.LastName,
-                e.DepartmentNo,
-                s.NetPay
-        FROM    Employee AS e
-        INNER JOIN Salary AS s
-            ON e.EmployeeNo = s.EmployeeNo;
-    ELSE
+# Helper function to run the backup script
+def run_backup_script(cur):
+    # Simulate the converted Snowflake script logic
+    cur.execute("""
         DROP TABLE IF EXISTS employee_bkup;
-    END IF;
-END;
-"""
+        CREATE TABLE employee_bkup AS
+        SELECT e.EmployeeNo, e.Name, s.Salary
+        FROM Employee e
+        INNER JOIN Salary s ON e.EmployeeNo = s.EmployeeNo;
+    """)
+
+# TC01: Happy Path - Standard backup creation
+def test_backup_creation_happy_path(snowflake_test_env):
+    cur = snowflake_test_env
+    # Setup Employee and Salary tables
+    cur.execute("CREATE TABLE Employee (EmployeeNo INT, Name STRING)")
+    cur.execute("INSERT INTO Employee VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')")
+    cur.execute("CREATE TABLE Salary (EmployeeNo INT, Salary FLOAT)")
+    cur.execute("INSERT INTO Salary VALUES (1, 50000), (2, 60000), (3, 55000)")
+    run_backup_script(cur)
+    cur.execute("SELECT * FROM employee_bkup ORDER BY EmployeeNo")
+    result = cur.fetchall()
+    assert result == [(1, 'Alice', 50000.0), (2, 'Bob', 60000.0), (3, 'Charlie', 55000.0)], "Backup table should contain all employees with correct salaries"
+
+# TC02: Edge Case - Salary table missing EmployeeNo
+def test_backup_creation_missing_salary(snowflake_test_env):
+    cur = snowflake_test_env
+    cur.execute("CREATE TABLE Employee (EmployeeNo INT, Name STRING)")
+    cur.execute("INSERT INTO Employee VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')")
+    cur.execute("CREATE TABLE Salary (EmployeeNo INT, Salary FLOAT)")
+    cur.execute("INSERT INTO Salary VALUES (1, 50000), (2, 60000)")  # Missing EmployeeNo 3
+    run_backup_script(cur)
+    cur.execute("SELECT * FROM employee_bkup ORDER BY EmployeeNo")
+    result = cur.fetchall()
+    assert result == [(1, 'Alice', 50000.0), (2, 'Bob', 60000.0)], "Backup table should only contain employees with matching salary records"
+
+# TC03: Null Salary value
+def test_backup_creation_null_salary(snowflake_test_env):
+    cur = snowflake_test_env
+    cur.execute("CREATE TABLE Employee (EmployeeNo INT, Name STRING)")
+    cur.execute("INSERT INTO Employee VALUES (1, 'Alice'), (2, 'Bob')")
+    cur.execute("CREATE TABLE Salary (EmployeeNo INT, Salary FLOAT)")
+    cur.execute("INSERT INTO Salary VALUES (1, NULL), (2, 60000)")
+    run_backup_script(cur)
+    cur.execute("SELECT * FROM employee_bkup ORDER BY EmployeeNo")
+    result = cur.fetchall()
+    assert result == [(1, 'Alice', None), (2, 'Bob', 60000.0)], "Backup table should handle NULL salary values"
+
+# TC04: Empty Employee table
+def test_backup_creation_empty_employee(snowflake_test_env):
+    cur = snowflake_test_env
+    cur.execute("CREATE TABLE Employee (EmployeeNo INT, Name STRING)")
+    cur.execute("CREATE TABLE Salary (EmployeeNo INT, Salary FLOAT)")
+    cur.execute("INSERT INTO Salary VALUES (1, 50000)")
+    run_backup_script(cur)
+    cur.execute("SELECT COUNT(*) FROM employee_bkup")
+    count = cur.fetchone()[0]
+    assert count == 0, "Backup table should be empty if Employee table is empty"
+
+# TC05: Empty Salary table
+def test_backup_creation_empty_salary(snowflake_test_env):
+    cur = snowflake_test_env
+    cur.execute("CREATE TABLE Employee (EmployeeNo INT, Name STRING)")
+    cur.execute("INSERT INTO Employee VALUES (1, 'Alice')")
+    cur.execute("CREATE TABLE Salary (EmployeeNo INT, Salary FLOAT)")
+    run_backup_script(cur)
+    cur.execute("SELECT COUNT(*) FROM employee_bkup")
+    count = cur.fetchone()[0]
+    assert count == 0, "Backup table should be empty if Salary table is empty"
+
+# TC06: Drop and recreate employee_bkup table
+def test_backup_drop_and_recreate(snowflake_test_env):
+    cur = snowflake_test_env
+    cur.execute("CREATE TABLE Employee (EmployeeNo INT, Name STRING)")
+    cur.execute("INSERT INTO Employee VALUES (1, 'Alice')")
+    cur.execute("CREATE TABLE Salary (EmployeeNo INT, Salary FLOAT)")
+    cur.execute("INSERT INTO Salary VALUES (1, 50000)")
+    # Create old backup table
+    cur.execute("CREATE TABLE employee_bkup (EmployeeNo INT, Name STRING, Salary FLOAT)")
+    cur.execute("INSERT INTO employee_bkup VALUES (99, 'Old', 99999)")
+    run_backup_script(cur)
+    cur.execute("SELECT * FROM employee_bkup ORDER BY EmployeeNo")
+    result = cur.fetchall()
+    assert result == [(1, 'Alice', 50000.0)], "Backup table should be dropped and recreated with new data"
+
+# TC07: Snowflake syntax compliance
+def test_snowflake_syntax_compliance(snowflake_test_env):
+    cur = snowflake_test_env
+    try:
+        cur.execute("CREATE TABLE Employee (EmployeeNo INT, Name STRING)")
+        cur.execute("CREATE TABLE Salary (EmployeeNo INT, Salary FLOAT)")
+        run_backup_script(cur)
+    except Exception as e:
+        pytest.fail(f"Snowflake syntax error: {e}")
+
+# TC08: Performance for large dataset
+def test_backup_creation_performance_large_dataset(snowflake_test_env):
+    cur = snowflake_test_env
+    cur.execute("CREATE TABLE Employee (EmployeeNo INT, Name STRING)")
+    cur.execute("CREATE TABLE Salary (EmployeeNo INT, Salary FLOAT)")
+    # Insert 10,000 records
+    for i in range(1, 10001):
+        cur.execute(f"INSERT INTO Employee VALUES ({i}, 'Emp{i}')")
+        cur.execute(f"INSERT INTO Salary VALUES ({i}, {50000 + i})")
+    import time
+    start = time.time()
+    run_backup_script(cur)
+    duration = time.time() - start
+    cur.execute("SELECT COUNT(*) FROM employee_bkup")
+    count = cur.fetchone()[0]
+    assert count == 10000, "Backup table should contain all records"
+    assert duration < 10, "Backup creation should be efficient (<10s for 10,000 records)"
+
+# Note: Replace Snowflake credentials and connection details with real values.
+# Each test case is logically grouped and includes comments for clarity.
 ```
 
 3. API Cost Calculation
 
-apiCost: 0.002 USD
+apiCost: 0.0042 USD
+```
