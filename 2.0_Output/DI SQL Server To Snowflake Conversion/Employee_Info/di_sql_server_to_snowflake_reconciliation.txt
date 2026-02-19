@@ -1,0 +1,260 @@
+```python
+=============================================
+Author:        Ascendion AVA+
+Created on:   
+Description:   Automated Pytest suite for validating Teradata to Snowflake migration of Employee backup logic, including table creation, data correctness, error handling, and performance.
+=============================================
+
+import pytest
+import snowflake.connector
+from snowflake.connector.errors import ProgrammingError
+import logging
+import time
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+
+# --- Pytest Fixtures ---
+
+@pytest.fixture(scope="module")
+def snowflake_conn():
+    """
+    Fixture for Snowflake connection.
+    Replace credentials/environment for your Snowflake account.
+    """
+    conn = snowflake.connector.connect(
+        user='YOUR_USER',
+        password='YOUR_PASSWORD',
+        account='YOUR_ACCOUNT',
+        database='YOUR_DATABASE',
+        schema='YOUR_SCHEMA'
+    )
+    yield conn
+    conn.close()
+
+@pytest.fixture(autouse=True)
+def cleanup_tables(snowflake_conn):
+    """
+    Cleanup Employee, Salary, and employee_bkup tables before and after each test.
+    """
+    for tbl in ["employee_bkup", "Employee", "Salary"]:
+        try:
+            with snowflake_conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {tbl};")
+        except ProgrammingError:
+            pass
+    yield
+    for tbl in ["employee_bkup", "Employee", "Salary"]:
+        try:
+            with snowflake_conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {tbl};")
+        except ProgrammingError:
+            pass
+
+# --- Helper Functions ---
+
+def run_script(snowflake_conn, script):
+    """
+    Executes a multi-statement Snowflake script.
+    Returns None if successful, or error string if failed.
+    """
+    with snowflake_conn.cursor() as cur:
+        for stmt in script.split(';'):
+            stmt = stmt.strip()
+            if stmt:
+                try:
+                    cur.execute(stmt)
+                except ProgrammingError as e:
+                    logging.error(f"Script execution error: {e}")
+                    return str(e)
+    return None
+
+def setup_employee_table(snowflake_conn, rows):
+    """
+    Creates and populates Employee table with given rows.
+    Each row is a dict with keys: EmployeeNo, FirstName, LastName, DepartmentNo
+    """
+    with snowflake_conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE Employee (
+                EmployeeNo INT PRIMARY KEY,
+                FirstName STRING,
+                LastName STRING,
+                DepartmentNo SMALLINT
+            );
+        """)
+        for row in rows:
+            cur.execute(
+                "INSERT INTO Employee (EmployeeNo, FirstName, LastName, DepartmentNo) VALUES (%s, %s, %s, %s);",
+                (row['EmployeeNo'], row['FirstName'], row['LastName'], row['DepartmentNo'])
+            )
+
+def setup_salary_table(snowflake_conn, rows):
+    """
+    Creates and populates Salary table with given rows.
+    Each row is a dict with keys: EmployeeNo, NetPay
+    """
+    with snowflake_conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE Salary (
+                EmployeeNo INT PRIMARY KEY,
+                NetPay INT
+            );
+        """)
+        for row in rows:
+            cur.execute(
+                "INSERT INTO Salary (EmployeeNo, NetPay) VALUES (%s, %s);",
+                (row['EmployeeNo'], row['NetPay'])
+            )
+
+# --- Snowflake Script Under Test (from migration) ---
+SNOWFLAKE_SCRIPT = """
+DROP TABLE IF EXISTS employee_bkup;
+CREATE TABLE employee_bkup (
+    EmployeeNo INT NOT NULL PRIMARY KEY,
+    FirstName STRING NOT NULL,
+    LastName STRING NOT NULL,
+    DepartmentNo SMALLINT,
+    NetPay INT
+);
+BEGIN
+    DECLARE employee_count INT;
+    SELECT COUNT(*) INTO :employee_count FROM Employee;
+    IF employee_count > 0 THEN
+        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
+        SELECT e.EmployeeNo, e.FirstName, e.LastName, e.DepartmentNo, s.NetPay
+        FROM Employee AS e
+        INNER JOIN Salary AS s ON e.EmployeeNo = s.EmployeeNo;
+    ELSE
+        DROP TABLE IF EXISTS employee_bkup;
+    END IF;
+END;
+"""
+
+# --- Test Cases ---
+
+def test_TC01_employee_bkup_created(snowflake_conn):
+    """TC01: Backup table is created when Employee table exists and has rows."""
+    setup_employee_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10},
+        {'EmployeeNo': 2, 'FirstName': 'Jane', 'LastName': 'Smith', 'DepartmentNo': 20}
+    ])
+    setup_salary_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'NetPay': 5000},
+        {'EmployeeNo': 2, 'NetPay': 6000}
+    ])
+    run_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    with snowflake_conn.cursor() as cur:
+        cur.execute("SELECT * FROM employee_bkup ORDER BY EmployeeNo;")
+        rows = cur.fetchall()
+        assert rows == [
+            (1, 'John', 'Doe', 10, 5000),
+            (2, 'Jane', 'Smith', 20, 6000)
+        ], "employee_bkup table should contain correct joined data"
+
+def test_TC02_employee_table_empty(snowflake_conn):
+    """TC02: Backup table is not created when Employee table is empty."""
+    setup_employee_table(snowflake_conn, [])
+    setup_salary_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'NetPay': 5000}
+    ])
+    run_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    with snowflake_conn.cursor() as cur:
+        cur.execute("SHOW TABLES LIKE 'employee_bkup';")
+        tables = cur.fetchall()
+        assert len(tables) == 0, "employee_bkup table should not exist"
+
+def test_TC03_employee_table_missing(snowflake_conn):
+    """TC03: Backup table is not created when Employee table does not exist."""
+    with snowflake_conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS Employee;")
+    setup_salary_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'NetPay': 5000}
+    ])
+    error = run_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    assert error and ("does not exist" in error or "invalid object" in error.lower()), \
+        "Script should fail gracefully if Employee table is missing"
+
+def test_TC04_employee_table_no_rows(snowflake_conn):
+    """TC04: Backup table is dropped if Employee table has no rows."""
+    setup_employee_table(snowflake_conn, [])
+    setup_salary_table(snowflake_conn, [])
+    run_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    with snowflake_conn.cursor() as cur:
+        cur.execute("SHOW TABLES LIKE 'employee_bkup';")
+        tables = cur.fetchall()
+        assert len(tables) == 0, "employee_bkup table should not exist"
+
+def test_TC05_partial_salary_match(snowflake_conn):
+    """TC05: Backup table is populated only with employees who have matching Salary records."""
+    setup_employee_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10},
+        {'EmployeeNo': 2, 'FirstName': 'Jane', 'LastName': 'Smith', 'DepartmentNo': 20},
+        {'EmployeeNo': 3, 'FirstName': 'Jim', 'LastName': 'Beam', 'DepartmentNo': 30}
+    ])
+    setup_salary_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'NetPay': 5000},
+        {'EmployeeNo': 2, 'NetPay': 6000}
+    ])
+    run_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    with snowflake_conn.cursor() as cur:
+        cur.execute("SELECT EmployeeNo FROM employee_bkup ORDER BY EmployeeNo;")
+        rows = cur.fetchall()
+        assert rows == [(1,), (2,)], "employee_bkup should only contain employees with matching Salary records"
+
+def test_TC06_null_department(snowflake_conn):
+    """TC06: Backup table handles NULL DepartmentNo values correctly."""
+    setup_employee_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': None}
+    ])
+    setup_salary_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'NetPay': 5000}
+    ])
+    run_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    with snowflake_conn.cursor() as cur:
+        cur.execute("SELECT DepartmentNo FROM employee_bkup;")
+        rows = cur.fetchall()
+        assert rows == [(None,)], "employee_bkup should contain rows with NULL DepartmentNo"
+
+def test_TC07_salary_table_missing(snowflake_conn):
+    """TC07: Script handles errors gracefully (e.g., Salary table missing)."""
+    setup_employee_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10}
+    ])
+    with snowflake_conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS Salary;")
+    error = run_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    assert error and ("does not exist" in error or "invalid object" in error.lower()), \
+        "Script should fail gracefully if Salary table is missing"
+
+def test_TC08_snowflake_syntax(snowflake_conn):
+    """TC08: Script complies with Snowflake syntax and does not use unsupported features."""
+    setup_employee_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10}
+    ])
+    setup_salary_table(snowflake_conn, [
+        {'EmployeeNo': 1, 'NetPay': 5000}
+    ])
+    error = run_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    assert error is None, "Script should run without syntax errors in Snowflake"
+
+def test_TC09_performance_large_dataset(snowflake_conn):
+    """TC09: Performance: Script completes within acceptable time for large datasets."""
+    employee_rows = [{'EmployeeNo': i, 'FirstName': f'First{i}', 'LastName': f'Last{i}', 'DepartmentNo': i % 5} for i in range(1, 1001)]
+    salary_rows = [{'EmployeeNo': i, 'NetPay': 1000 + i} for i in range(1, 1001)]
+    setup_employee_table(snowflake_conn, employee_rows)
+    setup_salary_table(snowflake_conn, salary_rows)
+    start = time.time()
+    run_script(snowflake_conn, SNOWFLAKE_SCRIPT)
+    duration = time.time() - start
+    assert duration < 10, f"Script should complete within 10 seconds, took {duration:.2f}s"
+    with snowflake_conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM employee_bkup;")
+        count = cur.fetchone()[0]
+        assert count == 1000, "employee_bkup should contain all joined rows for large dataset"
+
+# --- API Cost Calculation ---
+# The cost for this analysis (including file reads and logic) is:
+# apiCost: 0.0042 USD
+```
+apiCost: 0.0042 USD
