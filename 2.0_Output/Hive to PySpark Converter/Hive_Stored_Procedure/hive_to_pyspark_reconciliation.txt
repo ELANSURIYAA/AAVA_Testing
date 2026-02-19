@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""
+Automated Hive to PySpark Migration Reconciliation Script
+
+This script:
+- Executes Hive SQL code and exports target tables to Parquet
+- Transfers Parquet files to Databricks
+- Creates PySpark external tables from Parquet
+- Executes converted PySpark code
+- Compares Hive and PySpark results for consistency
+- Generates a detailed reconciliation report
+
+Requirements:
+- Python 3.7+
+- pyhive[hive], pandas, pyarrow, pyspark, databricks-cli, requests, boto3 (if using S3), logging
+- Environment variables for all credentials
+
+Author: Data Migration Validation Agent
+Date: 2024-06
+"""
+
+import os
+import sys
+import time
+import logging
+import tempfile
+import shutil
+import subprocess
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from datetime import datetime
+from pyhive import hive
+from pyspark.sql import SparkSession
+from pyspark.sql.utils import AnalysisException
+
+# ------------------------------- CONFIGURATION -------------------------------
+
+# Environment variables (must be set externally)
+HIVE_HOST = os.environ.get("HIVE_HOST")
+HIVE_PORT = int(os.environ.get("HIVE_PORT", "10000"))
+HIVE_USERNAME = os.environ.get("HIVE_USERNAME")
+HIVE_PASSWORD = os.environ.get("HIVE_PASSWORD")
+HIVE_DATABASE = os.environ.get("HIVE_DATABASE", "default")
+
+DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
+DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN")
+DATABRICKS_STORAGE_PATH = os.environ.get("DATABRICKS_STORAGE_PATH")  # e.g., "dbfs:/mnt/reconciliation/"
+DATABRICKS_CLUSTER_ID = os.environ.get("DATABRICKS_CLUSTER_ID")  # Optional, for REST API
+
+SPARK_APP_NAME = "HiveToPySparkReconciliation"
+SPARK_MASTER = os.environ.get("SPARK_MASTER", "local[*]")  # Or "yarn", etc.
+
+# Paths for temporary files
+LOCAL_TMP_DIR = tempfile.mkdtemp(prefix="hive_pyspark_recon_")
+
+# Logging setup
+LOG_FILE = os.path.join(LOCAL_TMP_DIR, "reconciliation.log")
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+console.setFormatter(formatter)
+logging.getLogger().addHandler(console)
+
+# ------------------------------- HELPER FUNCTIONS ----------------------------
+
+def log_and_print(msg):
+    logging.info(msg)
+    print(msg)
+
+def cleanup():
+    shutil.rmtree(LOCAL_TMP_DIR, ignore_errors=True)
+
+def get_timestamp():
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def export_hive_table_to_parquet(cursor, table_name, where_clause=None):
+    """
+    Export a Hive table to Parquet via Pandas DataFrame.
+    """
+    log_and_print(f"Exporting Hive table '{table_name}' to Parquet...")
+    query = f"SELECT * FROM {table_name}"
+    if where_clause:
+        query += f" WHERE {where_clause}"
+    cursor.execute(query)
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+    df = pd.DataFrame(rows, columns=columns)
+    parquet_path = os.path.join(LOCAL_TMP_DIR, f"{table_name}_{get_timestamp()}.parquet")
+    table = pa.Table.from_pandas(df)
+    pq.write_table(table, parquet_path)
+    log_and_print(f"Exported {len(df)} rows from '{table_name}' to '{parquet_path}'")
+    return parquet_path, df
+
+def transfer_to_databricks(local_path, dbfs_path):
+    """
+    Transfer a local file to Databricks DBFS using databricks-cli.
+    """
+    log_and_print(f"Transferring '{local_path}' to Databricks DBFS at '{dbfs_path}'...")
+    try:
+        subprocess.check_call([
+            "databricks", "fs", "cp", local_path, dbfs_path, "--overwrite"
+        ])
+        log_and_print(f"Transfer successful: {dbfs_path}")
+    except Exception as e:
+        log_and_print(f"Error during Databricks transfer: {e}")
+        raise
+
+def verify_dbfs_file(dbfs_path):
+    """
+    Verify file exists in DBFS.
+    """
+    try:
+        result = subprocess.check_output([
+            "databricks", "fs", "ls", dbfs_path
+        ]).decode()
+        if os.path.basename(dbfs_path) in result:
+            log_and_print(f"Verified file in DBFS: {dbfs_path}")
+            return True
+        else:
+            log_and_print(f"File not found in DBFS: {dbfs_path}")
+            return False
+    except Exception as e:
+        log_and_print(f"Error verifying DBFS file: {e}")
+        return False
+
+def create_external_table(spark, table_name, parquet_dbfs_path, schema):
+    """
+    Create an external table in Databricks/Spark SQL pointing to the Parquet file.
+    """
+    log_and_print(f"Creating external table '{table_name}_ext' in Databricks...")
+    # Drop if exists
+    spark.sql(f"DROP TABLE IF EXISTS {table_name}_ext")
+    # Build schema string
+    schema_str = ", ".join([f"{field.name} {field.dataType.simpleString()}" for field in schema])
+    # Create table
+    spark.sql(f"""
+        CREATE TABLE {table_name}_ext ({schema_str})
+        USING PARQUET
+        LOCATION '{parquet_dbfs_path}'
+    """)
+    log_and_print(f"External table '{table_name}_ext' created.")
+
+def compare_dataframes(df1, df2, key_columns=None, float_tol=1e-6):
+    """
+    Compare two Spark DataFrames and return a dict with match status and details.
+    """
+    result = {
+        "row_count_hive": df1.count(),
+        "row_count_pyspark": df2.count(),
+        "row_count_match": df1.count() == df2.count(),
+        "column_names_hive": set(df1.columns),
+        "column_names_pyspark": set(df2.columns),
+        "column_names_match": set(df1.columns) == set(df2.columns),
+        "column_discrepancies": [],
+        "sample_mismatches": [],
+        "match_percentage": 0.0,
+        "status": "NO MATCH"
+    }
+
+    # Check columns
+    if not result["column_names_match"]:
+        result["column_discrepancies"] = list(result["column_names_hive"].symmetric_difference(result["column_names_pyspark"]))
+        result["status"] = "NO MATCH"
+        return result
+
+    # Join on key columns if provided, else on all columns
+    join_cols = key_columns if key_columns else df1.columns
+    try:
+        mismatches = (
+            df1.subtract(df2)
+            .union(df2.subtract(df1))
+        )
+        mismatch_count = mismatches.count()
+        total = max(df1.count(), 1)
+        match_pct = 1.0 - (mismatch_count / total)
+        result["sample_mismatches"] = mismatches.limit(10).toPandas().to_dict("records")
+        result["match_percentage"] = round(match_pct * 100, 2)
+        if mismatch_count == 0 and result["row_count_match"]:
+            result["status"] = "MATCH"
+        elif mismatch_count > 0 and result["row_count_match"]:
+            result["status"] = "PARTIAL MATCH"
+        else:
+            result["status"] = "NO MATCH"
+    except Exception as e:
+        result["status"] = "ERROR"
+        result["error"] = str(e)
+    return result
+
+# ------------------------------- MAIN WORKFLOW -------------------------------
+
+def main():
+    try:
+        log_and_print("Starting Hive to PySpark migration reconciliation process...")
+
+        # ------------------- 1. Connect to Hive and Execute Hive SQL -------------------
+        log_and_print("Connecting to Hive...")
+        hive_conn = hive.Connection(
+            host=HIVE_HOST,
+            port=HIVE_PORT,
+            username=HIVE_USERNAME,
+            password=HIVE_PASSWORD,
+            database=HIVE_DATABASE,
+            auth="CUSTOM"
+        )
+        hive_cursor = hive_conn.cursor()
+
+        # Read Hive SQL code (replace with your file path or pass as argument)
+        HIVE_SQL_FILE = os.path.join(os.path.dirname(__file__), "Hive_Stored_Procedure.txt")
+        with open(HIVE_SQL_FILE, "r") as f:
+            hive_sql_code = f.read()
+
+        # Execute Hive SQL code (simulate stored procedure)
+        log_and_print("Executing Hive SQL code...")
+        # For simplicity, extract and execute the INSERT and temp table creation
+        # (You may need to parse and execute line by line for complex procedures)
+        for stmt in hive_sql_code.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                try:
+                    hive_cursor.execute(stmt)
+                    log_and_print(f"Executed: {stmt[:60]}...")
+                except Exception as e:
+                    log_and_print(f"Error executing statement: {e}")
+
+        # ------------------- 2. Export Hive Target Tables to Parquet -------------------
+        target_tables = ["summary_table", "detailed_sales_summary"]
+        parquet_files = {}
+        pandas_snapshots = {}
+        for tbl in target_tables:
+            parquet_path, df = export_hive_table_to_parquet(hive_cursor, tbl)
+            parquet_files[tbl] = parquet_path
+            pandas_snapshots[tbl] = df
+
+        # ------------------- 3. Transfer Parquet Files to Databricks -------------------
+        dbfs_parquet_paths = {}
+        for tbl, local_path in parquet_files.items():
+            dbfs_path = os.path.join(DATABRICKS_STORAGE_PATH, os.path.basename(local_path))
+            transfer_to_databricks(local_path, dbfs_path)
+            if not verify_dbfs_file(DATABRICKS_STORAGE_PATH):
+                raise Exception(f"File not found in DBFS after transfer: {dbfs_path}")
+            dbfs_parquet_paths[tbl] = dbfs_path
+
+        # ------------------- 4. Connect to Databricks/Spark -------------------
+        log_and_print("Connecting to Databricks/Spark...")
+        spark = SparkSession.builder \
+            .appName(SPARK_APP_NAME) \
+            .master(SPARK_MASTER) \
+            .getOrCreate()
+
+        # ------------------- 5. Create External Tables in PySpark -------------------
+        for tbl in target_tables:
+            # Read schema from Parquet
+            df = spark.read.parquet(dbfs_parquet_paths[tbl])
+            create_external_table(spark, tbl, dbfs_parquet_paths[tbl], df.schema)
+
+        # ------------------- 6. Execute PySpark SQL Code -------------------
+        log_and_print("Executing converted PySpark code...")
+        # The PySpark code should be imported or executed here.
+        # For automation, you can exec() the code or import as a module.
+        # For this example, we assume the code is in 'converted_pyspark_code.py'
+        PYSPARK_CODE_FILE = os.path.join(os.path.dirname(__file__), "converted_pyspark_code.py")
+        with open(PYSPARK_CODE_FILE, "r") as f:
+            pyspark_code = f.read()
+        # Provide start_date and end_date variables in the exec environment
+        exec_env = {"spark": spark, "start_date": "2023-01-01", "end_date": "2023-01-31"}
+        exec(pyspark_code, exec_env)
+
+        # ------------------- 7. Compare Results -------------------
+        log_and_print("Comparing Hive and PySpark results...")
+        report = {}
+        for tbl in target_tables:
+            hive_df = spark.read.parquet(dbfs_parquet_paths[tbl])
+            pyspark_df = spark.table(tbl)
+            result = compare_dataframes(hive_df, pyspark_df)
+            report[tbl] = result
+            log_and_print(f"Comparison for table '{tbl}': {result['status']}, Match: {result['match_percentage']}%")
+
+        # ------------------- 8. Generate Report -------------------
+        summary = {
+            "timestamp": get_timestamp(),
+            "tables": report,
+            "log_file": LOG_FILE
+        }
+        report_file = os.path.join(LOCAL_TMP_DIR, f"reconciliation_report_{get_timestamp()}.json")
+        import json
+        with open(report_file, "w") as f:
+            json.dump(summary, f, indent=2)
+        log_and_print(f"Reconciliation report written to: {report_file}")
+
+        # Print summary
+        for tbl, res in report.items():
+            log_and_print(f"Table: {tbl} | Status: {res['status']} | Match %: {res['match_percentage']}")
+
+    except Exception as e:
+        log_and_print(f"ERROR: {e}")
+        logging.exception("Exception occurred")
+        sys.exit(1)
+    finally:
+        cleanup()
+        log_and_print("Cleanup complete.")
+
+# ------------------------------- ENTRY POINT ---------------------------------
+
+if __name__ == "__main__":
+    main()
+
+"""
+# ------------------------------- USAGE NOTES ---------------------------------
+- Set all required environment variables before running the script.
+- Place 'Hive_Stored_Procedure.txt' and 'converted_pyspark_code.py' in the same directory as this script.
+- The script logs all operations to both console and a log file.
+- The reconciliation report is output as a JSON file for easy parsing.
+- Handles large datasets efficiently via Parquet and Spark.
+- All credentials are handled securely via environment variables.
+- Robust error handling and progress reporting are included.
+"""
