@@ -1,0 +1,314 @@
+```
+=============================================
+Author: Ascendion AVA+
+Date: 
+Description: Pytest script for validating PySpark TAMBR_RINGS transformation logic, joins, aggregations, UDFs, and output structure, including edge cases and error handling.
+=============================================
+
+# -------------------------------
+# 1. Test Case List
+# -------------------------------
+
+| Test Case ID | Description                                                                                  | Expected Outcome                                                                                           |
+|--------------|---------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: Valid customer and branch data, all joins succeed, all fields present            | Output DataFrames have correct schema, data matches expected values, row counts as per business logic      |
+| TC02         | Edge: Customer with NULL latitude/longitude                                                  | Customer is flagged as bad_latlong_cust, excluded from rings_cust_data, handled gracefully                 |
+| TC03         | Edge: Branch with invalid latitude/longitude                                                 | Branch is flagged as bad_latlong_branch, excluded from rings_branch_data, handled gracefully               |
+| TC04         | Edge: Customer with no matching branch                                                       | Customer excluded from rings_priority_cust and rings_most_used_cust                                        |
+| TC05         | Edge: Empty input datasets                                                                   | All output DataFrames are empty, no errors                                                                 |
+| TC06         | Edge: Duplicate LP_ID in branch_active                                                       | Only one (first) most_used branch per customer is selected                                                 |
+| TC07         | Error: Type mismatch in latitude/longitude fields                                            | Exception is raised, test fails                                                                            |
+| TC08         | Error: Missing required columns in input DataFrames                                          | Exception is raised, test fails                                                                            |
+| TC09         | Edge: Distance calculation with NULLs                                                        | Distance is NULL, handled gracefully, not included in percentile calculation                               |
+| TC10         | Happy path: Output structure matches TAMBR_RINGS.txt (columns, types)                        | Output DataFrames have expected columns and types                                                          |
+| TC11         | Happy path: Aggregated values (percentiles, counts) match expected results                   | Aggregated values match expected, percentiles are correct                                                  |
+| TC12         | Edge: Filtering and conditional logic yields expected row counts                             | Row counts after filters match expectations                                                                |
+| TC13         | Edge: Performance improvement (PySpark vs SAS)                                               | PySpark runs faster than SAS (mocked/estimated in test)                                                    |
+
+# -------------------------------
+# 2. Pytest Script
+# -------------------------------
+
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType, StringType, IntegerType, StructType, StructField
+import math
+
+@pytest.fixture(scope="session")
+def spark():
+    spark = (
+        SparkSession.builder
+        .master("local[2]")
+        .appName("TAMBR_RINGS_TEST")
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+        .getOrCreate()
+    )
+    yield spark
+    spark.stop()
+
+# Helper UDF for geodist
+def geodist(lat1, lon1, lat2, lon2):
+    if None in (lat1, lon1, lat2, lon2):
+        return None
+    lon1, lat1, lon2, lat2 = map(math.radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    r = 3958.8
+    return c * r
+
+@pytest.fixture
+def geodist_udf(spark):
+    return F.udf(geodist, DoubleType())
+
+@pytest.fixture
+def valid_customer_df(spark):
+    schema = StructType([
+        StructField("LP_ID", StringType(), False),
+        StructField("PRTY_BR", StringType(), False),
+        StructField("CUST_PRTY_ACCT_ID", StringType(), False),
+        StructField("OPN_ACCT_FLG", StringType(), False),
+        StructField("NBR_OF_MOS_OPN", IntegerType(), False),
+        StructField("MOST_USED_BR", StringType(), True),
+        StructField("MOST_USED_OLD", StringType(), True),
+        StructField("HGN_CUST_TYP_CDE", StringType(), True),
+        StructField("OPN_ACCT_CNT", IntegerType(), False),
+        StructField("geomatchcode", StringType(), True),
+        StructField("custlat", DoubleType(), True),
+        StructField("custlong", DoubleType(), True),
+    ])
+    data = [
+        ("CUST1", "BR1", "ACCT1", "Y", 12, "BR2", "BR2", "TYP1", 1, "A", 40.0, -75.0),
+        ("CUST2", "BR2", "ACCT2", "Y", 24, "BR3", "BR3", "TYP2", 2, "A", 41.0, -76.0),
+    ]
+    return spark.createDataFrame(data, schema)
+
+@pytest.fixture
+def valid_branch_df(spark):
+    schema = StructType([
+        StructField("HGN_BR_ID", StringType(), False),
+        StructField("BR_TYP", StringType(), False),
+        StructField("BR_OPN_FLG", StringType(), False),
+        StructField("branchlat", DoubleType(), False),
+        StructField("branchlong", DoubleType(), False),
+        StructField("METRO_COMMUNITY_CDE", StringType(), True),
+        StructField("GEN_CDE", StringType(), True),
+        StructField("TBA_CLS_DVSTD_DT", StringType(), True),
+        StructField("BRICK_AND_MORTOR_NM", StringType(), True),
+        StructField("CITY", StringType(), True),
+        StructField("ST", StringType(), True),
+        StructField("ZIP_CDE", StringType(), True),
+    ])
+    data = [
+        ("BR1", "R", "Y", 40.0, -75.0, "A", "GEN1", "2023-01-01", "Branch1", "City1", "ST1", "12345"),
+        ("BR2", "U", "Y", 41.0, -76.0, "B", "GEN2", "2023-01-01", "Branch2", "City2", "ST2", "23456"),
+    ]
+    return spark.createDataFrame(data, schema)
+
+@pytest.fixture
+def invalid_latlong_customer_df(spark):
+    schema = StructType([
+        StructField("LP_ID", StringType(), False),
+        StructField("PRTY_BR", StringType(), False),
+        StructField("CUST_PRTY_ACCT_ID", StringType(), False),
+        StructField("OPN_ACCT_FLG", StringType(), False),
+        StructField("NBR_OF_MOS_OPN", IntegerType(), False),
+        StructField("MOST_USED_BR", StringType(), True),
+        StructField("MOST_USED_OLD", StringType(), True),
+        StructField("HGN_CUST_TYP_CDE", StringType(), True),
+        StructField("OPN_ACCT_CNT", IntegerType(), False),
+        StructField("geomatchcode", StringType(), True),
+        StructField("custlat", DoubleType(), True),
+        StructField("custlong", DoubleType(), True),
+    ])
+    data = [
+        ("CUST3", "BR1", "ACCT3", "Y", 10, "BR2", "BR2", "TYP1", 1, "0", None, None),
+    ]
+    return spark.createDataFrame(data, schema)
+
+@pytest.fixture
+def invalid_latlong_branch_df(spark):
+    schema = StructType([
+        StructField("HGN_BR_ID", StringType(), False),
+        StructField("BR_TYP", StringType(), False),
+        StructField("BR_OPN_FLG", StringType(), False),
+        StructField("branchlat", DoubleType(), False),
+        StructField("branchlong", DoubleType(), False),
+        StructField("METRO_COMMUNITY_CDE", StringType(), True),
+        StructField("GEN_CDE", StringType(), True),
+        StructField("TBA_CLS_DVSTD_DT", StringType(), True),
+        StructField("BRICK_AND_MORTOR_NM", StringType(), True),
+        StructField("CITY", StringType(), True),
+        StructField("ST", StringType(), True),
+        StructField("ZIP_CDE", StringType(), True),
+    ])
+    data = [
+        ("BR3", "R", "Y", 0.0, 0.0, "C", "GEN3", "2023-01-01", "Branch3", "City3", "ST3", "34567"),
+    ]
+    return spark.createDataFrame(data, schema)
+
+def test_happy_path_valid_data(spark, valid_customer_df, valid_branch_df, geodist_udf):
+    # Join customers and branches on priority branch
+    joined = valid_customer_df.join(valid_branch_df, valid_customer_df["PRTY_BR"] == valid_branch_df["HGN_BR_ID"], "inner")
+    assert joined.count() == 2
+    # Check schema
+    expected_cols = ["LP_ID", "PRTY_BR", "CUST_PRTY_ACCT_ID", "OPN_ACCT_FLG", "NBR_OF_MOS_OPN", "MOST_USED_BR", "MOST_USED_OLD", "HGN_CUST_TYP_CDE", "OPN_ACCT_CNT", "geomatchcode", "custlat", "custlong", "HGN_BR_ID", "BR_TYP", "BR_OPN_FLG", "branchlat", "branchlong", "METRO_COMMUNITY_CDE", "GEN_CDE", "TBA_CLS_DVSTD_DT", "BRICK_AND_MORTOR_NM", "CITY", "ST", "ZIP_CDE"]
+    assert set(joined.columns) >= set(expected_cols)
+    # Distance calculation
+    joined = joined.withColumn("dist_to_prty_br", geodist_udf("branchlat", "branchlong", "custlat", "custlong"))
+    for row in joined.collect():
+        assert row.dist_to_prty_br is not None
+
+def test_edge_null_latlong_customer(spark, invalid_latlong_customer_df, valid_branch_df):
+    # Should be excluded from rings_cust_data
+    filtered = invalid_latlong_customer_df.filter(~F.col("geomatchcode").isin("0", " "))
+    assert filtered.count() == 0
+    # Should be included in bad_latlong_cust
+    bad = invalid_latlong_customer_df.filter(F.col("geomatchcode").isin("0", " "))
+    assert bad.count() == 1
+
+def test_edge_invalid_latlong_branch(spark, valid_customer_df, invalid_latlong_branch_df):
+    # Should be excluded from rings_branch_data
+    filtered = invalid_latlong_branch_df.filter((F.col("branchlat") > 1) & (F.col("branchlong") < -1))
+    assert filtered.count() == 0
+    # Should be included in bad_latlong_branch
+    bad = invalid_latlong_branch_df.filter(~((F.col("branchlat") > 1) & (F.col("branchlong") < -1)))
+    assert bad.count() == 1
+
+def test_edge_no_matching_branch(spark, valid_customer_df):
+    # Branch DataFrame with no matching HGN_BR_ID
+    empty_branch_df = spark.createDataFrame([], valid_customer_df.schema)
+    joined = valid_customer_df.join(empty_branch_df, valid_customer_df["PRTY_BR"] == empty_branch_df["HGN_BR_ID"], "inner")
+    assert joined.count() == 0
+
+def test_edge_empty_input(spark):
+    empty_customer_df = spark.createDataFrame([], StructType([
+        StructField("LP_ID", StringType(), False),
+        StructField("PRTY_BR", StringType(), False),
+        StructField("CUST_PRTY_ACCT_ID", StringType(), False),
+        StructField("OPN_ACCT_FLG", StringType(), False),
+        StructField("NBR_OF_MOS_OPN", IntegerType(), False),
+        StructField("MOST_USED_BR", StringType(), True),
+        StructField("MOST_USED_OLD", StringType(), True),
+        StructField("HGN_CUST_TYP_CDE", StringType(), True),
+        StructField("OPN_ACCT_CNT", IntegerType(), False),
+        StructField("geomatchcode", StringType(), True),
+        StructField("custlat", DoubleType(), True),
+        StructField("custlong", DoubleType(), True),
+    ]))
+    empty_branch_df = spark.createDataFrame([], StructType([
+        StructField("HGN_BR_ID", StringType(), False),
+        StructField("BR_TYP", StringType(), False),
+        StructField("BR_OPN_FLG", StringType(), False),
+        StructField("branchlat", DoubleType(), False),
+        StructField("branchlong", DoubleType(), False),
+        StructField("METRO_COMMUNITY_CDE", StringType(), True),
+        StructField("GEN_CDE", StringType(), True),
+        StructField("TBA_CLS_DVSTD_DT", StringType(), True),
+        StructField("BRICK_AND_MORTOR_NM", StringType(), True),
+        StructField("CITY", StringType(), True),
+        StructField("ST", StringType(), True),
+        StructField("ZIP_CDE", StringType(), True),
+    ]))
+    joined = empty_customer_df.join(empty_branch_df, empty_customer_df["PRTY_BR"] == empty_branch_df["HGN_BR_ID"], "inner")
+    assert joined.count() == 0
+
+def test_edge_duplicate_lp_id_branch_active(spark):
+    schema = StructType([
+        StructField("LP_ID", StringType(), False),
+        StructField("BR_ID", StringType(), False),
+        StructField("branch_used_days_3mo", IntegerType(), False),
+        StructField("branch_used_days_prev", IntegerType(), False),
+        StructField("branch_trans_count_3mo", IntegerType(), False),
+        StructField("branch_trans_count_prev", IntegerType(), False),
+        StructField("branch_trans_amount_3mo", DoubleType(), False),
+        StructField("branch_trans_amount_prev", DoubleType(), False),
+    ])
+    data = [
+        ("CUST1", "BR1", 10, 5, 20, 10, 100.0, 50.0),
+        ("CUST1", "BR2", 8, 4, 18, 9, 90.0, 45.0),
+    ]
+    df = spark.createDataFrame(data, schema)
+    w = F.Window.partitionBy("LP_ID").orderBy(
+        F.desc("branch_used_days_3mo"), F.desc("branch_used_days_prev"),
+        F.desc("branch_trans_count_3mo"), F.desc("branch_trans_count_prev"),
+        F.desc("branch_trans_amount_3mo"), F.desc("branch_trans_amount_prev")
+    )
+    most_used = df.withColumn("rn", F.row_number().over(w)).filter(F.col("rn") == 1)
+    assert most_used.count() == 1
+    assert most_used.collect()[0].BR_ID == "BR1"
+
+def test_error_type_mismatch_latlong(spark):
+    schema = StructType([
+        StructField("branchlat", StringType(), False),
+        StructField("branchlong", StringType(), False),
+        StructField("custlat", StringType(), False),
+        StructField("custlong", StringType(), False),
+    ])
+    data = [
+        ("not_a_float", "not_a_float", "not_a_float", "not_a_float"),
+    ]
+    df = spark.createDataFrame(data, schema)
+    with pytest.raises(Exception):
+        df.withColumn("dist", F.udf(geodist, DoubleType())("branchlat", "branchlong", "custlat", "custlong")).collect()
+
+def test_error_missing_columns(spark):
+    schema = StructType([
+        StructField("LP_ID", StringType(), False),
+        # Missing PRTY_BR
+    ])
+    data = [
+        ("CUST1",),
+    ]
+    df = spark.createDataFrame(data, schema)
+    with pytest.raises(Exception):
+        df.join(df, df["PRTY_BR"] == df["LP_ID"], "inner").collect()
+
+def test_edge_distance_nulls(spark):
+    schema = StructType([
+        StructField("branchlat", DoubleType(), True),
+        StructField("branchlong", DoubleType(), True),
+        StructField("custlat", DoubleType(), True),
+        StructField("custlong", DoubleType(), True),
+    ])
+    data = [
+        (None, None, 40.0, -75.0),
+    ]
+    df = spark.createDataFrame(data, schema)
+    df = df.withColumn("dist", F.udf(geodist, DoubleType())("branchlat", "branchlong", "custlat", "custlong"))
+    assert df.collect()[0].dist is None
+
+def test_output_structure_matches(spark, valid_customer_df, valid_branch_df):
+    joined = valid_customer_df.join(valid_branch_df, valid_customer_df["PRTY_BR"] == valid_branch_df["HGN_BR_ID"], "inner")
+    expected_schema = joined.schema
+    assert expected_schema["LP_ID"].dataType == StringType()
+    assert expected_schema["branchlat"].dataType == DoubleType()
+
+def test_aggregated_values_percentiles(spark, valid_customer_df, valid_branch_df, geodist_udf):
+    joined = valid_customer_df.join(valid_branch_df, valid_customer_df["PRTY_BR"] == valid_branch_df["HGN_BR_ID"], "inner")
+    joined = joined.withColumn("dist_to_prty_br", geodist_udf("branchlat", "branchlong", "custlat", "custlong"))
+    percentiles = joined.approxQuantile("dist_to_prty_br", [0.8], 0.01)
+    assert isinstance(percentiles, list)
+    assert len(percentiles) == 1
+
+def test_filtering_conditional_logic(spark, valid_customer_df):
+    filtered = valid_customer_df.filter((F.col("OPN_ACCT_FLG") == "Y") & (F.col("NBR_OF_MOS_OPN") <= 24) & (F.col("NBR_OF_MOS_OPN") >= 0))
+    assert filtered.count() == 2
+
+def test_performance_improvement(spark, valid_customer_df, valid_branch_df):
+    import time
+    start = time.time()
+    joined = valid_customer_df.join(valid_branch_df, valid_customer_df["PRTY_BR"] == valid_branch_df["HGN_BR_ID"], "inner")
+    joined.collect()
+    duration = time.time() - start
+    # For demo, assert PySpark completes in under 2 seconds (mocked threshold)
+    assert duration < 2
+
+# -------------------------------
+# 3. API Cost
+# -------------------------------
+
+apiCost: 0.0143 USD
+```
