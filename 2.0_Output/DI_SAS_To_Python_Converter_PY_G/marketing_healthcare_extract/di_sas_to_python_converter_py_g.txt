@@ -1,65 +1,44 @@
-/***********************************************************************
-* Program Name : marketing_healthcare_extract.py
-* Description  : 
-*   This Python script connects securely to Teradata using SQLAlchemy, extracts healthcare 
-*   plan and provider network data, applies marketing eligibility logic, enriches data with 
-*   business rules, filters eligible members, and exports the final dataset for marketing campaign use.
-*   Includes API cost calculation as described.
-************************************************************************/
-
 import pandas as pd
+import teradatasql
 from sqlalchemy import create_engine
-from sqlalchemy.engine.url import URL
+import os
 
-def get_teradata_engine():
+def get_teradata_connection(user, password, host, database=None):
     """
-    Establishes a secure connection to Teradata using SQLAlchemy.
-    Replace placeholders with actual credentials and connection details.
+    Establish a secure connection to Teradata using SQLAlchemy and teradatasql.
+    Args:
+        user (str): Teradata username.
+        password (str): Teradata password.
+        host (str): Teradata server hostname or IP.
+        database (str, optional): Default database/schema.
+    Returns:
+        sqlalchemy.engine.base.Engine: SQLAlchemy engine object.
     """
-    teradata_url = URL.create(
-        drivername='teradata',
-        username='YOUR_USERNAME',      # Replace with your Teradata username
-        password='YOUR_PASSWORD',      # Replace with your Teradata password
-        host='your_server_name',       # Replace with your Teradata server name
-        database='your_database',      # Replace with your Teradata database
-        query={'tdpid': 'your_tdpid'}  # Replace with your Teradata TDPID
-    )
-    engine = create_engine(teradata_url)
+    url = f"teradatasql://{user}:{password}@{host}/"
+    if database:
+        url += f"?database={database}"
+    engine = create_engine(url)
     return engine
 
 def extract_healthcare_data(engine):
     """
-    Extracts healthcare plan and provider network data, applies business rules,
-    and enriches with marketing eligibility logic.
-    Returns a pandas DataFrame.
+    Extract and join healthcare plan and provider network data from Teradata.
+    Returns:
+        pd.DataFrame: Joined and raw data.
     """
     query = """
         SELECT 
             hp.member_id,
-            TRIM(hp.member_first_name) || ' ' || TRIM(hp.member_last_name) AS member_full_name,
+            TRIM(hp.member_first_name) AS member_first_name,
+            TRIM(hp.member_last_name) AS member_last_name,
             hp.member_age,
-            CASE 
-                WHEN hp.member_age BETWEEN 25 AND 35 THEN 'YOUNG_ADULT'
-                WHEN hp.member_age BETWEEN 36 AND 50 THEN 'MID_AGE'
-                WHEN hp.member_age > 50 THEN 'SENIOR'
-                ELSE 'UNKNOWN'
-            END AS age_group,
             hp.plan_id,
             hp.plan_type,
             hp.region,
-            pn.network_type,
-            UPPER(hp.plan_type) || '-' || hp.region AS marketing_segment,
-            CASE 
-                WHEN hp.plan_status = 'ACTIVE' 
-                     AND hp.member_age BETWEEN 25 AND 60 
-                     AND hp.plan_type IN ('PPO', 'HMO') 
-                     AND hp.region IN ('WEST', 'SOUTH')
-                     AND pn.network_type = 'IN_NETWORK'
-                THEN 1
-                ELSE 0
-            END AS is_campaign_eligible
-        FROM healthcare_plans hp
-        LEFT JOIN provider_network pn
+            hp.plan_status,
+            pn.network_type
+        FROM tdata.healthcare_plans hp
+        LEFT JOIN tdata.provider_network pn
             ON hp.plan_id = pn.plan_id
         WHERE hp.plan_status = 'ACTIVE'
           AND hp.member_age IS NOT NULL
@@ -67,51 +46,103 @@ def extract_healthcare_data(engine):
     df = pd.read_sql(query, engine)
     return df
 
+def assign_age_group(age):
+    """
+    Assign age group based on member_age.
+    """
+    if pd.isnull(age):
+        return 'UNKNOWN'
+    if 25 <= age <= 35:
+        return 'YOUNG_ADULT'
+    elif 36 <= age <= 50:
+        return 'MID_AGE'
+    elif age > 50:
+        return 'SENIOR'
+    else:
+        return 'UNKNOWN'
+
+def build_marketing_segment(plan_type, region):
+    """
+    Build marketing segment string.
+    """
+    if pd.isnull(plan_type) or pd.isnull(region):
+        return None
+    return f"{str(plan_type).upper()}-{region}"
+
+def is_campaign_eligible(row):
+    """
+    Apply campaign eligibility logic.
+    """
+    return int(
+        row['plan_status'] == 'ACTIVE'
+        and 25 <= row['member_age'] <= 60
+        and row['plan_type'] in ('PPO', 'HMO')
+        and row['region'] in ('WEST', 'SOUTH')
+        and row['network_type'] == 'IN_NETWORK'
+    )
+
+def enrich_data(df):
+    """
+    Create enriched dataframe with business rules and derived columns.
+    Args:
+        df (pd.DataFrame): Raw dataframe.
+    Returns:
+        pd.DataFrame: Enriched dataframe.
+    """
+    df['member_full_name'] = df['member_first_name'].str.strip() + ' ' + df['member_last_name'].str.strip()
+    df['age_group'] = df['member_age'].apply(assign_age_group)
+    df['marketing_segment'] = df.apply(lambda x: build_marketing_segment(x['plan_type'], x['region']), axis=1)
+    df['is_campaign_eligible'] = df.apply(is_campaign_eligible, axis=1)
+    return df
+
 def filter_eligible_members(df):
     """
-    Filters the DataFrame to include only eligible members for the campaign.
-    """
-    eligible_df = df[df['is_campaign_eligible'] == 1].copy()
-    return eligible_df
-
-def export_to_csv(df, outpath):
-    """
-    Exports the final DataFrame to a CSV file.
-    """
-    df.to_csv(outpath, index=False)
-
-def calculate_api_cost(num_records, cost_per_record=0.02):
-    """
-    Calculates API cost for the campaign as described.
+    Filter dataframe to only eligible members.
     Args:
-        num_records (int): Number of eligible records.
-        cost_per_record (float): Cost per API call/record.
+        df (pd.DataFrame): Enriched dataframe.
     Returns:
-        float: Total API cost.
+        pd.DataFrame: Filtered dataframe.
     """
-    return num_records * cost_per_record
+    return df[df['is_campaign_eligible'] == 1].copy()
+
+def export_to_csv(df, output_path):
+    """
+    Export dataframe to CSV.
+    Args:
+        df (pd.DataFrame): Data to export.
+        output_path (str): Path to output CSV file.
+    """
+    df.to_csv(output_path, index=False)
 
 def main():
     """
-    Main workflow for extracting, processing, and exporting healthcare marketing data.
+    Main function to orchestrate the ETL process.
     """
-    # Step 1: Secure Teradata connection
-    engine = get_teradata_engine()
+    # --- User configuration ---
+    TERADATA_USER = os.getenv('TERADATA_USER')
+    TERADATA_PASSWORD = os.getenv('TERADATA_PASSWORD')
+    TERADATA_HOST = os.getenv('TERADATA_HOST')
+    OUTPUT_PATH = '/folders/myfolders/final_marketing_campaign_extract_2025.csv'
+    # --------------------------
 
-    # Step 2: Data extraction and enrichment
-    df = extract_healthcare_data(engine)
+    # Connect to Teradata
+    engine = get_teradata_connection(
+        user=TERADATA_USER,
+        password=TERADATA_PASSWORD,
+        host=TERADATA_HOST
+    )
 
-    # Step 3: Filter eligible members
-    eligible_df = filter_eligible_members(df)
+    # Extract data
+    raw_df = extract_healthcare_data(engine)
 
-    # Step 4: Export final dataset to CSV
-    outpath = '/folders/myfolders/final_marketing_campaign_extract_2025.csv'
-    export_to_csv(eligible_df, outpath)
+    # Enrich data with business rules
+    enriched_df = enrich_data(raw_df)
 
-    # Step 5: API cost calculation
-    num_records = len(eligible_df)
-    total_cost = calculate_api_cost(num_records)
-    print(f"API Cost Calculation: {num_records} records x $0.02 = ${total_cost:.2f}")
+    # Filter only eligible members
+    final_df = filter_eligible_members(enriched_df)
+
+    # Export to CSV
+    export_to_csv(final_df, OUTPUT_PATH)
 
 if __name__ == '__main__':
     main()
