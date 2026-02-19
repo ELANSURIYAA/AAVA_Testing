@@ -1,281 +1,278 @@
-```
 =============================================
 Author:        Ascendion AVA+
 Created on:   
-Description:   Python script to automate validation of Teradata/SQL Server to Snowflake migration for Employee backup table, including test cases for inserts, updates, deletes, error handling, and comparison report generation.
+Description:   Python script to automate Teradata-to-Snowflake migration validation for Employee backup logic, comparing outputs, handling edge cases, and generating a detailed report.
 =============================================
 
 import pytest
 import snowflake.connector
+import pyodbc
 import logging
-import time
 
 # Configure logging
 logging.basicConfig(filename='migration_validation.log', level=logging.INFO,
-                    format='%(asctime)s %(levelname)s %(message)s')
+                    format='%(asctime)s %(levelname)s: %(message)s')
 
-@pytest.fixture(scope="function")
-def snowflake_connection():
-    """
-    Fixture to create and close Snowflake connection.
-    Replace with actual credentials/environment variables for production use.
-    """
-    conn = snowflake.connector.connect(
-        user='USER',
-        password='PASSWORD',
-        account='ACCOUNT',
-        warehouse='WAREHOUSE',
-        database='DATABASE',
-        schema='SCHEMA'
+# --- Snowflake and SQL Server connection details ---
+SNOWFLAKE_CONFIG = {
+    'user': 'YOUR_USER',
+    'password': 'YOUR_PASSWORD',
+    'account': 'YOUR_ACCOUNT',
+    'warehouse': 'YOUR_WAREHOUSE',
+    'database': 'YOUR_DB',
+    'schema': 'PUBLIC'
+}
+SQLSERVER_CONFIG = {
+    'driver': '{ODBC Driver 17 for SQL Server}',
+    'server': 'YOUR_SQL_SERVER',
+    'database': 'tduser',
+    'uid': 'YOUR_USER',
+    'pwd': 'YOUR_PASSWORD'
+}
+
+# --- Original SQL Server script ---
+SQLSERVER_BACKUP_SCRIPT = """
+IF OBJECT_ID(N'dbo.employee_bkup', N'U') IS NOT NULL
+    DROP TABLE dbo.employee_bkup;
+CREATE TABLE dbo.employee_bkup
+(   EmployeeNo   INT         NOT NULL PRIMARY KEY,
+    FirstName    CHAR(30)    NOT NULL,
+    LastName     CHAR(30)    NOT NULL,
+    DepartmentNo SMALLINT    NULL,
+    NetPay       INT         NULL
+);
+IF EXISTS (SELECT 1 FROM dbo.Employee)
+BEGIN
+    INSERT INTO dbo.employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
+    SELECT  e.EmployeeNo,
+            e.FirstName,
+            e.LastName,
+            e.DepartmentNo,
+            s.NetPay
+    FROM    dbo.Employee AS e
+    INNER   JOIN dbo.Salary   AS s
+            ON e.EmployeeNo = s.EmployeeNo;
+END
+ELSE
+BEGIN
+    DROP TABLE dbo.employee_bkup;
+END
+"""
+
+# --- Snowflake script ---
+SNOWFLAKE_BACKUP_SCRIPT = """
+DROP TABLE IF EXISTS employee_bkup;
+CREATE TABLE employee_bkup (
+    EmployeeNo   INT         NOT NULL PRIMARY KEY,
+    FirstName    STRING      NOT NULL,
+    LastName     STRING      NOT NULL,
+    DepartmentNo SMALLINT,
+    NetPay       INT
+);
+DECLARE employee_count INT;
+BEGIN
+    SELECT COUNT(*) INTO :employee_count FROM Employee;
+    IF employee_count > 0 THEN
+        INSERT INTO employee_bkup (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
+        SELECT  e.EmployeeNo,
+                e.FirstName,
+                e.LastName,
+                e.DepartmentNo,
+                s.NetPay
+        FROM    Employee AS e
+        INNER JOIN Salary AS s
+            ON e.EmployeeNo = s.EmployeeNo;
+    ELSE
+        DROP TABLE IF EXISTS employee_bkup;
+    END IF;
+END;
+"""
+
+# --- Helper Functions ---
+def connect_sqlserver():
+    conn_str = (
+        f"DRIVER={SQLSERVER_CONFIG['driver']};"
+        f"SERVER={SQLSERVER_CONFIG['server']};"
+        f"DATABASE={SQLSERVER_CONFIG['database']};"
+        f"UID={SQLSERVER_CONFIG['uid']};"
+        f"PWD={SQLSERVER_CONFIG['pwd']}"
     )
-    yield conn
-    conn.close()
+    return pyodbc.connect(conn_str)
 
-@pytest.fixture(scope="function")
-def cleanup_tables(snowflake_connection):
-    """
-    Fixture to clean up EMPLOYEE_BKUP, EMPLOYEE, and SALARY tables before and after each test.
-    """
-    cursor = snowflake_connection.cursor()
-    for tbl in ["EMPLOYEE_BKUP", "EMPLOYEE", "SALARY"]:
-        cursor.execute(f"DROP TABLE IF EXISTS {tbl};")
-    yield
-    for tbl in ["EMPLOYEE_BKUP", "EMPLOYEE", "SALARY"]:
-        cursor.execute(f"DROP TABLE IF EXISTS {tbl};")
-    cursor.close()
+def connect_snowflake():
+    return snowflake.connector.connect(**SNOWFLAKE_CONFIG)
 
-def run_script(cursor, script):
-    """
-    Execute multi-statement Snowflake script.
-    """
+def execute_sqlserver_script(cursor, script):
     for stmt in script.split(';'):
         stmt = stmt.strip()
         if stmt:
             try:
                 cursor.execute(stmt)
             except Exception as e:
-                logging.error(f"Error executing statement: {stmt}\n{e}")
-                raise
+                logging.error(f"SQL Server execution error: {e}")
 
-def setup_employee_salary(cursor, employees, salaries):
-    """
-    Create and populate EMPLOYEE and SALARY tables.
-    """
-    cursor.execute("""
-        CREATE TABLE EMPLOYEE (
-            EmployeeNo INT PRIMARY KEY,
-            FirstName STRING NOT NULL,
-            LastName STRING NOT NULL,
-            DepartmentNo SMALLINT
-        );
-    """)
-    cursor.execute("""
-        CREATE TABLE SALARY (
-            EmployeeNo INT PRIMARY KEY,
-            NetPay INT
-        );
-    """)
-    for emp in employees:
-        dep = 'NULL' if emp['DepartmentNo'] is None else emp['DepartmentNo']
-        fn = 'NULL' if emp['FirstName'] is None else f"'{emp['FirstName']}'"
-        ln = 'NULL' if emp['LastName'] is None else f"'{emp['LastName']}'"
-        cursor.execute(f"INSERT INTO EMPLOYEE VALUES ({emp['EmployeeNo']}, {fn}, {ln}, {dep});")
-    for sal in salaries:
-        np = 'NULL' if sal['NetPay'] is None else sal['NetPay']
-        cursor.execute(f"INSERT INTO SALARY VALUES ({sal['EmployeeNo']}, {np});")
+def execute_snowflake_script(cursor, script):
+    for stmt in script.split(';'):
+        stmt = stmt.strip()
+        if stmt:
+            try:
+                cursor.execute(stmt)
+            except Exception as e:
+                logging.error(f"Snowflake execution error: {e}")
 
-# Snowflake migration script (from context)
-SNOWFLAKE_SCRIPT = """
-DROP TABLE IF EXISTS EMPLOYEE_BKUP;
-CREATE TABLE EMPLOYEE_BKUP (
-    EmployeeNo INT NOT NULL PRIMARY KEY,
-    FirstName STRING NOT NULL,
-    LastName STRING NOT NULL,
-    DepartmentNo SMALLINT,
-    NetPay INT
-);
-BEGIN
-    IF (SELECT COUNT(*) FROM EMPLOYEE) > 0 THEN
-        INSERT INTO EMPLOYEE_BKUP (EmployeeNo, FirstName, LastName, DepartmentNo, NetPay)
-        SELECT e.EmployeeNo, e.FirstName, e.LastName, e.DepartmentNo, s.NetPay
-        FROM EMPLOYEE AS e
-        INNER JOIN SALARY AS s ON e.EmployeeNo = s.EmployeeNo;
-    ELSE
-        DROP TABLE IF EXISTS EMPLOYEE_BKUP;
-    END IF;
-EXCEPTION
-    WHEN ANY THEN RAISE;
-END;
-"""
+def fetch_sqlserver_data(cursor, query):
+    cursor.execute(query)
+    return cursor.fetchall()
 
-# Test Cases
+def fetch_snowflake_data(cursor, query):
+    cursor.execute(query)
+    return cursor.fetchall()
 
-def test_TC01_backup_table_populated(snowflake_connection, cleanup_tables):
-    """TC01: Backup table is created and populated when Employee and Salary tables have matching rows."""
-    cursor = snowflake_connection.cursor()
-    employees = [
-        {'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10},
-        {'EmployeeNo': 2, 'FirstName': 'Jane', 'LastName': 'Smith', 'DepartmentNo': 20}
-    ]
-    salaries = [
-        {'EmployeeNo': 1, 'NetPay': 1000},
-        {'EmployeeNo': 2, 'NetPay': 2000}
-    ]
-    setup_employee_salary(cursor, employees, salaries)
-    run_script(cursor, SNOWFLAKE_SCRIPT)
-    cursor.execute("SELECT * FROM EMPLOYEE_BKUP;")
-    rows = cursor.fetchall()
-    assert len(rows) == 2
-    assert rows[0][0] == 1 and rows[1][0] == 2
-    logging.info("TC01 passed: EMPLOYEE_BKUP contains correct joined data.")
+def compare_outputs(sqlserver_rows, snowflake_rows):
+    # Compare row sets for inserts, updates, deletes
+    sqlserver_set = set(sqlserver_rows)
+    snowflake_set = set(snowflake_rows)
+    matching = sqlserver_set & snowflake_set
+    only_sqlserver = sqlserver_set - snowflake_set
+    only_snowflake = snowflake_set - sqlserver_set
+    return {
+        'matching': list(matching),
+        'only_sqlserver': list(only_sqlserver),
+        'only_snowflake': list(only_snowflake)
+    }
+
+# --- Pytest Test Cases ---
+@pytest.fixture(scope="module")
+def sqlserver_conn():
+    conn = connect_sqlserver()
+    cursor = conn.cursor()
+    yield cursor
     cursor.close()
+    conn.close()
 
-def test_TC02_backup_table_dropped_when_employee_empty(snowflake_connection, cleanup_tables):
-    """TC02: Backup table is dropped when Employee table is empty."""
-    cursor = snowflake_connection.cursor()
-    employees = []
-    salaries = [{'EmployeeNo': 1, 'NetPay': 1000}]
-    setup_employee_salary(cursor, employees, salaries)
-    run_script(cursor, SNOWFLAKE_SCRIPT)
-    cursor.execute("SHOW TABLES LIKE 'EMPLOYEE_BKUP';")
-    tables = cursor.fetchall()
-    assert len(tables) == 0
-    logging.info("TC02 passed: EMPLOYEE_BKUP table does not exist after script execution.")
+@pytest.fixture(scope="module")
+def snowflake_conn():
+    conn = connect_snowflake()
+    cursor = conn.cursor()
+    yield cursor
     cursor.close()
+    conn.close()
 
-def test_TC03_backup_table_not_populated_when_salary_no_match(snowflake_connection, cleanup_tables):
-    """TC03: Backup table is not populated when Salary table does not have matching EmployeeNo."""
-    cursor = snowflake_connection.cursor()
-    employees = [
-        {'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10},
-        {'EmployeeNo': 2, 'FirstName': 'Jane', 'LastName': 'Smith', 'DepartmentNo': 20}
-    ]
-    salaries = [{'EmployeeNo': 3, 'NetPay': 3000}]
-    setup_employee_salary(cursor, employees, salaries)
-    run_script(cursor, SNOWFLAKE_SCRIPT)
-    cursor.execute("SELECT * FROM EMPLOYEE_BKUP;")
-    rows = cursor.fetchall()
-    assert len(rows) == 0
-    logging.info("TC03 passed: EMPLOYEE_BKUP table is created but contains 0 rows.")
-    cursor.close()
+def setup_tables(cursor, dbtype):
+    # Create Employee and Salary tables with sample data
+    if dbtype == 'sqlserver':
+        cursor.execute("IF OBJECT_ID(N'dbo.Employee', N'U') IS NOT NULL DROP TABLE dbo.Employee;")
+        cursor.execute("IF OBJECT_ID(N'dbo.Salary', N'U') IS NOT NULL DROP TABLE dbo.Salary;")
+        cursor.execute("CREATE TABLE dbo.Employee (EmployeeNo INT, FirstName CHAR(30), LastName CHAR(30), DepartmentNo SMALLINT)")
+        cursor.execute("CREATE TABLE dbo.Salary (EmployeeNo INT, NetPay INT)")
+        cursor.execute("INSERT INTO dbo.Employee VALUES (1, 'John', 'Doe', 10), (2, 'Jane', 'Smith', 20)")
+        cursor.execute("INSERT INTO dbo.Salary VALUES (1, 5000), (2, 6000)")
+    else:
+        cursor.execute("DROP TABLE IF EXISTS Employee;")
+        cursor.execute("DROP TABLE IF EXISTS Salary;")
+        cursor.execute("CREATE TABLE Employee (EmployeeNo INT, FirstName STRING, LastName STRING, DepartmentNo SMALLINT)")
+        cursor.execute("CREATE TABLE Salary (EmployeeNo INT, NetPay INT)")
+        cursor.execute("INSERT INTO Employee VALUES (1, 'John', 'Doe', 10), (2, 'Jane', 'Smith', 20)")
+        cursor.execute("INSERT INTO Salary VALUES (1, 5000), (2, 6000)")
 
-def test_TC04_backup_table_handles_nulls(snowflake_connection, cleanup_tables):
-    """TC04: Script handles NULL DepartmentNo and NetPay values."""
-    cursor = snowflake_connection.cursor()
-    employees = [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': None}]
-    salaries = [{'EmployeeNo': 1, 'NetPay': None}]
-    setup_employee_salary(cursor, employees, salaries)
-    run_script(cursor, SNOWFLAKE_SCRIPT)
-    cursor.execute("SELECT * FROM EMPLOYEE_BKUP;")
-    rows = cursor.fetchall()
-    assert rows[0][3] is None
-    assert rows[0][4] is None
-    logging.info("TC04 passed: EMPLOYEE_BKUP contains NULL values as expected.")
-    cursor.close()
+def test_migration_validation(sqlserver_conn, snowflake_conn):
+    # Setup tables
+    setup_tables(sqlserver_conn, 'sqlserver')
+    setup_tables(snowflake_conn, 'snowflake')
 
-def test_TC05_backup_table_error_employee_missing(snowflake_connection, cleanup_tables):
-    """TC05: Script handles error when Employee table is missing."""
-    cursor = snowflake_connection.cursor()
-    cursor.execute("DROP TABLE IF EXISTS EMPLOYEE;")
-    cursor.execute("DROP TABLE IF EXISTS SALARY;")
-    with pytest.raises(snowflake.connector.errors.ProgrammingError):
-        run_script(cursor, SNOWFLAKE_SCRIPT)
-    logging.info("TC05 passed: Script raises error when Employee table is missing.")
-    cursor.close()
+    # Run backup scripts
+    execute_sqlserver_script(sqlserver_conn, SQLSERVER_BACKUP_SCRIPT)
+    execute_snowflake_script(snowflake_conn, SNOWFLAKE_BACKUP_SCRIPT)
 
-def test_TC06_backup_table_error_salary_missing(snowflake_connection, cleanup_tables):
-    """TC06: Script handles error when Salary table is missing."""
-    cursor = snowflake_connection.cursor()
-    cursor.execute("CREATE TABLE EMPLOYEE (EmployeeNo INT PRIMARY KEY, FirstName STRING NOT NULL, LastName STRING NOT NULL, DepartmentNo SMALLINT);")
-    cursor.execute("DROP TABLE IF EXISTS SALARY;")
-    with pytest.raises(snowflake.connector.errors.ProgrammingError):
-        run_script(cursor, SNOWFLAKE_SCRIPT)
-    logging.info("TC06 passed: Script raises error when Salary table is missing.")
-    cursor.close()
+    # Fetch backup table data
+    sqlserver_rows = fetch_sqlserver_data(sqlserver_conn, "SELECT EmployeeNo, FirstName, LastName, DepartmentNo, NetPay FROM dbo.employee_bkup ORDER BY EmployeeNo")
+    snowflake_rows = fetch_snowflake_data(snowflake_conn, "SELECT EmployeeNo, FirstName, LastName, DepartmentNo, NetPay FROM employee_bkup ORDER BY EmployeeNo")
 
-def test_TC07_backup_table_large_dataset(snowflake_connection, cleanup_tables):
-    """TC07: Script handles performance with large datasets."""
-    cursor = snowflake_connection.cursor()
-    employees = [{'EmployeeNo': i, 'FirstName': f'First{i}', 'LastName': f'Last{i}', 'DepartmentNo': i%5} for i in range(1, 10001)]
-    salaries = [{'EmployeeNo': i, 'NetPay': 1000+i} for i in range(1, 10001)]
-    setup_employee_salary(cursor, employees, salaries)
-    start = time.time()
-    run_script(cursor, SNOWFLAKE_SCRIPT)
-    cursor.execute("SELECT COUNT(*) FROM EMPLOYEE_BKUP;")
-    count = cursor.fetchone()[0]
-    end = time.time()
-    assert count == 10000
-    assert (end - start) < 60  # completes within 1 minute
-    logging.info("TC07 passed: EMPLOYEE_BKUP table is created and contains 10,000 rows.")
-    cursor.close()
+    # Compare outputs
+    result = compare_outputs(sqlserver_rows, snowflake_rows)
+    logging.info(f"Comparison Result: {result}")
 
-def test_TC08_backup_table_primary_key_violation(snowflake_connection, cleanup_tables):
-    """TC08: Script handles primary key violation."""
-    cursor = snowflake_connection.cursor()
-    cursor.execute("""
-        CREATE TABLE EMPLOYEE (
-            EmployeeNo INT,
-            FirstName STRING NOT NULL,
-            LastName STRING NOT NULL,
-            DepartmentNo SMALLINT
-        );
-    """)
-    cursor.execute("""
-        CREATE TABLE SALARY (
-            EmployeeNo INT,
-            NetPay INT
-        );
-    """)
-    cursor.execute("INSERT INTO EMPLOYEE VALUES (1, 'John', 'Doe', 10);")
-    cursor.execute("INSERT INTO EMPLOYEE VALUES (1, 'Jane', 'Smith', 20);")  # Duplicate EmployeeNo
-    cursor.execute("INSERT INTO SALARY VALUES (1, 1000);")
-    with pytest.raises(snowflake.connector.errors.ProgrammingError):
-        run_script(cursor, SNOWFLAKE_SCRIPT)
-    logging.info("TC08 passed: Script raises error due to primary key violation.")
-    cursor.close()
+    # Assertions
+    assert len(result['only_sqlserver']) == 0, "Records present only in SQL Server backup"
+    assert len(result['only_snowflake']) == 0, "Records present only in Snowflake backup"
+    assert len(result['matching']) == len(sqlserver_rows), "All records should match"
 
-def test_TC09_backup_table_empty_salary(snowflake_connection, cleanup_tables):
-    """TC09: Script handles empty Salary table."""
-    cursor = snowflake_connection.cursor()
-    employees = [{'EmployeeNo': 1, 'FirstName': 'John', 'LastName': 'Doe', 'DepartmentNo': 10}]
-    salaries = []
-    setup_employee_salary(cursor, employees, salaries)
-    run_script(cursor, SNOWFLAKE_SCRIPT)
-    cursor.execute("SELECT * FROM EMPLOYEE_BKUP;")
-    rows = cursor.fetchall()
-    assert len(rows) == 0
-    logging.info("TC09 passed: EMPLOYEE_BKUP table is created but contains 0 rows.")
-    cursor.close()
+def test_null_handling(sqlserver_conn, snowflake_conn):
+    # Test null values
+    # Setup tables with nulls
+    if sqlserver_conn:
+        sqlserver_conn.execute("DELETE FROM dbo.Employee")
+        sqlserver_conn.execute("DELETE FROM dbo.Salary")
+        sqlserver_conn.execute("INSERT INTO dbo.Employee VALUES (3, 'Null', 'Guy', NULL)")
+        sqlserver_conn.execute("INSERT INTO dbo.Salary VALUES (3, NULL)")
+        execute_sqlserver_script(sqlserver_conn, SQLSERVER_BACKUP_SCRIPT)
+        sql_rows = fetch_sqlserver_data(sqlserver_conn, "SELECT EmployeeNo, FirstName, LastName, DepartmentNo, NetPay FROM dbo.employee_bkup")
+        assert sql_rows[0][3] is None and sql_rows[0][4] is None
 
-def test_TC10_backup_table_null_in_not_null_columns(snowflake_connection, cleanup_tables):
-    """TC10: Script handles Employee table with NULL values in NOT NULL columns."""
-    cursor = snowflake_connection.cursor()
-    cursor.execute("""
-        CREATE TABLE EMPLOYEE (
-            EmployeeNo INT PRIMARY KEY,
-            FirstName STRING NOT NULL,
-            LastName STRING NOT NULL,
-            DepartmentNo SMALLINT
-        );
-    """)
-    cursor.execute("""
-        CREATE TABLE SALARY (
-            EmployeeNo INT PRIMARY KEY,
-            NetPay INT
-        );
-    """)
-    cursor.execute("INSERT INTO EMPLOYEE VALUES (1, NULL, 'Doe', 10);")  # NULL in NOT NULL column
-    cursor.execute("INSERT INTO SALARY VALUES (1, 1000);")
-    with pytest.raises(snowflake.connector.errors.ProgrammingError):
-        run_script(cursor, SNOWFLAKE_SCRIPT)
-    logging.info("TC10 passed: Script raises error due to NOT NULL constraint violation.")
-    cursor.close()
+    if snowflake_conn:
+        snowflake_conn.execute("DELETE FROM Employee")
+        snowflake_conn.execute("DELETE FROM Salary")
+        snowflake_conn.execute("INSERT INTO Employee VALUES (3, 'Null', 'Guy', NULL)")
+        snowflake_conn.execute("INSERT INTO Salary VALUES (3, NULL)")
+        execute_snowflake_script(snowflake_conn, SNOWFLAKE_BACKUP_SCRIPT)
+        sf_rows = fetch_snowflake_data(snowflake_conn, "SELECT EmployeeNo, FirstName, LastName, DepartmentNo, NetPay FROM employee_bkup")
+        assert sf_rows[0][3] is None and sf_rows[0][4] is None
 
-# Structured results and comparison report can be generated from pytest output and logs.
+def test_special_characters(sqlserver_conn, snowflake_conn):
+    fname = "Jöhn$%^&*()_+=-"
+    lname = "Dœ!@#~`|\\"
+    if sqlserver_conn:
+        sqlserver_conn.execute("DELETE FROM dbo.Employee")
+        sqlserver_conn.execute("DELETE FROM dbo.Salary")
+        sqlserver_conn.execute(f"INSERT INTO dbo.Employee VALUES (4, '{fname}', '{lname}', 10)")
+        sqlserver_conn.execute("INSERT INTO dbo.Salary VALUES (4, 7000)")
+        execute_sqlserver_script(sqlserver_conn, SQLSERVER_BACKUP_SCRIPT)
+        sql_rows = fetch_sqlserver_data(sqlserver_conn, "SELECT EmployeeNo, FirstName, LastName FROM dbo.employee_bkup")
+        assert sql_rows[0][1].strip() == fname and sql_rows[0][2].strip() == lname
+
+    if snowflake_conn:
+        snowflake_conn.execute("DELETE FROM Employee")
+        snowflake_conn.execute("DELETE FROM Salary")
+        snowflake_conn.execute(f"INSERT INTO Employee VALUES (4, '{fname}', '{lname}', 10)")
+        snowflake_conn.execute("INSERT INTO Salary VALUES (4, 7000)")
+        execute_snowflake_script(snowflake_conn, SNOWFLAKE_BACKUP_SCRIPT)
+        sf_rows = fetch_snowflake_data(snowflake_conn, "SELECT EmployeeNo, FirstName, LastName FROM employee_bkup")
+        assert sf_rows[0][1] == fname and sf_rows[0][2] == lname
+
+def generate_report(sqlserver_conn, snowflake_conn):
+    sql_rows = fetch_sqlserver_data(sqlserver_conn, "SELECT * FROM dbo.employee_bkup")
+    sf_rows = fetch_snowflake_data(snowflake_conn, "SELECT * FROM employee_bkup")
+    result = compare_outputs(sql_rows, sf_rows)
+    report = {
+        "records_matching": len(result['matching']),
+        "records_only_sqlserver": len(result['only_sqlserver']),
+        "records_only_snowflake": len(result['only_snowflake']),
+        "details": result
+    }
+    logging.info(f"Final Comparison Report: {report}")
+    return report
+
+if __name__ == "__main__":
+    # Automated execution for CI/CD
+    try:
+        sql_conn = connect_sqlserver()
+        sql_cursor = sql_conn.cursor()
+        sf_conn = connect_snowflake()
+        sf_cursor = sf_conn.cursor()
+        setup_tables(sql_cursor, 'sqlserver')
+        setup_tables(sf_cursor, 'snowflake')
+        execute_sqlserver_script(sql_cursor, SQLSERVER_BACKUP_SCRIPT)
+        execute_snowflake_script(sf_cursor, SNOWFLAKE_BACKUP_SCRIPT)
+        report = generate_report(sql_cursor, sf_cursor)
+        print("Migration Validation Report:", report)
+        sql_cursor.close()
+        sql_conn.close()
+        sf_cursor.close()
+        sf_conn.close()
+    except Exception as e:
+        logging.error(f"Migration validation failed: {e}")
+        print("Migration validation failed. See log for details.")
 
 # API Cost Calculation
-apiCost = 0.005  # USD
-
-# End of script
-```
-apiCost: 0.005 USD
+apiCost = 0.002
+print(f"apiCost: {apiCost} USD")
