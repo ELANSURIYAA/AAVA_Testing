@@ -1,6 +1,6 @@
 # AAVA Comparison Results
  
-Generated: 2026-02-20 11:35:33
+Generated: 2026-02-20 11:49:05
  
 ## Workflows Compared
 - AAVA 1.0: DI_Azure_Synapse_To_Fabric_Conversion
