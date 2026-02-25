@@ -1,167 +1,121 @@
-# PySpark Implementation of usp_MergePersonData T-SQL Procedure
-
 ```python
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import current_timestamp, lit, regexp_replace, col
-from datetime import datetime
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import col
+from typing import Optional
+from datetime import date
 
-def merge_person_data(spark, source_system):
+def get_person_data_with_filters(
+    spark: SparkSession,
+    person_id: Optional[str] = None,
+    gender: Optional[int] = None,
+    race: Optional[str] = None,
+    ethnicity: Optional[str] = None,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    include_contact_info: bool = False,
+    include_language: bool = False
+) -> DataFrame:
     """
-    PySpark implementation of the usp_MergePersonData stored procedure.
+    PySpark implementation of the T-SQL GetPersonDataWithFilters procedure.
     
-    This function replicates the functionality of the T-SQL stored procedure by:
-    1. Merging data from a staging table into the Person table
-    2. Updating existing records or inserting new ones based on PersonID
-    3. Logging the operation in a DataProcessingLog table
-    4. Updating related tables (ContactInfo and Language) with new person data
+    This function reads data from the Person table and applies filters based on the
+    provided parameters. It also conditionally includes additional columns based on
+    the include_contact_info and include_language parameters.
     
     Args:
-        spark: SparkSession object
-        source_system: Source system identifier (string)
+        spark: SparkSession instance
+        person_id: Optional filter for PersonID
+        gender: Optional filter for Gender (1 = Male, 0 = Female)
+        race: Optional filter for Race
+        ethnicity: Optional filter for Ethnicity
+        start_date: Optional filter for minimum DOB
+        end_date: Optional filter for maximum DOB
+        include_contact_info: Whether to include contact information columns
+        include_language: Whether to include language columns
         
     Returns:
-        Dictionary with status information
+        DataFrame with filtered Person data and selected columns
+        
+    Examples:
+        >>> spark = SparkSession.builder.appName("PersonDataFilters").getOrCreate()
+        >>> result = get_person_data_with_filters(
+        ...     spark=spark,
+        ...     gender=0,
+        ...     ethnicity="Hispanic",
+        ...     include_contact_info=True
+        ... )
+        >>> result.show()
     """
-    # Current timestamp for logging and updates
-    now = datetime.now()
-    
-    # Read staging data and filter by source system
-    # This is equivalent to the source part of the MERGE statement in T-SQL
-    staging_df = spark.table("Staging_Person").filter(col("SourceSystem") == source_system)
-    
-    # Add/update columns with current values
-    # This replicates the dynamic SQL part where we set SourceSystem and timestamps
-    staging_df = staging_df.withColumn("SourceSystem", lit(source_system)) \
-                          .withColumn("IngestionTimestamp", current_timestamp()) \
-                          .withColumn("LastUpdated", current_timestamp())
-    
-    # Read target table
-    target_df = spark.table("Person")
-    
-    # In PySpark, we'll implement the MERGE operation as a combination of operations:
-    # 1. Identify records to update (matched records)
-    # 2. Identify records to insert (not matched)
-    # 3. Remove the old versions of updated records from target
-    # 4. Union the new/updated records with the remaining target records
-    
-    # Identify records to update (matched records)
-    matched_records = staging_df.join(target_df, "PersonID", "inner")
-    
-    # If we have records to update
-    if matched_records.count() > 0:
-        # Get the list of PersonIDs to update
-        person_ids_to_update = matched_records.select("PersonID")
+    try:
+        # Validate input parameters
+        if gender is not None and gender not in [0, 1]:
+            raise ValueError("Gender must be 0 (Female) or 1 (Male)")
         
-        # Remove the old versions of these records from target
-        target_df = target_df.join(person_ids_to_update, "PersonID", "left_anti")
+        # Define base columns that are always included
+        base_columns = [
+            "PersonID", "DOB", "Gender", "Race", "Ethnicity",
+            "Insurance", "Provider", "SourceSystem", "IngestionTimestamp"
+        ]
         
-        # Select records from staging that need to be updated
-        update_df = staging_df.join(person_ids_to_update, "PersonID", "inner")
+        # Add optional columns based on parameters
+        selected_columns = base_columns.copy()
         
-        # Union the remaining target records with the updated records
-        target_df = target_df.union(update_df)
-    
-    # Identify records to insert (not matched)
-    new_records = staging_df.join(target_df.select("PersonID"), "PersonID", "left_anti")
-    
-    # If we have new records to insert
-    if new_records.count() > 0:
-        # Union the target with the new records
-        target_df = target_df.union(new_records)
-    
-    # Write the updated dataframe back to the target table
-    # This completes the MERGE operation
-    target_df.write.mode("overwrite").saveAsTable("Person")
-    
-    # Log the operation
-    # This replicates the INSERT INTO DataProcessingLog in T-SQL
-    records_processed = staging_df.count()
-    log_data = [(
-        "MergePersonData",
-        "Person",
-        records_processed,
-        now
-    )]
-    log_schema = ["ProcessName", "TableName", "RecordsProcessed", "ProcessTimestamp"]
-    log_df = spark.createDataFrame(log_data, log_schema)
-    log_df.write.mode("append").saveAsTable("DataProcessingLog")
-    
-    # Update ContactInfo table with new person data
-    # This replicates the first INSERT after the MERGE in T-SQL
-    contact_info_df = spark.table("ContactInfo")
-    
-    # Get person records that don't exist in ContactInfo
-    new_contacts = target_df.filter(col("SourceSystem") == source_system) \
-                           .join(contact_info_df.select("PersonID"), "PersonID", "left_anti") \
-                           .select(
-                               col("PersonID"),
-                               col("Address"),
-                               # Clean and convert phone number
-                               regexp_replace(regexp_replace(col("ContactNumber"), "-", ""), " ", "").cast("bigint").alias("Phone"),
-                               col("EmailId").alias("Email")
-                           )
-    
-    # If we have new contacts to insert
-    if new_contacts.count() > 0:
-        # Append new contact records
-        new_contacts.write.mode("append").saveAsTable("ContactInfo")
-    
-    # Update Language table with new person data
-    # This replicates the second INSERT after the MERGE in T-SQL
-    language_df = spark.table("Language")
-    
-    # Get person records that don't exist in Language
-    new_languages = target_df.filter(col("SourceSystem") == source_system) \
-                            .join(language_df.select("PersonID"), "PersonID", "left_anti") \
-                            .select(
-                                col("PersonID"),
-                                col("Spoken"),
-                                col("Written")
-                            )
-    
-    # If we have new languages to insert
-    if new_languages.count() > 0:
-        # Append new language records
-        new_languages.write.mode("append").saveAsTable("Language")
-    
-    # Return status information
-    return {
-        "status": "success",
-        "records_processed": records_processed,
-        "timestamp": now
-    }
+        if include_contact_info:
+            selected_columns.extend(["Address", "ContactNumber", "EmailId"])
+        
+        if include_language:
+            selected_columns.extend(["Spoken", "Written"])
+        
+        # Read data from the Person table
+        person_df = spark.table("`dataswitch-poc.cvs.Person`")
+        
+        # Build filter conditions
+        conditions = []
+        
+        if person_id is not None:
+            conditions.append(col("PersonID") == person_id)
+        
+        if gender is not None:
+            conditions.append(col("Gender") == gender)
+        
+        if race is not None:
+            conditions.append(col("Race") == race)
+        
+        if ethnicity is not None:
+            conditions.append(col("Ethnicity") == ethnicity)
+        
+        # Apply date range filters
+        if start_date is not None and end_date is not None:
+            conditions.append((col("DOB") >= start_date) & (col("DOB") <= end_date))
+        elif start_date is not None:
+            conditions.append(col("DOB") >= start_date)
+        elif end_date is not None:
+            conditions.append(col("DOB") <= end_date)
+        
+        # Apply all filters
+        result_df = person_df
+        for condition in conditions:
+            result_df = result_df.filter(condition)
+        
+        # Select only the required columns
+        result_df = result_df.select(*selected_columns)
+        
+        return result_df
+        
+    except Exception as e:
+        import logging
+        logging.error(f"Error in get_person_data_with_filters: {str(e)}")
+        raise
 ```
 
-## Usage Example
+This PySpark function replicates the functionality of the original T-SQL procedure `GetPersonDataWithFilters`. It:
 
-```python
-# Initialize SparkSession
-spark = SparkSession.builder \
-    .appName("Person Data Processing") \
-    .enableHiveSupport() \
-    .getOrCreate()
+1. Takes the same parameters as the original T-SQL procedure
+2. Reads directly from the `dataswitch-poc.cvs.Person` table
+3. Selects the base columns that are always included
+4. Conditionally includes additional columns based on the `include_contact_info` and `include_language` parameters
+5. Applies filters based on the provided parameters
+6. Includes input validation and error handling
+7. Uses optimized filter application by collecting all conditions and applying them efficiently
 
-# Call the function with a source system
-result = merge_person_data(spark, "EMR_System_A")
-print(f"Process completed: {result['status']}")
-print(f"Records processed: {result['records_processed']}")
-print(f"Timestamp: {result['timestamp']}")
-```
-
-## Implementation Notes
-
-1. **Dynamic SQL Handling**: The T-SQL procedure used dynamic SQL to build a MERGE statement. In PySpark, we've implemented this logic using DataFrame operations (joins, filters, unions) that achieve the same result.
-
-2. **MERGE Operation**: Since PySpark doesn't have a direct equivalent to T-SQL's MERGE statement, we've broken it down into component operations:
-   - Identifying records to update
-   - Identifying records to insert
-   - Removing old versions of updated records
-   - Combining everything into the final dataset
-
-3. **Data Type Handling**: The phone number conversion uses regexp_replace to remove dashes and spaces, then casts to bigint, replicating the T-SQL CAST operation.
-
-4. **Timestamps**: We use PySpark's current_timestamp() function to replicate T-SQL's GETDATE().
-
-5. **Error Handling**: Basic error handling is implemented through the return status. In a production environment, you might want to add more robust exception handling.
-
-This implementation maintains all the functionality of the original T-SQL stored procedure while leveraging PySpark's distributed processing capabilities.
+The function maintains the same functionality as the original T-SQL procedure while leveraging PySpark's distributed computing capabilities. It handles the dynamic SQL aspect of the original procedure by conditionally selecting columns and applying filters based on the provided parameters.
