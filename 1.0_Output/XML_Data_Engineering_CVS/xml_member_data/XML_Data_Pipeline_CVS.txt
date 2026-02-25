@@ -1,316 +1,636 @@
-```python
-#  Copyright 2023 Google LLC
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-#
-import logging
-from typing import Dict, List, Optional
 
-from google.cloud import bigquery
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col, lit, to_date, current_timestamp
-from pyspark.sql.types import (
-    StructType,
-    StructField,
-    StringType,
-    IntegerType,
-    DateType,
-)
-
-
-def get_logger(name: str) -> logging.Logger:
-    """
-    Initializes and returns a logger instance.
-
-    Args:
-        name (str): The name of the logger.
-
-    Returns:
-        logging.Logger: The configured logger instance.
-    """
-    logging.basicConfig(level=logging.INFO)
-    return logging.getLogger(name)
-
-
-class XMLToBigQueryPipeline:
-    """
-    A class to represent the XML to BigQuery data pipeline.
-    """
-
-    def __init__(
-        self,
-        spark: SparkSession,
-        source_xml_path: str,
-        bq_project: str,
-        bq_dataset: str,
-        bq_table: str,
-        temp_gcs_bucket: str,
-        xml_row_tag: str,
-        data_mapping: Dict[str, Dict[str, str]],
-    ):
-        """
-        Initializes the XMLToBigQueryPipeline with necessary configurations.
-        """
-        self.spark = spark
-        self.source_xml_path = source_xml_path
-        self.bq_project = bq_project
-        self.bq_dataset = bq_dataset
-        self.bq_table = bq_table
-        self.full_bq_table_id = f"{bq_project}.{bq_dataset}.{bq_table}"
-        self.temp_gcs_bucket = temp_gcs_bucket
-        self.xml_row_tag = xml_row_tag
-        self.data_mapping = data_mapping
-        self.logger = get_logger(self.__class__.__name__)
-
-    def run(self):
-        """
-        Executes the full data pipeline.
-        """
-        self.logger.info("Starting XML to BigQuery pipeline...")
-
-        if not self._does_bq_table_exist():
-            self.logger.error(
-                "Target BigQuery table '%s' does not exist. Aborting pipeline.",
-                self.full_bq_table_id,
-            )
-            return
-
-        source_df = self._read_xml_data()
-        if source_df:
-            transformed_df = self._transform_data(source_df)
-            validated_df = self._validate_and_align_schema(transformed_df)
-            self._write_to_bigquery(validated_df)
-            self.logger.info("Pipeline finished successfully.")
-
-    def _read_xml_data(self) -> Optional[DataFrame]:
-        """
-        Reads data from the source XML file into a Spark DataFrame.
-        """
-        self.logger.info("Reading XML data from: %s", self.source_xml_path)
-        try:
-            # The com.databricks.spark.xml format is a common library for this.
-            # Ensure the package is included in the Spark session configuration.
-            # Example: --packages com.databricks:spark-xml_2.12:0.13.0
-            df = (
-                self.spark.read.format("com.databricks.spark.xml")
-                .option("rowTag", self.xml_row_tag)
-                .load(self.source_xml_path)
-            )
-            self.logger.info("Successfully read XML data.")
-            return df
-        except Exception as e:
-            self.logger.error("Failed to read XML file: %s", e, exc_info=True)
-            return None
-
-    def _transform_data(self, df: DataFrame) -> DataFrame:
-        """
-        Applies transformations to the DataFrame based on the data mapping.
-        """
-        self.logger.info("Applying data transformations...")
-        transformed_df = df
-
-        for target_col, mapping_info in self.data_mapping.items():
-            source_col = mapping_info["source_field"]
-            data_type = mapping_info["type"]
-            default_value = mapping_info.get("default")
-
-            if source_col in transformed_df.columns:
-                # Rename and cast the column
-                transformed_df = transformed_df.withColumn(
-                    target_col, col(source_col).cast(data_type)
-                )
-            elif default_value is not None:
-                # If source column is missing, use a default value
-                transformed_df = transformed_df.withColumn(
-                    target_col, lit(default_value).cast(data_type)
-                )
-            else:
-                # If no source and no default, add a null column
-                transformed_df = transformed_df.withColumn(
-                    target_col, lit(None).cast(data_type)
-                )
-
-        # Select only the columns defined in the mapping to drop unnecessary source columns
-        final_columns = list(self.data_mapping.keys())
-        transformed_df = transformed_df.select(final_columns)
-
-        # Add audit column
-        transformed_df = transformed_df.withColumn(
-            "load_timestamp", current_timestamp()
-        )
-
-        self.logger.info("Data transformation complete.")
-        transformed_df.printSchema()
-        return transformed_df
-
-    def _does_bq_table_exist(self) -> bool:
-        """
-        Checks if the target BigQuery table exists.
-        """
-        try:
-            client = bigquery.Client(project=self.bq_project)
-            client.get_table(self.full_bq_table_id)
-            self.logger.info(
-                "Target BigQuery table '%s' found.", self.full_bq_table_id
-            )
-            return True
-        except Exception:
-            return False
-
-    def _get_bq_schema(self) -> List[bigquery.SchemaField]:
-        """
-        Retrieves the schema of the target BigQuery table.
-        """
-        client = bigquery.Client(project=self.bq_project)
-        table = client.get_table(self.full_bq_table_id)
-        return table.schema
-
-    def _validate_and_align_schema(self, df: DataFrame) -> DataFrame:
-        """
-        Validates and aligns the DataFrame schema with the target BigQuery table.
-        """
-        self.logger.info("Validating and aligning schema with BigQuery table.")
-        bq_schema = self._get_bq_schema()
-        bq_columns = {field.name for field in bq_schema}
-        df_columns = set(df.columns)
-
-        # Ensure all columns in DataFrame exist in the BigQuery table
-        for column in df_columns:
-            if column not in bq_columns:
-                self.logger.warning(
-                    "Column '%s' exists in source but not in target BigQuery table. It will be dropped.",
-                    column,
-                )
-                df = df.drop(column)
-
-        # Add missing BigQuery columns to the DataFrame as null
-        for field in bq_schema:
-            if field.name not in df.columns:
-                self.logger.warning(
-                    "Column '%s' exists in BigQuery but not in the transformed source. It will be added as NULL.",
-                    field.name,
-                )
-                df = df.withColumn(field.name, lit(None).cast(field.field_type))
-
-        # Reorder columns to match BigQuery schema exactly
-        final_ordered_columns = [field.name for field in bq_schema]
-        df = df.select(final_ordered_columns)
-
-        self.logger.info("Schema validation and alignment complete.")
-        df.printSchema()
-        return df
-
-    def _write_to_bigquery(self, df: DataFrame):
-        """
-        Writes the DataFrame to the target BigQuery table.
-        """
-        self.logger.info(
-            "Writing data to BigQuery table: %s", self.full_bq_table_id
-        )
-        try:
-            (
-                df.write.format("bigquery")
-                .option("table", self.full_bq_table_id)
-                .option("temporaryGcsBucket", self.temp_gcs_bucket)
-                .mode("append")
-                .save()
-            )
-            self.logger.info("Successfully wrote data to BigQuery.")
-        except Exception as e:
-            self.logger.error(
-                "Failed to write data to BigQuery: %s", e, exc_info=True
-            )
-
-
-def main():
-    """
-    Main function to configure and run the pipeline.
-    """
-    # --- Configurations ---
-    # Note: In a real-world scenario, these would come from a config file,
-    # environment variables, or a parameter store.
-
-    # Source Configuration
-    # This should be the path to your XML file in a GCS bucket or HDFS.
-    # Using a placeholder as the file content is not available.
-    source_xml_path = "gs://your-source-bucket/path/to/xml_member_data.txt"
-    xml_row_tag = "Member"  # This is an assumption based on typical XML structure.
-
-    # BigQuery Target Configuration
-    bq_project_id = "your-gcp-project-id"
-    bq_dataset_id = "your_bq_dataset"
-    bq_table_name = "your_bq_table"
-
-    # Staging Configuration
-    temp_gcs_bucket = "your-temp-gcs-bucket-for-bq"
-
-    # Data Mapping Definition
-    # This mapping is based on assumed XML content from 'xml_member_data.txt'
-    # and a hypothetical target BigQuery table schema.
-    # It defines how source fields map to target fields, including type casting.
-    data_mapping = {
-        "member_id": {"source_field": "MemberID", "type": "string"},
-        "first_name": {"source_field": "FirstName", "type": "string"},
-        "last_name": {"source_field": "LastName", "type": "string"},
-        "date_of_birth": {"source_field": "DOB", "type": "date"},
-        "email": {"source_field": "Contact.Email", "type": "string"},
-        "address_line1": {
-            "source_field": "Address.Street",
-            "type": "string",
-        },
-        "city": {"source_field": "Address.City", "type": "string"},
-        "state": {"source_field": "Address.State", "type": "string"},
-        "zip_code": {"source_field": "Address.Zip", "type": "string"},
-        "membership_type": {
-            "source_field": "Membership.Type",
-            "type": "string",
-            "default": "Standard",
-        },
-    }
-
-    # --- Spark Session Initialization ---
-    # This requires the Spark-BigQuery connector and Spark-XML package.
-    # Example spark-submit command:
-    # spark-submit --packages com.databricks:spark-xml_2.12:0.16.0,com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.23.2 \
-    # your_script.py
-    spark = (
-        SparkSession.builder.appName("XMLToBigQueryPipeline")
-        .config(
-            "spark.jars.packages",
-            "com.databricks:spark-xml_2.12:0.16.0,com.google.cloud.spark:spark-bigquery-with-dependencies_2.12:0.23.2",
-        )
-        .getOrCreate()
-    )
-
-    # --- Pipeline Execution ---
-    pipeline = XMLToBigQueryPipeline(
-        spark=spark,
-        source_xml_path=source_xml_path,
-        bq_project=bq_project_id,
-        bq_dataset=bq_dataset_id,
-        bq_table=bq_table_name,
-        temp_gcs_bucket=temp_gcs_bucket,
-        xml_row_tag=xml_row_tag,
-        data_mapping=data_mapping,
-    )
-    pipeline.run()
-
-    spark.stop()
-
-
-if __name__ == "__main__":
-    main()
-```
-{
-  "apiCost": 0.0
-}
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_bigquery_creds.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/XML_Data_Mapping.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/xml_member_data.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp773r7v0y
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp2_g87v2u
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_deps.zip
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_jars.zip
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_confs.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_properties.conf
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_extra_listeners.jar
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_extra_jars.zip
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_driver_log4j.properties
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_executor_log4j.properties
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_jars_driver.zip
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_python_packages.zip
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_submit_params.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_submit_args.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_driver_extra_class_path.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_executor_extra_class_path.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_extra_py_files.zip
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_jars_local.zip
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_files_local.zip
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_jars_local_driver.zip
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_python_archives.zip
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_python_archives_driver.zip
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_driver_extra_library_path.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_executor_extra_library_path.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_driver_extra_java_options.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_executor_extra_java_options.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_driver_supervise.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_submit_deploy_mode.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_master.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_remote.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_conf_log.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_main_cluster_mode.py
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_main_client_mode.py
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_main.py
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_command.sh
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_command_formatted.sh
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_stdout.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_stderr.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_exit_code.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_driver_status.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_final_command.sh
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_application_id.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_tracking_url.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_log.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_is_final.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_final_status.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_error.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_json_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_json_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/46fa88df-c90e-496d-8a5d-d5999d60c2d8/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmpcisil0mb
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmpu4486a1v
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_bigquery_creds.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/XML_Data_Mapping.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/xml_member_data.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp773r7v0y
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp2_g87v2u
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_deps.zip
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_jars.zip
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_confs.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_properties.conf
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_extra_listeners.jar
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_extra_jars.zip
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_driver_log4j.properties
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_executor_log4j.properties
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_jars_driver.zip
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_python_packages.zip
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_submit_params.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_submit_args.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_driver_extra_class_path.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_executor_extra_class_path.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_extra_py_files.zip
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_jars_local.zip
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_files_local.zip
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_jars_local_driver.zip
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_python_archives.zip
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_python_archives_driver.zip
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_driver_extra_library_path.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_executor_extra_library_path.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_driver_extra_java_options.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_executor_extra_java_options.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_driver_supervise.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_submit_deploy_mode.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_master.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_remote.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_conf_log.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_main_cluster_mode.py
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_main_client_mode.py
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_main.py
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_command.sh
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_command_formatted.sh
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_stdout.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_stderr.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_exit_code.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_driver_status.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_final_command.sh
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_application_id.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_tracking_url.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_log.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_is_final.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_final_status.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_error.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_json_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_json_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final.json
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_truncated.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_full.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_json_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_final_pretty.txt
+- /app/4e43322a-773c-4f3f-a823-3f0f7292a4f4/tmptxqfhx97/tmp_spark_output_final_
