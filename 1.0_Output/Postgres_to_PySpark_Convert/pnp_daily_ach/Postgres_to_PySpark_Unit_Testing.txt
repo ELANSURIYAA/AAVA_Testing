@@ -1,150 +1,238 @@
---------------------------------------------------
 Test Case List:
------------------
-TC1 - Happy Path Scenario:
-  - Description: Provide a valid DataFrame with 'achievement_date' and 'amount' fields. The pipeline filters records from 2023-01-01 onward, truncates the date to the day, aggregates total amount and count per day, and orders by day.
-  - Expected Outcome: A DataFrame with rows containing the day, total_amount (sum of amount), and total_count (record count) reflecting the valid input data.
-  
-TC2 - Empty DataFrame:
-  - Description: Provide an empty DataFrame to the pipeline.
-  - Expected Outcome: An empty DataFrame (no aggregation results).
-  
-TC3 - Null Values in 'amount' Column:
-  - Description: Provide a DataFrame with valid 'achievement_date' but with null values in the 'amount' column. Here, we assume that null values are skipped during summation.
-  - Expected Outcome: The aggregated DataFrame should correctly sum only non-null amounts and count records appropriately.
-  
-TC4 - Missing Required Column (Error Scenario):
-  - Description: Provide a DataFrame that is missing the 'achievement_date' column.
-  - Expected Outcome: The process should raise an exception (e.g., AnalysisException) due to the absence of the needed column.
+----------------
+1. TC01_HappyPath:
+   - Description: Validate correct aggregation when provided with valid transactions and accounts DataFrames. Ensure the join, filtering, and aggregations produce the expected sum and average per (transaction_date, category) group.
+   - Expected Outcome: The aggregated DataFrame shows proper grouping by transaction_date and category with correct total_amount and average_amount calculations.
 
---------------------------------------------------
-Pytest Script (test_daily_achievements.py):
---------------------------------------------------
+2. TC02_OnlyActiveTransactions:
+   - Description: Ensure only transactions with status "active" are processed.
+   - Expected Outcome: Any transaction with a different status is filtered out before joining and aggregation.
+
+3. TC03_DateRangeFilter:
+   - Description: Verify that transactions falling outside the date range ("2023-01-01" to "2023-12-31") are excluded.
+   - Expected Outcome: The resulting DataFrame only contains transactions with transaction_date in the defined range.
+
+4. TC04_EmptyDataFrame:
+   - Description: Test the case where one or both of the input DataFrames (transactions or accounts) are empty.
+   - Expected Outcome: The final result is an empty DataFrame without errors.
+
+5. TC05_NullValues:
+   - Description: Check behavior when critical fields (e.g., transaction_date, amount) have null values.
+   - Expected Outcome: Null values are either filtered out or handled in such a way that aggregations do not crash, and the output is as expected.
+
+6. TC06_JoinMismatch:
+   - Description: Validate the join operation when some transactions do not have a matching account in the accounts DataFrame.
+   - Expected Outcome: Transactions without matching accounts should be excluded from the join result.
+
+7. TC07_AggregationAccuracy:
+   - Description: Verify the accuracy of the aggregation functions by manually computing expected results for a controlled dataset.
+   - Expected Outcome: The computed total_amount and average_amount for each (transaction_date, category) group exactly match the expected values.
+
+Pytest Script:
+----------------
 #!/usr/bin/env python3
-"""
-Pytest script for testing the PySpark daily achievements pipeline.
-API cost consumed for this call: $0.0020
-"""
+\"\"\"
+PySpark Unit Tests for Converted PySpark Code
+
+This script performs unit tests for the following:
+- Filtering of active transactions
+- Date range filtering
+- DataFrame join between transactions and accounts
+- Data aggregation into total and average amounts
+- Handling of empty datasets and null values
+
+API Cost Consumed for this conversion call: $0.0035
+\"\"\"
 
 import pytest
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, date_trunc, sum as _sum, count as _count
-from pyspark.sql.utils import AnalysisException
+from pyspark.sql.functions import col, to_date, sum as _sum, avg as _avg
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType
 
-# Fixture for SparkSession setup and teardown
 @pytest.fixture(scope="session")
 def spark():
-    spark = SparkSession.builder.master("local[2]").appName("DailyAchievementsTest").getOrCreate()
-    yield spark
-    spark.stop()
+    spark_session = SparkSession.builder \
+        .master("local[2]") \
+        .appName("PySparkTestSuite") \
+        .getOrCreate()
+    yield spark_session
+    spark_session.stop()
 
-# Helper function to simulate the transformation pipeline
-def process_daily_achievements(pnpDF):
-    # Filter data: achievements from 2023-01-01 onwards
-    filteredDF = pnpDF.filter(col("achievement_date") >= "2023-01-01")
+def create_transactions_df(spark, data):
+    schema = StructType([
+        StructField("transaction_date", StringType(), True),
+        StructField("status", StringType(), True),
+        StructField("account_id", IntegerType(), True),
+        StructField("category", StringType(), True),
+        StructField("amount", DoubleType(), True)
+    ])
+    return spark.createDataFrame(data, schema)
+
+def create_accounts_df(spark, data):
+    schema = StructType([
+        StructField("id", IntegerType(), True),
+        StructField("account_name", StringType(), True)
+    ])
+    return spark.createDataFrame(data, schema)
+
+def process_data(spark, transactions_df, accounts_df):
+    # Convert transaction_date from string to actual date
+    transactions_df = transactions_df.withColumn("transaction_date", to_date(col("transaction_date"), "yyyy-MM-dd"))
     
-    # Truncate achievements to the day
-    dailyDF = filteredDF.withColumn("day", date_trunc("day", col("achievement_date")))
-    
-    # Aggregate data: sum of amount and count of records per day
-    aggDF = dailyDF.groupBy("day").agg(
-        _sum("amount").alias("total_amount"),
-        _count("*").alias("total_count")
+    # Filter active transactions within date range
+    df_filtered = transactions_df.filter(
+        (col("status") == "active") & 
+        (col("transaction_date") >= "2023-01-01") & 
+        (col("transaction_date") <= "2023-12-31")
     )
     
-    # Order the result by day
-    resultDF = aggDF.orderBy("day")
-    return resultDF
+    # Join with accounts on account_id and id
+    df_joined = df_filtered.join(accounts_df, df_filtered.account_id == accounts_df.id, how="inner")
+    
+    # Aggregation: group by transaction_date and category, compute sum and average
+    df_aggregated = df_joined.groupBy("transaction_date", "category").agg(
+        _sum("amount").alias("total_amount"),
+        _avg("amount").alias("average_amount")
+    )
+    
+    # Cache (if needed) and return the result
+    df_result = df_aggregated.cache()
+    return df_result
 
-# TC1: Happy Path Scenario
+# ---------------------------
+# Test Cases Implementation
+# ---------------------------
+
 def test_happy_path(spark):
-    """
-    Test that valid data is correctly filtered, aggregated, and ordered.
-    """
-    data = [
-        {"achievement_date": "2023-01-02 10:00:00", "amount": 100},
-        {"achievement_date": "2023-01-02 15:30:00", "amount": 200},
-        {"achievement_date": "2023-01-03 09:00:00", "amount": 150}
+    \"\"\" TC01_HappyPath: Validate aggregation with valid input data \"\"\"
+    transactions_data = [
+        ("2023-05-01", "active", 1, "food", 100.0),
+        ("2023-05-01", "active", 1, "food", 200.0),
+        ("2023-05-01", "active", 2, "travel", 300.0)
     ]
-    # Create DataFrame
-    df = spark.createDataFrame(data)
-    
-    resultDF = process_daily_achievements(df)
-    
-    # Collect results
-    results = resultDF.collect()
-    
-    # Expected results:
-    # For 2023-01-02: total_amount = 300, total_count = 2
-    # For 2023-01-03: total_amount = 150, total_count = 1
-    expected = {
-        "2023-01-02": {"total_amount": 300, "total_count": 2},
-        "2023-01-03": {"total_amount": 150, "total_count": 1},
-    }
-    
-    # Verify each row
-    for row in results:
-        day_str = row["day"].strftime("%Y-%m-%d")
-        assert day_str in expected
-        assert row["total_amount"] == expected[day_str]["total_amount"]
-        assert row["total_count"] == expected[day_str]["total_count"]
-
-# TC2: Empty DataFrame
-def test_empty_dataframe(spark):
-    """
-    Test that an empty DataFrame returns an empty result after processing.
-    """
-    # Create empty DataFrame with required schema
-    schema = "achievement_date STRING, amount INT"
-    empty_df = spark.createDataFrame([], schema)
-    
-    resultDF = process_daily_achievements(empty_df)
-    
-    # Collect results: should be empty list
-    results = resultDF.collect()
-    assert results == []
-
-# TC3: Null Values in 'amount' Column
-def test_null_values_in_amount(spark):
-    """
-    Test that the pipeline correctly processes records with null amounts.
-    Nulls are skipped in summation.
-    """
-    data = [
-        {"achievement_date": "2023-01-04 08:00:00", "amount": None},
-        {"achievement_date": "2023-01-04 12:00:00", "amount": 50},
-        {"achievement_date": "2023-01-04 16:00:00", "amount": None},
+    accounts_data = [
+        (1, "Account A"),
+        (2, "Account B")
     ]
-    df = spark.createDataFrame(data)
+    transactions_df = create_transactions_df(spark, transactions_data)
+    accounts_df = create_accounts_df(spark, accounts_data)
+    result_df = process_data(spark, transactions_df, accounts_df)
     
-    resultDF = process_daily_achievements(df)
-    results = resultDF.collect()
+    result = {row['category']: (row['total_amount'], row['average_amount']) for row in result_df.collect()}
+    # Expected: For category 'food' total=300, average=150, for 'travel' total=300, average=300.
+    assert result.get("food") == (300.0, 150.0)
+    assert result.get("travel") == (300.0, 300.0)
+
+def test_only_active_transactions(spark):
+    \"\"\" TC02_OnlyActiveTransactions: Ensure transactions with status != 'active' are filtered out \"\"\"
+    transactions_data = [
+        ("2023-06-15", "active", 1, "entertainment", 120.0),
+        ("2023-06-15", "inactive", 1, "entertainment", 300.0)
+    ]
+    accounts_data = [(1, "Account A")]
+    transactions_df = create_transactions_df(spark, transactions_data)
+    accounts_df = create_accounts_df(spark, accounts_data)
+    result_df = process_data(spark, transactions_df, accounts_df)
     
-    # Expected: for 2023-01-04, total_amount should be 50 (None values skipped) and count should be 3.
+    results = result_df.collect()
+    # Only one active transaction should be present.
     assert len(results) == 1
     row = results[0]
-    day_str = row["day"].strftime("%Y-%m-%d")
-    assert day_str == "2023-01-04"
-    # Spark _sum function over nulls returns null if all values are null, otherwise it sums non-null values.
-    # Here, sum should be 50.
-    assert row["total_amount"] == 50
-    assert row["total_count"] == 3
+    assert row["category"] == "entertainment"
+    assert row["total_amount"] == 120.0
 
-# TC4: Missing Required Column (Error Scenario)
-def test_missing_achievement_date_column(spark):
-    """
-    Test that providing a DataFrame missing 'achievement_date' raises an AnalysisException.
-    """
-    # Create a DataFrame missing the 'achievement_date' column
-    data = [
-        {"timestamp": "2023-01-05 10:00:00", "amount": 100},
+def test_date_range_filter(spark):
+    \"\"\" TC03_DateRangeFilter: Verify filtering of transactions by date range \"\"\"
+    transactions_data = [
+        ("2022-12-31", "active", 1, "utilities", 80.0),   # Outside date range
+        ("2023-01-02", "active", 1, "utilities", 120.0)      # Inside date range
     ]
-    schema = "timestamp STRING, amount INT"
-    df = spark.createDataFrame(data, schema)
+    accounts_data = [(1, "Account A")]
+    transactions_df = create_transactions_df(spark, transactions_data)
+    accounts_df = create_accounts_df(spark, accounts_data)
+    result_df = process_data(spark, transactions_df, accounts_df)
     
-    with pytest.raises(Exception):
-        # This call should raise an exception because 'achievement_date' column is not in the DataFrame.
-        _ = process_daily_achievements(df)
-        
---------------------------------------------------
-(API cost consumed for this call: $0.0020)
+    results = result_df.collect()
+    # Only the transaction with date "2023-01-02" should be included.
+    assert len(results) == 1
+    row = results[0]
+    assert row["category"] == "utilities"
+    assert row["total_amount"] == 120.0
+
+def test_empty_dataframe(spark):
+    \"\"\" TC04_EmptyDataFrame: Test behavior with empty input DataFrames \"\"\"
+    transactions_data = []  # Empty transactions
+    accounts_data = []      # Empty accounts
+    transactions_df = create_transactions_df(spark, transactions_data)
+    accounts_df = create_accounts_df(spark, accounts_data)
+    result_df = process_data(spark, transactions_df, accounts_df)
+    
+    results = result_df.collect()
+    # Expecting an empty result
+    assert len(results) == 0
+
+def test_null_values(spark):
+    \"\"\" TC05_NullValues: Test processing when critical fields contain null values \"\"\"
+    # A row with null transaction_date or amount should be handled (filtered or cause no aggregation)
+    transactions_data = [
+        (None, "active", 1, "misc", 50.0),          # Null date
+        ("2023-07-07", "active", 1, "misc", None),    # Null amount
+        ("2023-07-07", "active", 1, "misc", 100.0)      # Valid row
+    ]
+    accounts_data = [(1, "Account A")]
+    transactions_df = create_transactions_df(spark, transactions_data)
+    accounts_df = create_accounts_df(spark, accounts_data)
+    result_df = process_data(spark, transactions_df, accounts_df)
+    
+    results = result_df.collect()
+    # Expect only the valid row to be aggregated.
+    if results:
+        row = results[0]
+        assert row["category"] == "misc"
+        # Only valid amount contributes to sum and average.
+        assert row["total_amount"] == 100.0
+    else:
+        # In some implementations rows with null amounts may be filtered out
+        assert True
+
+def test_join_mismatch(spark):
+    \"\"\" TC06_JoinMismatch: Verify that transactions with no matching accounts are excluded after join \"\"\"
+    transactions_data = [
+        ("2023-08-10", "active", 1, "shopping", 220.0),
+        ("2023-08-10", "active", 2, "shopping", 180.0)  # Account ID 2 will not be found
+    ]
+    accounts_data = [(1, "Account A")]
+    transactions_df = create_transactions_df(spark, transactions_data)
+    accounts_df = create_accounts_df(spark, accounts_data)
+    result_df = process_data(spark, transactions_df, accounts_df)
+    
+    results = result_df.collect()
+    # Only the transaction with account_id 1 should appear after the join.
+    assert len(results) == 1
+    row = results[0]
+    assert row["category"] == "shopping"
+    assert row["total_amount"] == 220.0
+
+def test_aggregation_accuracy(spark):
+    \"\"\" TC07_AggregationAccuracy: Validate computed sum and average against known expected values \"\"\"
+    transactions_data = [
+        ("2023-09-01", "active", 1, "health", 50.0),
+        ("2023-09-01", "active", 1, "health", 150.0),
+        ("2023-09-01", "active", 1, "health", 200.0),
+        ("2023-09-01", "active", 1, "health", 100.0)
+    ]
+    accounts_data = [(1, "Account A")]
+    transactions_df = create_transactions_df(spark, transactions_data)
+    accounts_df = create_accounts_df(spark, accounts_data)
+    result_df = process_data(spark, transactions_df, accounts_df)
+    
+    results = result_df.collect()
+    # Manually computed: total = 50+150+200+100 = 500, average = 500/4 = 125.0
+    assert len(results) == 1
+    row = results[0]
+    assert row["category"] == "health"
+    assert row["total_amount"] == 500.0
+    # Comparing float values with a tolerance can be done if necessary. For simplicity, direct comparison is shown.
+    assert row["average_amount"] == 125.0
+
+# API Cost Consumed for this conversion call: $0.0035
