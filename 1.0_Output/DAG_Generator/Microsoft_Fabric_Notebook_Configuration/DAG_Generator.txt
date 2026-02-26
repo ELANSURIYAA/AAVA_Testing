@@ -1,0 +1,441 @@
+```python
+"""
+Microsoft Fabric Data Pipeline Orchestration DAG
+
+This DAG orchestrates Microsoft Fabric notebooks for a complete data pipeline
+from source to bronze, bronze to silver, and silver to gold layers.
+
+Author: Data Engineering Team
+Created: 2024
+"""
+
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.providers.microsoft.azure.operators.data_factory import AzureDataFactoryRunPipelineOperator
+from airflow.providers.http.operators.http import SimpleHttpOperator
+from airflow.models import Variable
+from airflow.utils.dates import days_ago
+from airflow.utils.email import send_email
+import logging
+import json
+
+# Constants
+DAG_ID = 'microsoft_fabric_etl_pipeline'
+FABRIC_WORKSPACE_ID = Variable.get("fabric_workspace_id", default_var="your-workspace-id")
+FABRIC_BASE_URL = Variable.get("fabric_base_url", default_var="https://api.fabric.microsoft.com/v1")
+NOTIFICATION_EMAIL = Variable.get("notification_email", default_var="data-team@company.com")
+
+# Default arguments for the DAG
+default_args = {
+    'owner': 'data-engineering-team',
+    'depends_on_past': False,
+    'start_date': datetime(2024, 1, 1),
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'email': [NOTIFICATION_EMAIL],
+    'retries': 2,
+    'retry_delay': timedelta(minutes=5),
+    'execution_timeout': timedelta(hours=4),
+    'sla': timedelta(hours=6),
+}
+
+def failure_callback(context):
+    """
+    Callback function for task failures
+    """
+    task_instance = context.get('task_instance')
+    dag_run = context.get('dag_run')
+    
+    subject = f"Airflow Task Failed: {task_instance.task_id}"
+    html_content = f"""
+    <h3>Task Failure Notification</h3>
+    <p><strong>DAG:</strong> {dag_run.dag_id}</p>
+    <p><strong>Task:</strong> {task_instance.task_id}</p>
+    <p><strong>Execution Date:</strong> {dag_run.execution_date}</p>
+    <p><strong>Log URL:</strong> {task_instance.log_url}</p>
+    """
+    
+    send_email(
+        to=[NOTIFICATION_EMAIL],
+        subject=subject,
+        html_content=html_content
+    )
+
+def success_callback(context):
+    """
+    Callback function for successful DAG completion
+    """
+    dag_run = context.get('dag_run')
+    logging.info(f"DAG {dag_run.dag_id} completed successfully for execution date {dag_run.execution_date}")
+
+def execute_fabric_notebook(notebook_path, parameters=None, timeout_minutes=60):
+    """
+    Execute a Microsoft Fabric notebook
+    
+    Args:
+        notebook_path (str): Path to the notebook in Fabric workspace
+        parameters (dict): Parameters to pass to the notebook
+        timeout_minutes (int): Timeout for notebook execution
+    
+    Returns:
+        dict: Execution result
+    """
+    import requests
+    import time
+    
+    # Get authentication token (assuming service principal authentication)
+    auth_token = Variable.get("fabric_auth_token")
+    
+    headers = {
+        'Authorization': f'Bearer {auth_token}',
+        'Content-Type': 'application/json'
+    }
+    
+    # Prepare notebook execution payload
+    payload = {
+        'notebookPath': notebook_path,
+        'parameters': parameters or {},
+        'timeoutInMinutes': timeout_minutes
+    }
+    
+    # Execute notebook
+    execute_url = f"{FABRIC_BASE_URL}/workspaces/{FABRIC_WORKSPACE_ID}/notebooks/execute"
+    
+    try:
+        response = requests.post(execute_url, headers=headers, json=payload)
+        response.raise_for_status()
+        
+        execution_id = response.json().get('executionId')
+        logging.info(f"Started notebook execution: {execution_id}")
+        
+        # Poll for completion
+        status_url = f"{FABRIC_BASE_URL}/workspaces/{FABRIC_WORKSPACE_ID}/notebooks/executions/{execution_id}"
+        
+        while True:
+            status_response = requests.get(status_url, headers=headers)
+            status_response.raise_for_status()
+            
+            status_data = status_response.json()
+            status = status_data.get('status')
+            
+            if status == 'Completed':
+                logging.info(f"Notebook execution completed successfully: {execution_id}")
+                return status_data
+            elif status == 'Failed':
+                error_msg = status_data.get('error', 'Unknown error')
+                raise Exception(f"Notebook execution failed: {error_msg}")
+            elif status in ['Cancelled', 'Timeout']:
+                raise Exception(f"Notebook execution {status.lower()}: {execution_id}")
+            
+            # Wait before next poll
+            time.sleep(30)
+            
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error executing notebook {notebook_path}: {str(e)}")
+        raise
+
+# Create the DAG
+dag = DAG(
+    DAG_ID,
+    default_args=default_args,
+    description='Microsoft Fabric ETL Pipeline - Source to Bronze to Silver to Gold',
+    schedule_interval='0 9 * * *',  # 4 AM EST (9 AM UTC)
+    catchup=False,
+    max_active_runs=1,
+    tags=['microsoft-fabric', 'etl', 'data-pipeline'],
+    on_failure_callback=failure_callback,
+    on_success_callback=success_callback,
+)
+
+# Start task
+start_task = DummyOperator(
+    task_id='start_pipeline',
+    dag=dag,
+)
+
+# Data Quality Check - Pre-processing
+data_quality_check = PythonOperator(
+    task_id='data_quality_pre_check',
+    python_callable=lambda: logging.info("Performing pre-processing data quality checks"),
+    dag=dag,
+)
+
+# Source to Bronze Layer Tasks
+source_to_bronze_customers = PythonOperator(
+    task_id='source_to_bronze_customers',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/bronze/ingest_customers',
+        'parameters': {
+            'execution_date': '{{ ds }}',
+            'source_system': 'crm'
+        },
+        'timeout_minutes': 45
+    },
+    dag=dag,
+    sla=timedelta(hours=1),
+)
+
+source_to_bronze_orders = PythonOperator(
+    task_id='source_to_bronze_orders',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/bronze/ingest_orders',
+        'parameters': {
+            'execution_date': '{{ ds }}',
+            'source_system': 'ecommerce'
+        },
+        'timeout_minutes': 60
+    },
+    dag=dag,
+    sla=timedelta(hours=1),
+)
+
+source_to_bronze_products = PythonOperator(
+    task_id='source_to_bronze_products',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/bronze/ingest_products',
+        'parameters': {
+            'execution_date': '{{ ds }}',
+            'source_system': 'inventory'
+        },
+        'timeout_minutes': 30
+    },
+    dag=dag,
+    sla=timedelta(hours=1),
+)
+
+# Bronze Layer Validation
+bronze_validation = PythonOperator(
+    task_id='bronze_layer_validation',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/validation/bronze_data_validation',
+        'parameters': {
+            'execution_date': '{{ ds }}'
+        },
+        'timeout_minutes': 20
+    },
+    dag=dag,
+)
+
+# Bronze to Silver Layer Tasks
+bronze_to_silver_customers = PythonOperator(
+    task_id='bronze_to_silver_customers',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/silver/transform_customers',
+        'parameters': {
+            'execution_date': '{{ ds }}',
+            'apply_scd_type2': True
+        },
+        'timeout_minutes': 45
+    },
+    dag=dag,
+    sla=timedelta(hours=1.5),
+)
+
+bronze_to_silver_orders = PythonOperator(
+    task_id='bronze_to_silver_orders',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/silver/transform_orders',
+        'parameters': {
+            'execution_date': '{{ ds }}',
+            'enable_deduplication': True
+        },
+        'timeout_minutes': 75
+    },
+    dag=dag,
+    sla=timedelta(hours=1.5),
+)
+
+bronze_to_silver_products = PythonOperator(
+    task_id='bronze_to_silver_products',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/silver/transform_products',
+        'parameters': {
+            'execution_date': '{{ ds }}',
+            'standardize_categories': True
+        },
+        'timeout_minutes': 30
+    },
+    dag=dag,
+    sla=timedelta(hours=1.5),
+)
+
+# Silver Layer Validation
+silver_validation = PythonOperator(
+    task_id='silver_layer_validation',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/validation/silver_data_validation',
+        'parameters': {
+            'execution_date': '{{ ds }}'
+        },
+        'timeout_minutes': 25
+    },
+    dag=dag,
+)
+
+# Silver to Gold Layer Tasks
+silver_to_gold_customer_analytics = PythonOperator(
+    task_id='silver_to_gold_customer_analytics',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/gold/customer_analytics',
+        'parameters': {
+            'execution_date': '{{ ds }}',
+            'calculate_ltv': True,
+            'segment_customers': True
+        },
+        'timeout_minutes': 60
+    },
+    dag=dag,
+    sla=timedelta(hours=2),
+)
+
+silver_to_gold_sales_metrics = PythonOperator(
+    task_id='silver_to_gold_sales_metrics',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/gold/sales_metrics',
+        'parameters': {
+            'execution_date': '{{ ds }}',
+            'aggregation_level': 'daily',
+            'include_forecasts': True
+        },
+        'timeout_minutes': 45
+    },
+    dag=dag,
+    sla=timedelta(hours=2),
+)
+
+silver_to_gold_product_performance = PythonOperator(
+    task_id='silver_to_gold_product_performance',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/gold/product_performance',
+        'parameters': {
+            'execution_date': '{{ ds }}',
+            'include_inventory_metrics': True
+        },
+        'timeout_minutes': 40
+    },
+    dag=dag,
+    sla=timedelta(hours=2),
+)
+
+# Gold Layer Validation
+gold_validation = PythonOperator(
+    task_id='gold_layer_validation',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/validation/gold_data_validation',
+        'parameters': {
+            'execution_date': '{{ ds }}'
+        },
+        'timeout_minutes': 30
+    },
+    dag=dag,
+)
+
+# Final Data Quality Check
+final_data_quality_check = PythonOperator(
+    task_id='final_data_quality_check',
+    python_callable=execute_fabric_notebook,
+    op_kwargs={
+        'notebook_path': '/notebooks/validation/end_to_end_validation',
+        'parameters': {
+            'execution_date': '{{ ds }}',
+            'send_report': True
+        },
+        'timeout_minutes': 20
+    },
+    dag=dag,
+)
+
+# Success notification
+success_notification = PythonOperator(
+    task_id='success_notification',
+    python_callable=lambda: send_email(
+        to=[NOTIFICATION_EMAIL],
+        subject=f"ETL Pipeline Success - {datetime.now().strftime('%Y-%m-%d')}",
+        html_content="<p>Microsoft Fabric ETL Pipeline completed successfully!</p>"
+    ),
+    dag=dag,
+)
+
+# End task
+end_task = DummyOperator(
+    task_id='end_pipeline',
+    dag=dag,
+)
+
+# Define task dependencies
+# Start of pipeline
+start_task >> data_quality_check
+
+# Source to Bronze layer (parallel execution)
+data_quality_check >> [
+    source_to_bronze_customers,
+    source_to_bronze_orders,
+    source_to_bronze_products
+]
+
+# Bronze validation after all bronze tasks complete
+[
+    source_to_bronze_customers,
+    source_to_bronze_orders,
+    source_to_bronze_products
+] >> bronze_validation
+
+# Bronze to Silver layer (parallel execution after bronze validation)
+bronze_validation >> [
+    bronze_to_silver_customers,
+    bronze_to_silver_orders,
+    bronze_to_silver_products
+]
+
+# Silver validation after all silver tasks complete
+[
+    bronze_to_silver_customers,
+    bronze_to_silver_orders,
+    bronze_to_silver_products
+] >> silver_validation
+
+# Silver to Gold layer (parallel execution after silver validation)
+silver_validation >> [
+    silver_to_gold_customer_analytics,
+    silver_to_gold_sales_metrics,
+    silver_to_gold_product_performance
+]
+
+# Gold validation after all gold tasks complete
+[
+    silver_to_gold_customer_analytics,
+    silver_to_gold_sales_metrics,
+    silver_to_gold_product_performance
+] >> gold_validation
+
+# Final checks and notifications
+gold_validation >> final_data_quality_check >> success_notification >> end_task
+
+# Additional task dependencies for data lineage
+# Ensure customer data flows correctly through the pipeline
+source_to_bronze_customers >> bronze_to_silver_customers >> silver_to_gold_customer_analytics
+
+# Ensure order data flows correctly (depends on both customers and products)
+[source_to_bronze_orders, bronze_to_silver_customers, bronze_to_silver_products] >> bronze_to_silver_orders
+bronze_to_silver_orders >> silver_to_gold_sales_metrics
+
+# Ensure product data flows correctly
+source_to_bronze_products >> bronze_to_silver_products >> silver_to_gold_product_performance
+
+if __name__ == "__main__":
+    dag.cli()
+```
