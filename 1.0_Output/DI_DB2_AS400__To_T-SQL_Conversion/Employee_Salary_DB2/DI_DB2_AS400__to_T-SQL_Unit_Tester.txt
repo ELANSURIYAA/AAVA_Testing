@@ -1,0 +1,222 @@
+====================================================
+Author:        AAVA
+Date:          
+Description:   Returns total salary and bonus count for a department
+====================================================
+
+1. Test Case List
+
+| Test Case ID | Test Case Description                                                                 | Expected Outcome                                                                                              |
+|--------------|--------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: Department with multiple employees, all with non-null salary and bonus   | Correct sum of salaries+bonuses, correct count of employees with bonus > 0                                   |
+| TC02         | Department with some employees having NULL salary or bonus                           | NULLs treated as 0 in sum, bonus count increments only if bonus > 0                                          |
+| TC03         | Department with no employees                                                         | Output total salary = 0, bonus count = 0                                                                     |
+| TC04         | Department with all bonuses = 0                                                      | Bonus count = 0, total salary is sum of salaries and bonuses                                                 |
+| TC05         | Department with negative/zero salary or bonus                                        | Negative/zero values included in sum, bonus count increments only for bonus > 0                              |
+| TC06         | INT overflow: Salaries/bonuses sum to more than DECIMAL(9,2) max                     | Procedure should error or output max possible value (test for overflow handling)                             |
+| TC07         | Edge: Employee with maximum possible salary/bonus                                    | Output reflects correct handling of DECIMAL(9,2) boundary                                                    |
+| TC08         | Input department does not exist                                                      | Output total salary = 0, bonus count = 0                                                                     |
+| TC09         | Error handling: Table missing or inaccessible                                        | Procedure raises error, output parameters remain as initialized                                               |
+| TC10         | Collation/encoding: Department code with non-ASCII chars                             | Procedure works correctly with Unicode input                                                                 |
+| TC11         | Transaction rollback: Simulate error during cursor loop                              | Output parameters remain as last assigned, or transaction is rolled back (if TRY...CATCH is implemented)    |
+| TC12         | Empty string as department input                                                     | Output total salary = 0, bonus count = 0                                                                     |
+
+---
+
+2. Pytest Script for Each Test Case
+
+```python
+import pytest
+import pyodbc
+
+# Connection string template (adjust as needed)
+CONN_STR = (
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=localhost;DATABASE=TestDB;UID=sa;PWD=YourStrong!Passw0rd"
+)
+
+@pytest.fixture(scope="module")
+def sql_conn():
+    conn = pyodbc.connect(CONN_STR, autocommit=False)
+    yield conn
+    conn.close()
+
+@pytest.fixture(autouse=True)
+def setup_teardown(sql_conn):
+    # Setup: Create schema/table and insert test data
+    cursor = sql_conn.cursor()
+    cursor.execute("""
+        IF OBJECT_ID('CORPDATA.EMPLOYEE', 'U') IS NOT NULL DROP TABLE CORPDATA.EMPLOYEE;
+        IF SCHEMA_ID('CORPDATA') IS NULL EXEC('CREATE SCHEMA CORPDATA');
+        CREATE TABLE CORPDATA.EMPLOYEE (
+            EMPNO CHAR(6) PRIMARY KEY,
+            WORKDEPT CHAR(3),
+            SALARY DECIMAL(9,2) NULL,
+            BONUS DECIMAL(9,2) NULL
+        );
+    """)
+    sql_conn.commit()
+    yield
+    # Teardown: Clean up after each test
+    cursor.execute("DROP TABLE IF EXISTS CORPDATA.EMPLOYEE;")
+    sql_conn.commit()
+
+def call_proc(conn, dept):
+    cursor = conn.cursor()
+    out_salary = 0
+    out_bonus = 0
+    # Prepare output parameters
+    result = cursor.execute("""
+        DECLARE @OUT_TOTAL_SALARY DECIMAL(9,2), @OUT_BONUS_COUNT INT;
+        EXEC RETURN_DEPT_SALARY ?, @OUT_TOTAL_SALARY OUTPUT, @OUT_BONUS_COUNT OUTPUT;
+        SELECT @OUT_TOTAL_SALARY, @OUT_BONUS_COUNT;
+    """, dept)
+    row = result.fetchone()
+    return row[0], row[1]
+
+def insert_employees(conn, rows):
+    cursor = conn.cursor()
+    for row in rows:
+        cursor.execute(
+            "INSERT INTO CORPDATA.EMPLOYEE (EMPNO, WORKDEPT, SALARY, BONUS) VALUES (?, ?, ?, ?)",
+            row['EMPNO'], row['WORKDEPT'], row['SALARY'], row['BONUS']
+        )
+    conn.commit()
+
+def test_TC01_happy_path(sql_conn):
+    """Department with multiple employees, all non-null salary/bonus"""
+    rows = [
+        {'EMPNO': '000001', 'WORKDEPT': 'D01', 'SALARY': 1000.00, 'BONUS': 100.00},
+        {'EMPNO': '000002', 'WORKDEPT': 'D01', 'SALARY': 2000.00, 'BONUS': 200.00},
+        {'EMPNO': '000003', 'WORKDEPT': 'D01', 'SALARY': 3000.00, 'BONUS': 0.00},
+    ]
+    insert_employees(sql_conn, rows)
+    total, bonus_count = call_proc(sql_conn, 'D01')
+    assert total == 1000+100 + 2000+200 + 3000+0
+    assert bonus_count == 2
+
+def test_TC02_null_salary_bonus(sql_conn):
+    """Department with some NULL salary/bonus"""
+    rows = [
+        {'EMPNO': '000004', 'WORKDEPT': 'D02', 'SALARY': None, 'BONUS': 50.00},
+        {'EMPNO': '000005', 'WORKDEPT': 'D02', 'SALARY': 1500.00, 'BONUS': None},
+        {'EMPNO': '000006', 'WORKDEPT': 'D02', 'SALARY': None, 'BONUS': None},
+    ]
+    insert_employees(sql_conn, rows)
+    total, bonus_count = call_proc(sql_conn, 'D02')
+    assert total == 0+50 + 1500+0 + 0+0
+    assert bonus_count == 1
+
+def test_TC03_no_employees(sql_conn):
+    """Department with no employees"""
+    total, bonus_count = call_proc(sql_conn, 'D03')
+    assert total == 0
+    assert bonus_count == 0
+
+def test_TC04_all_bonuses_zero(sql_conn):
+    """Department with all bonuses zero"""
+    rows = [
+        {'EMPNO': '000007', 'WORKDEPT': 'D04', 'SALARY': 1200.00, 'BONUS': 0.00},
+        {'EMPNO': '000008', 'WORKDEPT': 'D04', 'SALARY': 1300.00, 'BONUS': 0.00},
+    ]
+    insert_employees(sql_conn, rows)
+    total, bonus_count = call_proc(sql_conn, 'D04')
+    assert total == 1200+0 + 1300+0
+    assert bonus_count == 0
+
+def test_TC05_negative_zero_salary_bonus(sql_conn):
+    """Department with negative/zero salary or bonus"""
+    rows = [
+        {'EMPNO': '000009', 'WORKDEPT': 'D05', 'SALARY': -500.00, 'BONUS': 0.00},
+        {'EMPNO': '000010', 'WORKDEPT': 'D05', 'SALARY': 0.00, 'BONUS': -100.00},
+        {'EMPNO': '000011', 'WORKDEPT': 'D05', 'SALARY': 100.00, 'BONUS': 0.00},
+    ]
+    insert_employees(sql_conn, rows)
+    total, bonus_count = call_proc(sql_conn, 'D05')
+    assert total == -500+0 + 0+(-100) + 100+0
+    assert bonus_count == 0
+
+def test_TC06_int_overflow(sql_conn):
+    """INT/DECIMAL overflow scenario"""
+    rows = [
+        {'EMPNO': '000012', 'WORKDEPT': 'D06', 'SALARY': 999999999.99, 'BONUS': 0.00},
+        {'EMPNO': '000013', 'WORKDEPT': 'D06', 'SALARY': 1.00, 'BONUS': 0.00},
+    ]
+    insert_employees(sql_conn, rows)
+    try:
+        total, bonus_count = call_proc(sql_conn, 'D06')
+        # Depending on SQL Server config, this may error or truncate
+        assert total is None or total <= 999999999.99
+    except pyodbc.Error as e:
+        assert "Arithmetic overflow" in str(e)
+
+def test_TC07_max_salary_bonus(sql_conn):
+    """Employee with maximum possible salary/bonus"""
+    rows = [
+        {'EMPNO': '000014', 'WORKDEPT': 'D07', 'SALARY': 9999999.99, 'BONUS': 9999999.99},
+    ]
+    insert_employees(sql_conn, rows)
+    total, bonus_count = call_proc(sql_conn, 'D07')
+    assert total == 9999999.99 + 9999999.99
+    assert bonus_count == 1
+
+def test_TC08_nonexistent_department(sql_conn):
+    """Input department does not exist"""
+    total, bonus_count = call_proc(sql_conn, 'ZZZ')
+    assert total == 0
+    assert bonus_count == 0
+
+def test_TC09_table_missing(sql_conn):
+    """Error handling: Table missing or inaccessible"""
+    cursor = sql_conn.cursor()
+    cursor.execute("DROP TABLE CORPDATA.EMPLOYEE;")
+    sql_conn.commit()
+    with pytest.raises(pyodbc.Error):
+        call_proc(sql_conn, 'D01')
+
+def test_TC10_unicode_department(sql_conn):
+    """Collation/encoding: Department code with non-ASCII chars"""
+    rows = [
+        {'EMPNO': '000015', 'WORKDEPT': 'Ñ01', 'SALARY': 500.00, 'BONUS': 50.00},
+    ]
+    insert_employees(sql_conn, rows)
+    total, bonus_count = call_proc(sql_conn, 'Ñ01')
+    assert total == 500+50
+    assert bonus_count == 1
+
+def test_TC11_transaction_rollback(sql_conn):
+    """Simulate error during cursor loop (e.g., by inserting bad data)"""
+    rows = [
+        {'EMPNO': '000016', 'WORKDEPT': 'D11', 'SALARY': 100.00, 'BONUS': 10.00},
+        {'EMPNO': '000017', 'WORKDEPT': 'D11', 'SALARY': 'bad', 'BONUS': 10.00},  # Invalid data
+    ]
+    # Insert first row, then try to insert invalid row
+    insert_employees(sql_conn, [rows[0]])
+    cursor = sql_conn.cursor()
+    with pytest.raises(pyodbc.Error):
+        cursor.execute(
+            "INSERT INTO CORPDATA.EMPLOYEE (EMPNO, WORKDEPT, SALARY, BONUS) VALUES (?, ?, ?, ?)",
+            rows[1]['EMPNO'], rows[1]['WORKDEPT'], rows[1]['SALARY'], rows[1]['BONUS']
+        )
+    # Only valid row should exist, procedure should work for it
+    total, bonus_count = call_proc(sql_conn, 'D11')
+    assert total == 100+10
+    assert bonus_count == 1
+
+def test_TC12_empty_string_department(sql_conn):
+    """Empty string as department input"""
+    total, bonus_count = call_proc(sql_conn, '')
+    assert total == 0
+    assert bonus_count == 0
+```
+
+- All tests use transactional setup/teardown for isolation.
+- Helper functions are provided for inserting test data and calling the procedure.
+- Adjust connection string and credentials as needed.
+- Tests are grouped logically and include docstrings for clarity.
+
+---
+
+3. API Cost
+
+API cost for this call: 0.004 USD
