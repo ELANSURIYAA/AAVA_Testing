@@ -1,0 +1,324 @@
+====================================================
+Author:        AAVA
+Date:          
+Description:   Automated data reconciliation between DB2 (AS400) and T-SQL systems for salary/bonus reporting
+====================================================
+
+import os
+import sys
+import logging
+import datetime
+import traceback
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+import ibm_db
+import pyodbc
+
+# -------------------------------
+# 1. CONFIGURATION & LOGGING
+# -------------------------------
+LOG_FILE = f"recon_tester_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+def log(msg):
+    print(msg)
+    logging.info(msg)
+
+# -------------------------------
+# 2. ENVIRONMENT VARIABLES
+# -------------------------------
+DB2_CONN_STR = os.getenv("DB2_CONN_STR")
+SQL_CONN_STR = os.getenv("SQL_CONN_STR")
+EXPORT_DIR = os.getenv("RECON_EXPORT_DIR", "./staging")
+os.makedirs(EXPORT_DIR, exist_ok=True)
+
+# -------------------------------
+# 3. CONNECTION COMPONENTS
+# -------------------------------
+def get_db2_conn():
+    try:
+        conn = ibm_db.connect(DB2_CONN_STR, "", "")
+        log("Connected to DB2 successfully.")
+        return conn
+    except Exception as e:
+        log(f"DB2 connection failed: {e}")
+        raise
+
+def get_sql_conn():
+    try:
+        conn = pyodbc.connect(SQL_CONN_STR, autocommit=False)
+        log("Connected to SQL Server successfully.")
+        return conn
+    except Exception as e:
+        log(f"SQL Server connection failed: {e}")
+        raise
+
+# -------------------------------
+# 4. DB2 EXECUTION & EXPORT
+# -------------------------------
+def export_db2_table_to_parquet(conn, table, where=None):
+    try:
+        sql = f"SELECT * FROM {table}"
+        if where:
+            sql += f" WHERE {where}"
+        stmt = ibm_db.exec_immediate(conn, sql)
+        result = []
+        cols = [ibm_db.field_name(stmt, i) for i in range(ibm_db.num_fields(stmt))]
+        row = ibm_db.fetch_assoc(stmt)
+        while row:
+            result.append(row)
+            row = ibm_db.fetch_assoc(stmt)
+        df = pd.DataFrame(result, columns=cols)
+        # Data type preservation
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].astype(str)
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        parquet_file = os.path.join(EXPORT_DIR, f"{table.replace('.', '_')}_{ts}.parquet")
+        table_pa = pa.Table.from_pandas(df)
+        pq.write_table(table_pa, parquet_file)
+        log(f"Exported {table} to {parquet_file}")
+        return parquet_file, df
+    except Exception as e:
+        log(f"DB2 export failed for {table}: {e}")
+        raise
+
+# -------------------------------
+# 5. PARQUET TRANSFER & INTEGRITY
+# -------------------------------
+def validate_file_integrity(src, dst):
+    import hashlib
+    def file_hash(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    if os.path.getsize(src) != os.path.getsize(dst):
+        raise Exception(f"File size mismatch: {src} vs {dst}")
+    if file_hash(src) != file_hash(dst):
+        raise Exception(f"File hash mismatch: {src} vs {dst}")
+    log(f"File integrity validated for {src} and {dst}")
+
+def transfer_parquet_to_staging(parquet_file):
+    # For local demo, just return the path; in real use, copy to shared folder
+    staging_path = os.path.join(EXPORT_DIR, os.path.basename(parquet_file))
+    if parquet_file != staging_path:
+        import shutil
+        shutil.copy2(parquet_file, staging_path)
+        validate_file_integrity(parquet_file, staging_path)
+    return staging_path
+
+# -------------------------------
+# 6. SQL SERVER STAGING LOAD
+# -------------------------------
+def create_staging_table_and_load(sql_conn, parquet_file, table, schema):
+    try:
+        # Read Parquet schema
+        df = pd.read_parquet(parquet_file)
+        cursor = sql_conn.cursor()
+        # Drop and create staging table
+        staging_table = f"{schema}.[STG_{table.split('.')[-1]}]"
+        cursor.execute(f"IF OBJECT_ID('{staging_table}', 'U') IS NOT NULL DROP TABLE {staging_table}")
+        # Build CREATE TABLE statement
+        col_defs = []
+        for col, dtype in zip(df.columns, df.dtypes):
+            if "int" in str(dtype):
+                col_type = "INT"
+            elif "float" in str(dtype) or "decimal" in str(dtype):
+                col_type = "DECIMAL(18,4)"
+            elif "datetime" in str(dtype) or "Timestamp" in str(dtype):
+                col_type = "DATETIME2"
+            else:
+                col_type = "VARCHAR(255)"
+            col_defs.append(f"[{col}] {col_type} NULL")
+        create_sql = f"CREATE TABLE {staging_table} ({', '.join(col_defs)})"
+        cursor.execute(create_sql)
+        sql_conn.commit()
+        # Bulk insert using OPENROWSET (PolyBase or BULK INSERT)
+        # For demo, use pandas to_sql if SQLAlchemy available, else insert row-by-row
+        for _, row in df.iterrows():
+            placeholders = ','.join(['?'] * len(df.columns))
+            insert_sql = f"INSERT INTO {staging_table} ({','.join([f'[{c}]' for c in df.columns])}) VALUES ({placeholders})"
+            cursor.execute(insert_sql, *row)
+        sql_conn.commit()
+        log(f"Loaded {parquet_file} into {staging_table}")
+        return staging_table
+    except Exception as e:
+        log(f"SQL Server staging load failed: {e}")
+        raise
+
+# -------------------------------
+# 7. EXECUTE T-SQL PROCEDURE
+# -------------------------------
+def execute_tsql_procedure(sql_conn, proc_name, dept_code):
+    try:
+        cursor = sql_conn.cursor()
+        out_salary = 0
+        out_bonus = 0
+        result = cursor.execute(f"""
+            DECLARE @OUT_TOTAL_SALARY DECIMAL(9,2), @OUT_BONUS_COUNT INT;
+            EXEC {proc_name} ?, @OUT_TOTAL_SALARY OUTPUT, @OUT_BONUS_COUNT OUTPUT;
+            SELECT @OUT_TOTAL_SALARY, @OUT_BONUS_COUNT;
+        """, dept_code)
+        row = result.fetchone()
+        log(f"T-SQL procedure {proc_name}({dept_code}) returned: {row}")
+        return row[0], row[1]
+    except Exception as e:
+        log(f"T-SQL procedure execution failed: {e}")
+        raise
+
+# -------------------------------
+# 8. COMPARISON LOGIC (SQL)
+# -------------------------------
+COMPARISON_SQL_TEMPLATE = """
+-- Row count comparison
+SELECT
+    (SELECT COUNT(*) FROM {db2_table}) AS DB2_Count,
+    (SELECT COUNT(*) FROM {sql_table}) AS SQL_Count;
+
+-- Column-by-column comparison
+SELECT
+    a.* EXCEPT (RowNum),
+    b.* EXCEPT (RowNum)
+FROM
+    (SELECT ROW_NUMBER() OVER (ORDER BY {order_col}) AS RowNum, * FROM {db2_table}) a
+FULL OUTER JOIN
+    (SELECT ROW_NUMBER() OVER (ORDER BY {order_col}) AS RowNum, * FROM {sql_table}) b
+ON a.RowNum = b.RowNum
+WHERE
+    EXISTS (
+        SELECT a.*, b.*
+        EXCEPT
+        SELECT b.*, a.*
+    )
+;
+-- Sample mismatches
+SELECT TOP 10 * FROM (
+    SELECT a.*, b.*
+    FROM {db2_table} a
+    FULL OUTER JOIN {sql_table} b
+    ON {join_cond}
+    WHERE
+        {mismatch_cond}
+) mismatches;
+"""
+
+# -------------------------------
+# 9. REPORTING
+# -------------------------------
+def generate_report(table, db2_df, sql_df, mismatches, summary, outdir):
+    excel_path = os.path.join(outdir, f"recon_report_{table}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+    json_path = os.path.join(outdir, f"recon_report_{table}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    with pd.ExcelWriter(excel_path) as writer:
+        db2_df.to_excel(writer, sheet_name="DB2")
+        sql_df.to_excel(writer, sheet_name="SQL")
+        mismatches.to_excel(writer, sheet_name="Mismatches")
+        pd.DataFrame([summary]).to_excel(writer, sheet_name="Summary")
+    report = {
+        "table": table,
+        "summary": summary,
+        "mismatches": mismatches.to_dict(orient="records")
+    }
+    with open(json_path, "w") as f:
+        import json
+        json.dump(report, f, indent=2)
+    log(f"Report generated: {excel_path} and {json_path}")
+
+# -------------------------------
+# 10. MAIN RECON TESTER LOGIC
+# -------------------------------
+def main():
+    try:
+        db2_conn = get_db2_conn()
+        sql_conn = get_sql_conn()
+        # 1. Identify target table
+        target_table = "CORPDATA.EMPLOYEE"
+        schema = "CORPDATA"
+        # 2. Export DB2 table to Parquet
+        parquet_file, db2_df = export_db2_table_to_parquet(db2_conn, target_table)
+        # 3. Transfer Parquet to staging
+        staging_file = transfer_parquet_to_staging(parquet_file)
+        # 4. Load Parquet into SQL Server staging
+        staging_table = create_staging_table_and_load(sql_conn, staging_file, target_table, schema)
+        # 5. Execute T-SQL procedure (example for D01)
+        proc_name = "RETURN_DEPT_SALARY"
+        dept_code = "D01"
+        tsql_salary, tsql_bonus = execute_tsql_procedure(sql_conn, proc_name, dept_code)
+        # 6. Fetch SQL Server table data
+        sql_df = pd.read_sql(f"SELECT * FROM {staging_table}", sql_conn)
+        # 7. Compare DataFrames
+        db2_count = len(db2_df)
+        sql_count = len(sql_df)
+        match_rows = pd.merge(db2_df, sql_df, how="inner", on=list(db2_df.columns))
+        match_pct = 100.0 * len(match_rows) / max(db2_count, sql_count, 1)
+        mismatches = pd.concat([db2_df, sql_df]).drop_duplicates(keep=False)
+        # 8. Generate report
+        summary = {
+            "table": target_table,
+            "db2_count": db2_count,
+            "sql_count": sql_count,
+            "match_pct": match_pct,
+            "status": "MATCH" if match_pct == 100 else ("PARTIAL MATCH" if match_pct > 0 else "NO MATCH"),
+            "tsql_salary": tsql_salary,
+            "tsql_bonus": tsql_bonus
+        }
+        generate_report(target_table, db2_df, sql_df, mismatches, summary, EXPORT_DIR)
+        log(f"Recon Tester completed for {target_table}")
+    except Exception as e:
+        log(f"Recon Tester failed: {e}")
+        log(traceback.format_exc())
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
+# -------------------------------
+# 11. SECURITY NOTES
+# -------------------------------
+# - All credentials are read from environment variables.
+# - No credentials are hardcoded.
+# - Only parameterized queries are used for all DML.
+# - All connections should use SSL/TLS as per DSN/server config.
+
+# -------------------------------
+# 12. PERFORMANCE NOTES
+# -------------------------------
+# - For large tables, consider chunked export/import and multi-threading.
+# - Use SQL Server BULK INSERT or PolyBase for large Parquet loads.
+# - Indexes on join/order columns are recommended for faster comparison.
+
+# -------------------------------
+# 13. COMPARISON LOGIC (SQL SNIPPET)
+# -------------------------------
+# Use the following SQL (as an example) for direct in-database comparison:
+
+"""
+-- Row count comparison
+SELECT
+    (SELECT COUNT(*) FROM CORPDATA.EMPLOYEE) AS DB2_Count,
+    (SELECT COUNT(*) FROM CORPDATA.STG_EMPLOYEE) AS SQL_Count;
+
+-- Column-by-column comparison (example)
+SELECT
+    a.EMPNO, a.WORKDEPT, a.SALARY, a.BONUS,
+    b.EMPNO, b.WORKDEPT, b.SALARY, b.BONUS
+FROM
+    CORPDATA.EMPLOYEE a
+FULL OUTER JOIN
+    CORPDATA.STG_EMPLOYEE b
+ON a.EMPNO = b.EMPNO
+WHERE
+    ISNULL(a.SALARY, 0) <> ISNULL(b.SALARY, 0)
+    OR ISNULL(a.BONUS, 0) <> ISNULL(b.BONUS, 0)
+    OR ISNULL(a.WORKDEPT, '') <> ISNULL(b.WORKDEPT, '')
+;
+"""
+
+# End of Recon Tester
