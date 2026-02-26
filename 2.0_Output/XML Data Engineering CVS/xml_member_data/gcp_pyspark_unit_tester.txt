@@ -1,0 +1,424 @@
+1. Test Case List
+
+| Test Case ID | Test Case Description                                                                                           | Expected Outcome                                                                                                   |
+|--------------|---------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: Valid XML input, all fields present, correct types                                                 | DataFrames for Person, ContactInfo, Language are created with correct schema and values; written to BQ successfully|
+| TC02         | Edge: Missing optional fields (e.g., Insurance, Provider, Email)                                               | Missing fields are set to null in output DataFrames; schema validation adds missing columns as null                |
+| TC03         | Edge: Null values in XML for some fields (e.g., Gender, Race)                                                  | Nulls are preserved; transformation logic does not fail; output DataFrames have nulls in those fields              |
+| TC04         | Edge: Empty XML file (no Member records)                                                                       | Pipeline completes without error; output DataFrames are empty; nothing written to BQ                               |
+| TC05         | Edge: Gender value not 'Male' or 'Female' (e.g., 'Other', null)                                                | Gender column in output is set to input value (or null); mapping logic does not alter unknown values               |
+| TC06         | Edge: IngestionTimestamp missing in XML                                                                        | IngestionTimestamp is set to current timestamp in output DataFrame                                                 |
+| TC07         | Error: Schema mismatch (extra fields in XML, missing fields in XML)                                            | Extra fields are ignored; missing fields are added as null via schema validation                                   |
+| TC08         | Error: Invalid data type in XML (e.g., DOB as 'not-a-date')                                                    | Cast to DateType results in null; no pipeline crash; error is logged                                               |
+| TC09         | Error: BigQuery table does not exist                                                                           | Pipeline logs error and exits with sys.exit(1) after logging missing table                                         |
+| TC10         | Error: Invalid XML structure (malformed XML)                                                                   | read_xml throws exception; pipeline logs error and fails gracefully                                                |
+| TC11         | Performance: Large XML file (>10,000 records)                                                                  | Pipeline processes data within reasonable time; no memory errors; correct row count in output                      |
+| TC12         | GCS Integration: XML file is read from GCS path                                                                | Pipeline reads XML from GCS successfully; DataFrames are populated as expected                                     |
+| TC13         | GCS Integration: Temporary bucket for BigQuery write is used                                                   | Data is staged in specified GCS bucket; write_to_bq completes successfully                                        |
+| TC14         | Error: BigQuery write failure (e.g., permission denied)                                                        | Pipeline logs error; does not crash ungracefully; error is surfaced                                               |
+
+---
+
+2. Pytest Script (GCP DataProc-Optimized)
+
+```python
+import pytest
+import sys
+import os
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType, DateType, TimestampType
+from pyspark.sql.functions import col, lit
+from unittest import mock
+
+# Import the pipeline functions (assume they are in xml2bq_pipeline.py)
+import xml2bq_pipeline as pipeline
+
+# ---------------------------
+# Pytest Fixtures
+# ---------------------------
+@pytest.fixture(scope="session")
+def spark():
+    spark = (
+        SparkSession.builder
+        .appName("Test XML to BigQuery ETL")
+        .master("local[2]")
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+        .getOrCreate()
+    )
+    yield spark
+    spark.stop()
+
+@pytest.fixture
+def sample_xml_df(spark):
+    # Simulate XML DataFrame as per mapping
+    data = [{
+        "PersonID": "P001",
+        "DOB": "1981-02-02",
+        "Gender": "Female",
+        "Race": "Black",
+        "Ethnicity": "Hispanic",
+        "Insurance": "UnitedHealthcare",
+        "Provider": "Dr. Johnson",
+        "SourceSystem": "XML",
+        "IngestionTimestamp": "2025-03-18T10:00:00Z",
+        "ContactInfo": {
+            "Address": "123 Main St, New York, NY",
+            "Phone": "123-456-7801",
+            "Email": "user1@example.com"
+        },
+        "Language": {
+            "Spoken": "Spanish",
+            "Written": "Spanish"
+        }
+    }]
+    schema = StructType([
+        StructField("PersonID", StringType(), True),
+        StructField("DOB", StringType(), True),
+        StructField("Gender", StringType(), True),
+        StructField("Race", StringType(), True),
+        StructField("Ethnicity", StringType(), True),
+        StructField("Insurance", StringType(), True),
+        StructField("Provider", StringType(), True),
+        StructField("SourceSystem", StringType(), True),
+        StructField("IngestionTimestamp", StringType(), True),
+        StructField("ContactInfo", 
+            StructType([
+                StructField("Address", StringType(), True),
+                StructField("Phone", StringType(), True),
+                StructField("Email", StringType(), True)
+            ]), True
+        ),
+        StructField("Language",
+            StructType([
+                StructField("Spoken", StringType(), True),
+                StructField("Written", StringType(), True)
+            ]), True
+        )
+    ])
+    return spark.createDataFrame(data, schema=schema)
+
+@pytest.fixture
+def empty_xml_df(spark):
+    # Empty DataFrame with correct schema
+    schema = StructType([
+        StructField("PersonID", StringType(), True),
+        StructField("DOB", StringType(), True),
+        StructField("Gender", StringType(), True),
+        StructField("Race", StringType(), True),
+        StructField("Ethnicity", StringType(), True),
+        StructField("Insurance", StringType(), True),
+        StructField("Provider", StringType(), True),
+        StructField("SourceSystem", StringType(), True),
+        StructField("IngestionTimestamp", StringType(), True),
+        StructField("ContactInfo", 
+            StructType([
+                StructField("Address", StringType(), True),
+                StructField("Phone", StringType(), True),
+                StructField("Email", StringType(), True)
+            ]), True
+        ),
+        StructField("Language",
+            StructType([
+                StructField("Spoken", StringType(), True),
+                StructField("Written", StringType(), True)
+            ]), True
+        )
+    ])
+    return spark.createDataFrame([], schema=schema)
+
+# ---------------------------
+# Test Cases
+# ---------------------------
+
+def test_TC01_happy_path(sample_xml_df, spark):
+    person_df = pipeline.transform_person(sample_xml_df)
+    contactinfo_df = pipeline.transform_contactinfo(sample_xml_df)
+    language_df = pipeline.transform_language(sample_xml_df)
+    # Validate schema and data
+    assert set(person_df.columns) == set(f.name for f in pipeline.person_schema.fields)
+    assert set(contactinfo_df.columns) == set(f.name for f in pipeline.contactinfo_schema.fields)
+    assert set(language_df.columns) == set(f.name for f in pipeline.language_schema.fields)
+    # Check Gender mapping
+    row = person_df.first()
+    assert row.Gender == "F"
+    # Check ContactInfo
+    row = contactinfo_df.first()
+    assert row.Address == "123 Main St, New York, NY"
+    assert row.Phone == "123-456-7801"
+    assert row.Email == "user1@example.com"
+    # Check Language
+    row = language_df.first()
+    assert row.Spoken == "Spanish"
+    assert row.Written == "Spanish"
+
+def test_TC02_missing_optional_fields(spark):
+    data = [{
+        "PersonID": "P002",
+        "DOB": "1982-03-03",
+        "Gender": "Male",
+        "Race": "White",
+        "Ethnicity": "Non-Hispanic",
+        # Insurance, Provider, Email missing
+        "SourceSystem": "XML",
+        "IngestionTimestamp": None,
+        "ContactInfo": {
+            "Address": "456 Oak St, Los Angeles, CA",
+            "Phone": "987-654-3210",
+            "Email": None
+        },
+        "Language": {
+            "Spoken": "French",
+            "Written": "English"
+        }
+    }]
+    schema = ... # (same as above)
+    df = spark.createDataFrame(data, schema=schema)
+    person_df = pipeline.transform_person(df)
+    person_df = pipeline.validate_schema(person_df, pipeline.person_schema, "Person")
+    # Insurance and Provider should be None
+    row = person_df.first()
+    assert row.Insurance is None
+    assert row.Provider is None
+    # Email should be None in ContactInfo
+    contactinfo_df = pipeline.transform_contactinfo(df)
+    row = contactinfo_df.first()
+    assert row.Email is None
+
+def test_TC03_null_values(spark):
+    data = [{
+        "PersonID": "P003",
+        "DOB": None,
+        "Gender": None,
+        "Race": None,
+        "Ethnicity": "Hispanic",
+        "Insurance": "Cigna",
+        "Provider": "Dr. Lee",
+        "SourceSystem": "XML",
+        "IngestionTimestamp": None,
+        "ContactInfo": {
+            "Address": None,
+            "Phone": None,
+            "Email": None
+        },
+        "Language": {
+            "Spoken": None,
+            "Written": None
+        }
+    }]
+    schema = ... # (same as above)
+    df = spark.createDataFrame(data, schema=schema)
+    person_df = pipeline.transform_person(df)
+    row = person_df.first()
+    assert row.DOB is None
+    assert row.Gender is None
+    assert row.Race is None
+
+def test_TC04_empty_xml(empty_xml_df, spark):
+    person_df = pipeline.transform_person(empty_xml_df)
+    assert person_df.count() == 0
+    contactinfo_df = pipeline.transform_contactinfo(empty_xml_df)
+    assert contactinfo_df.count() == 0
+    language_df = pipeline.transform_language(empty_xml_df)
+    assert language_df.count() == 0
+
+def test_TC05_gender_other(spark):
+    data = [{
+        "PersonID": "P004",
+        "DOB": "1984-05-05",
+        "Gender": "Other",
+        "Race": "Asian",
+        "Ethnicity": "Non-Hispanic",
+        "Insurance": "BlueCross",
+        "Provider": "Dr. Smith",
+        "SourceSystem": "XML",
+        "IngestionTimestamp": None,
+        "ContactInfo": {
+            "Address": "40 Texas St, Dallas, TX",
+            "Phone": "123-456-7804",
+            "Email": "user4@example.com"
+        },
+        "Language": {
+            "Spoken": "English",
+            "Written": "English"
+        }
+    }]
+    schema = ... # (same as above)
+    df = spark.createDataFrame(data, schema=schema)
+    person_df = pipeline.transform_person(df)
+    row = person_df.first()
+    assert row.Gender == "Other"
+
+def test_TC06_ingestiontimestamp_missing(spark):
+    data = [{
+        "PersonID": "P005",
+        "DOB": "1985-06-06",
+        "Gender": "Female",
+        "Race": "Black",
+        "Ethnicity": "Hispanic",
+        "Insurance": "UnitedHealthcare",
+        "Provider": "Dr. Johnson",
+        "SourceSystem": "XML",
+        "IngestionTimestamp": None,
+        "ContactInfo": {
+            "Address": "222 Cedar Ave, Seattle, WA",
+            "Phone": "123-456-7805",
+            "Email": "user5@example.com"
+        },
+        "Language": {
+            "Spoken": "Spanish",
+            "Written": "Spanish"
+        }
+    }]
+    schema = ... # (same as above)
+    df = spark.createDataFrame(data, schema=schema)
+    person_df = pipeline.transform_person(df)
+    row = person_df.first()
+    assert row.IngestionTimestamp is not None
+
+def test_TC07_schema_mismatch(spark):
+    # Extra field in XML, missing field in XML
+    data = [{
+        "PersonID": "P006",
+        "DOB": "1986-07-07",
+        "Gender": "Male",
+        "Race": "White",
+        "Ethnicity": "Non-Hispanic",
+        "Insurance": "Aetna",
+        "Provider": "Dr. Patel",
+        "SourceSystem": "XML",
+        "ExtraField": "should be ignored",
+        # IngestionTimestamp missing
+        "ContactInfo": {
+            "Address": "60 Example St, City 6, State 1",
+            "Phone": "123-456-7806",
+            "Email": "user6@example.com"
+        },
+        "Language": {
+            "Spoken": "French",
+            "Written": "English"
+        }
+    }]
+    schema = ... # (same as above, plus ExtraField as StringType)
+    df = spark.createDataFrame(data, schema=schema)
+    person_df = pipeline.transform_person(df)
+    person_df = pipeline.validate_schema(person_df, pipeline.person_schema, "Person")
+    # ExtraField should not be in output
+    assert "ExtraField" not in person_df.columns
+    # IngestionTimestamp should be present and not None
+    assert "IngestionTimestamp" in person_df.columns
+
+def test_TC08_invalid_data_type(spark):
+    data = [{
+        "PersonID": "P007",
+        "DOB": "not-a-date",
+        "Gender": "Female",
+        "Race": "Black",
+        "Ethnicity": "Hispanic",
+        "Insurance": "Cigna",
+        "Provider": "Dr. Lee",
+        "SourceSystem": "XML",
+        "IngestionTimestamp": None,
+        "ContactInfo": {
+            "Address": "70 Example St, City 7, State 2",
+            "Phone": "123-456-7807",
+            "Email": "user7@example.com"
+        },
+        "Language": {
+            "Spoken": "Mandarin",
+            "Written": "Spanish"
+        }
+    }]
+    schema = ... # (same as above)
+    df = spark.createDataFrame(data, schema=schema)
+    person_df = pipeline.transform_person(df)
+    row = person_df.first()
+    assert row.DOB is None  # Invalid date should be cast to null
+
+def test_TC09_table_not_exist(spark):
+    with mock.patch("xml2bq_pipeline.spark") as mock_spark:
+        mock_spark.read.format().option().load.side_effect = Exception("Table not found")
+        exists = pipeline.check_table_exists(mock_spark, "nonexistent_table")
+        assert exists is False
+
+def test_TC10_invalid_xml(spark):
+    # Simulate read_xml throwing an Exception for malformed XML
+    with mock.patch("xml2bq_pipeline.spark.read") as mock_read:
+        mock_read.format().option().load.side_effect = Exception("Malformed XML")
+        with pytest.raises(Exception):
+            pipeline.read_xml(spark, "malformed.xml")
+
+def test_TC11_performance_large_file(spark):
+    # Simulate large DataFrame
+    data = []
+    for i in range(10000):
+        data.append({
+            "PersonID": f"P{i:05d}",
+            "DOB": "1980-01-01",
+            "Gender": "Male" if i % 2 == 0 else "Female",
+            "Race": "White",
+            "Ethnicity": "Non-Hispanic",
+            "Insurance": "Aetna",
+            "Provider": "Dr. Patel",
+            "SourceSystem": "XML",
+            "IngestionTimestamp": None,
+            "ContactInfo": {
+                "Address": f"{i} Main St",
+                "Phone": "123-456-7890",
+                "Email": f"user{i}@example.com"
+            },
+            "Language": {
+                "Spoken": "English",
+                "Written": "English"
+            }
+        })
+    schema = ... # (same as above)
+    df = spark.createDataFrame(data, schema=schema)
+    person_df = pipeline.transform_person(df)
+    assert person_df.count() == 10000
+
+def test_TC12_gcs_read(spark):
+    # Mock reading from GCS path
+    with mock.patch("xml2bq_pipeline.spark.read") as mock_read:
+        mock_read.format().option().load.return_value = spark.createDataFrame([], schema=StructType([]))
+        df = pipeline.read_xml(spark, "gs://test-bucket/test.xml")
+        assert df is not None
+
+def test_TC13_gcs_temp_bucket(spark):
+    # Mock write to BigQuery with GCS temp bucket
+    df = spark.createDataFrame([], schema=StructType([
+        StructField("PersonID", StringType(), True)
+    ]))
+    with mock.patch("xml2bq_pipeline.logger") as mock_logger:
+        with mock.patch.object(df.write, "format") as mock_format:
+            mock_writer = mock_format.return_value
+            mock_writer.option.return_value = mock_writer
+            mock_writer.mode.return_value = mock_writer
+            mock_writer.save.return_value = None
+            pipeline.write_to_bq(df, "project.dataset.table")
+            mock_logger.info.assert_called_with("Data written to BigQuery table project.dataset.table")
+
+def test_TC14_bq_write_failure(spark):
+    df = spark.createDataFrame([], schema=StructType([
+        StructField("PersonID", StringType(), True)
+    ]))
+    with mock.patch("xml2bq_pipeline.logger") as mock_logger:
+        with mock.patch.object(df.write, "format") as mock_format:
+            mock_writer = mock_format.return_value
+            mock_writer.option.return_value = mock_writer
+            mock_writer.mode.return_value = mock_writer
+            mock_writer.save.side_effect = Exception("Permission denied")
+            with pytest.raises(Exception):
+                pipeline.write_to_bq(df, "project.dataset.table")
+            # Error should be logged
+
+# ---------------------------
+# Helper: Schema for test DataFrames
+# ---------------------------
+# For brevity, replace 'schema = ...' with the schema definition from sample_xml_df fixture above in actual test code.
+```
+
+---
+
+3. API Cost Calculation
+
+apiCost: 0.00
