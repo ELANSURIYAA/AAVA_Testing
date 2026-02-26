@@ -1,0 +1,236 @@
+====================================================
+Author:        AAVA
+Date:          
+Description:   Returns total salary and bonus count for a department
+====================================================
+
+## Syntax Differences
+
+| # | DB2 Syntax                                                                                 | T-SQL Syntax (Converted)                                                                                  |
+|---|-------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| 1 | Procedure header: `CREATE PROCEDURE ... (IN/OUT params)`                                  | `CREATE OR ALTER PROCEDURE ... @params TYPE OUTPUT`                                                      |
+| 2 | Parameter declaration: `IN DEPT_NUMBER CHAR(3), OUT DEPT_SALARY DECIMAL(15,2)`            | `@IN_DEPT CHAR(3), @OUT_TOTAL_SALARY DECIMAL(9,2) OUTPUT`                                                |
+| 3 | Variable declaration: `DECLARE EMPLOYEE_SALARY DECIMAL(9,2);`                             | `DECLARE @EMP_SALARY DECIMAL(9,2);`                                                                      |
+| 4 | Cursor declaration: `DECLARE C1 CURSOR FOR ...`                                           | `DECLARE employee_cursor CURSOR FOR ...`                                                                  |
+| 5 | Cursor open/fetch: `OPEN C1; FETCH C1 INTO ...;`                                          | `OPEN employee_cursor; FETCH NEXT FROM employee_cursor INTO ...;`                                         |
+| 6 | Loop: `WHILE END_TABLE = 0 DO ... END WHILE;`                                             | `WHILE @@FETCH_STATUS = 0 BEGIN ... END`                                                                 |
+| 7 | Handler: `DECLARE CONTINUE HANDLER FOR NOT FOUND ...`                                     | T-SQL does not support handlers; uses `@@FETCH_STATUS` and `TRY...CATCH`                                 |
+| 8 | Handler: `DECLARE EXIT HANDLER FOR SQLEXCEPTION ...`                                      | T-SQL uses `TRY...CATCH` for error handling                                                              |
+| 9 | Block label: `P1: BEGIN ... END P1`                                                       | T-SQL does not use block labels                                                                          |
+|10 | Conditional: `IF EMPLOYEE_BONUS > 0 THEN ... END IF;`                                     | `IF ISNULL(@EMP_BONUS, 0) > 0 BEGIN ... END`                                                             |
+|11 | SET statements: `SET TOTAL_SALARY = ...`                                                  | `SET @OUT_TOTAL_SALARY = ...`                                                                            |
+|12 | NULL handling: None explicit in DB2                                                       | T-SQL uses `ISNULL()` for NULL handling                                                                  |
+|13 | Output assignment: `SET DEPT_SALARY = TOTAL_SALARY;`                                      | `SET @OUT_TOTAL_SALARY = ...`                                                                            |
+|14 | Procedure end: `END P1`                                                                   | `END`                                                                                                    |
+
+Total Syntax Differences Identified: 14
+
+---
+
+## Test Case Document
+
+| Test Case ID | Description                                                                                       | Preconditions                                  | Test Steps                                                                                                 | Expected Result                                                                                          | Actual Result | Pass/Fail Status |
+|--------------|--------------------------------------------------------------------------------------------------|------------------------------------------------|------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|---------------|------------------|
+| TC01         | Happy path: Department with multiple employees, all with non-null salary and bonus                | Employee table exists, dept D01 has 3 employees| Insert 3 employees in D01, call procedure with D01                                                        | Correct sum of salaries+bonuses, correct count of employees with bonus > 0                               |               |                  |
+| TC02         | Department with some employees having NULL salary or bonus                                        | Employee table exists, dept D02 has 3 employees| Insert employees with NULL salary/bonus in D02, call procedure with D02                                   | NULLs treated as 0 in sum, bonus count increments only if bonus > 0                                      |               |                  |
+| TC03         | Department with no employees                                                                      | Employee table exists, dept D03 empty          | Call procedure with D03                                                                                   | Output total salary = 0, bonus count = 0                                                                 |               |                  |
+| TC04         | Department with all bonuses = 0                                                                   | Employee table exists, dept D04 has 2 employees| Insert employees with bonus = 0 in D04, call procedure with D04                                           | Bonus count = 0, total salary is sum of salaries and bonuses                                             |               |                  |
+| TC05         | Department with negative/zero salary or bonus                                                     | Employee table exists, dept D05 has 3 employees| Insert employees with negative/zero salary/bonus in D05, call procedure with D05                          | Negative/zero values included in sum, bonus count increments only for bonus > 0                          |               |                  |
+| TC06         | INT overflow: Salaries/bonuses sum to more than DECIMAL(9,2) max                                  | Employee table exists, dept D06 has 2 employees| Insert employees with large salary/bonus in D06, call procedure with D06                                  | Procedure should error or output max possible value (test for overflow handling)                         |               |                  |
+| TC07         | Edge: Employee with maximum possible salary/bonus                                                 | Employee table exists, dept D07 has 1 employee | Insert employee with max salary/bonus in D07, call procedure with D07                                     | Output reflects correct handling of DECIMAL(9,2) boundary                                                |               |                  |
+| TC08         | Input department does not exist                                                                   | Employee table exists                          | Call procedure with non-existent department                                                              | Output total salary = 0, bonus count = 0                                                                 |               |                  |
+| TC09         | Error handling: Table missing or inaccessible                                                     | Employee table missing                         | Drop employee table, call procedure                                                                      | Procedure raises error, output parameters remain as initialized                                           |               |                  |
+| TC10         | Collation/encoding: Department code with non-ASCII chars                                          | Employee table exists, dept Ñ01 has 1 employee | Insert employee with dept code Ñ01, call procedure with Ñ01                                               | Procedure works correctly with Unicode input                                                             |               |                  |
+| TC11         | Transaction rollback: Simulate error during cursor loop                                           | Employee table exists, dept D11 has 2 employees| Insert valid and invalid employee in D11, call procedure with D11                                         | Output parameters remain as last assigned, or transaction is rolled back (if TRY...CATCH is implemented) |               |                  |
+| TC12         | Empty string as department input                                                                  | Employee table exists                          | Call procedure with empty string                                                                         | Output total salary = 0, bonus count = 0                                                                 |               |                  |
+
+---
+
+## Pytest Script for Each Test Case
+
+```python
+import pytest
+import pyodbc
+
+CONN_STR = (
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=localhost;DATABASE=TestDB;UID=sa;PWD=YourStrong!Passw0rd"
+)
+
+@pytest.fixture(scope="module")
+def sql_conn():
+    conn = pyodbc.connect(CONN_STR, autocommit=False)
+    yield conn
+    conn.close()
+
+@pytest.fixture(autouse=True)
+def setup_teardown(sql_conn):
+    cursor = sql_conn.cursor()
+    cursor.execute("""
+        IF OBJECT_ID('CORPDATA.EMPLOYEE', 'U') IS NOT NULL DROP TABLE CORPDATA.EMPLOYEE;
+        IF SCHEMA_ID('CORPDATA') IS NULL EXEC('CREATE SCHEMA CORPDATA');
+        CREATE TABLE CORPDATA.EMPLOYEE (
+            EMPNO CHAR(6) PRIMARY KEY,
+            WORKDEPT CHAR(3),
+            SALARY DECIMAL(9,2) NULL,
+            BONUS DECIMAL(9,2) NULL
+        );
+    """)
+    sql_conn.commit()
+    yield
+    cursor.execute("DROP TABLE IF EXISTS CORPDATA.EMPLOYEE;")
+    sql_conn.commit()
+
+def call_proc(conn, dept):
+    cursor = conn.cursor()
+    result = cursor.execute("""
+        DECLARE @OUT_TOTAL_SALARY DECIMAL(9,2), @OUT_BONUS_COUNT INT;
+        EXEC RETURN_DEPT_SALARY ?, @OUT_TOTAL_SALARY OUTPUT, @OUT_BONUS_COUNT OUTPUT;
+        SELECT @OUT_TOTAL_SALARY, @OUT_BONUS_COUNT;
+    """, dept)
+    row = result.fetchone()
+    return row[0], row[1]
+
+def insert_employees(conn, rows):
+    cursor = conn.cursor()
+    for row in rows:
+        cursor.execute(
+            "INSERT INTO CORPDATA.EMPLOYEE (EMPNO, WORKDEPT, SALARY, BONUS) VALUES (?, ?, ?, ?)",
+            row['EMPNO'], row['WORKDEPT'], row['SALARY'], row['BONUS']
+        )
+    conn.commit()
+
+def test_TC01_happy_path(sql_conn):
+    rows = [
+        {'EMPNO': '000001', 'WORKDEPT': 'D01', 'SALARY': 1000.00, 'BONUS': 100.00},
+        {'EMPNO': '000002', 'WORKDEPT': 'D01', 'SALARY': 2000.00, 'BONUS': 200.00},
+        {'EMPNO': '000003', 'WORKDEPT': 'D01', 'SALARY': 3000.00, 'BONUS': 0.00},
+    ]
+    insert_employees(sql_conn, rows)
+    total, bonus_count = call_proc(sql_conn, 'D01')
+    assert total == 1000+100 + 2000+200 + 3000+0
+    assert bonus_count == 2
+
+def test_TC02_null_salary_bonus(sql_conn):
+    rows = [
+        {'EMPNO': '000004', 'WORKDEPT': 'D02', 'SALARY': None, 'BONUS': 50.00},
+        {'EMPNO': '000005', 'WORKDEPT': 'D02', 'SALARY': 1500.00, 'BONUS': None},
+        {'EMPNO': '000006', 'WORKDEPT': 'D02', 'SALARY': None, 'BONUS': None},
+    ]
+    insert_employees(sql_conn, rows)
+    total, bonus_count = call_proc(sql_conn, 'D02')
+    assert total == 0+50 + 1500+0 + 0+0
+    assert bonus_count == 1
+
+def test_TC03_no_employees(sql_conn):
+    total, bonus_count = call_proc(sql_conn, 'D03')
+    assert total == 0
+    assert bonus_count == 0
+
+def test_TC04_all_bonuses_zero(sql_conn):
+    rows = [
+        {'EMPNO': '000007', 'WORKDEPT': 'D04', 'SALARY': 1200.00, 'BONUS': 0.00},
+        {'EMPNO': '000008', 'WORKDEPT': 'D04', 'SALARY': 1300.00, 'BONUS': 0.00},
+    ]
+    insert_employees(sql_conn, rows)
+    total, bonus_count = call_proc(sql_conn, 'D04')
+    assert total == 1200+0 + 1300+0
+    assert bonus_count == 0
+
+def test_TC05_negative_zero_salary_bonus(sql_conn):
+    rows = [
+        {'EMPNO': '000009', 'WORKDEPT': 'D05', 'SALARY': -500.00, 'BONUS': 0.00},
+        {'EMPNO': '000010', 'WORKDEPT': 'D05', 'SALARY': 0.00, 'BONUS': -100.00},
+        {'EMPNO': '000011', 'WORKDEPT': 'D05', 'SALARY': 100.00, 'BONUS': 0.00},
+    ]
+    insert_employees(sql_conn, rows)
+    total, bonus_count = call_proc(sql_conn, 'D05')
+    assert total == -500+0 + 0+(-100) + 100+0
+    assert bonus_count == 0
+
+def test_TC06_int_overflow(sql_conn):
+    rows = [
+        {'EMPNO': '000012', 'WORKDEPT': 'D06', 'SALARY': 999999999.99, 'BONUS': 0.00},
+        {'EMPNO': '000013', 'WORKDEPT': 'D06', 'SALARY': 1.00, 'BONUS': 0.00},
+    ]
+    insert_employees(sql_conn, rows)
+    try:
+        total, bonus_count = call_proc(sql_conn, 'D06')
+        assert total is None or total <= 999999999.99
+    except pyodbc.Error as e:
+        assert "Arithmetic overflow" in str(e)
+
+def test_TC07_max_salary_bonus(sql_conn):
+    rows = [
+        {'EMPNO': '000014', 'WORKDEPT': 'D07', 'SALARY': 9999999.99, 'BONUS': 9999999.99},
+    ]
+    insert_employees(sql_conn, rows)
+    total, bonus_count = call_proc(sql_conn, 'D07')
+    assert total == 9999999.99 + 9999999.99
+    assert bonus_count == 1
+
+def test_TC08_nonexistent_department(sql_conn):
+    total, bonus_count = call_proc(sql_conn, 'ZZZ')
+    assert total == 0
+    assert bonus_count == 0
+
+def test_TC09_table_missing(sql_conn):
+    cursor = sql_conn.cursor()
+    cursor.execute("DROP TABLE CORPDATA.EMPLOYEE;")
+    sql_conn.commit()
+    with pytest.raises(pyodbc.Error):
+        call_proc(sql_conn, 'D01')
+
+def test_TC10_unicode_department(sql_conn):
+    rows = [
+        {'EMPNO': '000015', 'WORKDEPT': 'Ñ01', 'SALARY': 500.00, 'BONUS': 50.00},
+    ]
+    insert_employees(sql_conn, rows)
+    total, bonus_count = call_proc(sql_conn, 'Ñ01')
+    assert total == 500+50
+    assert bonus_count == 1
+
+def test_TC11_transaction_rollback(sql_conn):
+    rows = [
+        {'EMPNO': '000016', 'WORKDEPT': 'D11', 'SALARY': 100.00, 'BONUS': 10.00},
+        {'EMPNO': '000017', 'WORKDEPT': 'D11', 'SALARY': 'bad', 'BONUS': 10.00},
+    ]
+    insert_employees(sql_conn, [rows[0]])
+    cursor = sql_conn.cursor()
+    with pytest.raises(pyodbc.Error):
+        cursor.execute(
+            "INSERT INTO CORPDATA.EMPLOYEE (EMPNO, WORKDEPT, SALARY, BONUS) VALUES (?, ?, ?, ?)",
+            rows[1]['EMPNO'], rows[1]['WORKDEPT'], rows[1]['SALARY'], rows[1]['BONUS']
+        )
+    total, bonus_count = call_proc(sql_conn, 'D11')
+    assert total == 100+10
+    assert bonus_count == 1
+
+def test_TC12_empty_string_department(sql_conn):
+    total, bonus_count = call_proc(sql_conn, '')
+    assert total == 0
+    assert bonus_count == 0
+
+# Performance Comparison Test
+import time
+
+def test_performance_comparison(sql_conn):
+    rows = [
+        {'EMPNO': f'{i:06}', 'WORKDEPT': 'PERF', 'SALARY': 1000.00, 'BONUS': 100.00}
+        for i in range(1000)
+    ]
+    insert_employees(sql_conn, rows)
+    start = time.time()
+    total, bonus_count = call_proc(sql_conn, 'PERF')
+    duration = time.time() - start
+    assert total == 1000 * (1000.00 + 100.00)
+    assert bonus_count == 1000
+    assert duration < 2.0  # Example threshold for performance
+
+```
+
+---
+
+## API Cost
+
+API cost for this call: 0.004 USD
