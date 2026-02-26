@@ -1,0 +1,218 @@
+# PySpark Pipeline for Ingesting XML Data into BigQuery
+
+```python
+import sys
+import logging
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit, when, current_timestamp
+from pyspark.sql.types import StructType, StructField, StringType, DateType, TimestampType
+
+# ---------------------------
+# CONFIGURATIONS
+# ---------------------------
+# These should be set via environment variables or config files in production
+XML_SOURCE_PATH = "<XML_SOURCE_PATH>"  # e.g., "gs://your-bucket/xml_member_data.xml"
+TEMP_BUCKET = "<TEMP_BUCKET>"          # e.g., "gs://your-temp-bucket/pyspark-staging/"
+BQ_PROJECT = "<BQ_PROJECT>"            # e.g., "your-gcp-project"
+BQ_DATASET = "<BQ_DATASET>"            # e.g., "your_dataset"
+BQ_PERSON_TABLE = "Person"
+BQ_CONTACTINFO_TABLE = "ContactInfo"
+BQ_LANGUAGE_TABLE = "Language"
+BQ_PERSON_FQN = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_PERSON_TABLE}"
+BQ_CONTACTINFO_FQN = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_CONTACTINFO_TABLE}"
+BQ_LANGUAGE_FQN = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_LANGUAGE_TABLE}"
+
+# ---------------------------
+# LOGGING SETUP
+# ---------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("XML2BigQueryPipeline")
+
+# ---------------------------
+# SPARK SESSION INIT
+# ---------------------------
+def get_spark():
+    spark = (
+        SparkSession.builder
+        .appName("XML to BigQuery ETL")
+        .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+        .config("temporaryGcsBucket", TEMP_BUCKET.replace("gs://", ""))
+        .getOrCreate()
+    )
+    return spark
+
+# ---------------------------
+# SCHEMA DEFINITIONS
+# ---------------------------
+person_schema = StructType([
+    StructField("PersonID", StringType(), True),
+    StructField("DOB", DateType(), True),
+    StructField("Gender", StringType(), True),
+    StructField("Race", StringType(), True),
+    StructField("Ethnicity", StringType(), True),
+    StructField("Insurance", StringType(), True),
+    StructField("Provider", StringType(), True),
+    StructField("SourceSystem", StringType(), True),
+    StructField("IngestionTimestamp", TimestampType(), True)
+])
+
+contactinfo_schema = StructType([
+    StructField("PersonID", StringType(), True),
+    StructField("Address", StringType(), True),
+    StructField("Phone", StringType(), True),
+    StructField("Email", StringType(), True)
+])
+
+language_schema = StructType([
+    StructField("PersonID", StringType(), True),
+    StructField("Spoken", StringType(), True),
+    StructField("Written", StringType(), True)
+])
+
+# ---------------------------
+# XML READING FUNCTION
+# ---------------------------
+def read_xml(spark, xml_path):
+    # The XML structure is not standard; you may need to preprocess or use a custom parser.
+    # For this example, we assume the XML is well-formed and can be read with the Databricks XML package.
+    df = (
+        spark.read.format("com.databricks.spark.xml")
+        .option("rowTag", "Member")
+        .load(xml_path)
+    )
+    return df
+
+# ---------------------------
+# DATA TRANSFORMATION FUNCTIONS
+# ---------------------------
+def transform_person(df):
+    # Map and transform fields as per mapping
+    return (
+        df.withColumn("Gender", when(col("Gender") == "Male", lit("M"))
+                                 .when(col("Gender") == "Female", lit("F"))
+                                 .otherwise(col("Gender")))
+          .withColumn("IngestionTimestamp", when(col("IngestionTimestamp").isNull(), current_timestamp()).otherwise(col("IngestionTimestamp")))
+          .select(
+              col("PersonID").cast(StringType()),
+              col("DOB").cast(DateType()),
+              col("Gender").cast(StringType()),
+              col("Race").cast(StringType()),
+              col("Ethnicity").cast(StringType()),
+              col("Insurance").cast(StringType()),
+              col("Provider").cast(StringType()),
+              col("SourceSystem").cast(StringType()),
+              col("IngestionTimestamp").cast(TimestampType())
+          )
+    )
+
+def transform_contactinfo(df):
+    return (
+        df.select(
+            col("PersonID").cast(StringType()),
+            col("ContactInfo.Address").alias("Address").cast(StringType()),
+            col("ContactInfo.Phone").alias("Phone").cast(StringType()),
+            col("ContactInfo.Email").alias("Email").cast(StringType())
+        )
+    )
+
+def transform_language(df):
+    return (
+        df.select(
+            col("PersonID").cast(StringType()),
+            col("Language.Spoken").alias("Spoken").cast(StringType()),
+            col("Language.Written").alias("Written").cast(StringType())
+        )
+    )
+
+# ---------------------------
+# SCHEMA VALIDATION
+# ---------------------------
+def validate_schema(df, schema, table_name):
+    df_fields = set(df.schema.fieldNames())
+    schema_fields = set([f.name for f in schema.fields])
+    missing = schema_fields - df_fields
+    if missing:
+        logger.warning(f"Missing fields in {table_name}: {missing}")
+        for field in missing:
+            df = df.withColumn(field, lit(None).cast(schema[field].dataType))
+    # Only keep columns defined in schema
+    return df.select([col(f.name) for f in schema.fields])
+
+# ---------------------------
+# CHECK IF TARGET TABLE EXISTS
+# ---------------------------
+def check_table_exists(spark, table_fqn):
+    try:
+        spark.read.format("bigquery").option("table", table_fqn).load().limit(1)
+        return True
+    except Exception as e:
+        logger.error(f"Table {table_fqn} does not exist or cannot be accessed: {e}")
+        return False
+
+# ---------------------------
+# WRITE TO BIGQUERY
+# ---------------------------
+def write_to_bq(df, table_fqn):
+    (
+        df.write.format("bigquery")
+        .option("table", table_fqn)
+        .option("temporaryGcsBucket", TEMP_BUCKET.replace("gs://", ""))
+        .mode("append")
+        .save()
+    )
+    logger.info(f"Data written to BigQuery table {table_fqn}")
+
+# ---------------------------
+# MAIN PIPELINE
+# ---------------------------
+def main():
+    spark = get_spark()
+    logger.info("Spark session started.")
+
+    # Read XML
+    logger.info(f"Reading XML data from {XML_SOURCE_PATH}")
+    xml_df = read_xml(spark, XML_SOURCE_PATH)
+
+    # Transformations
+    person_df = transform_person(xml_df)
+    contactinfo_df = transform_contactinfo(xml_df)
+    language_df = transform_language(xml_df)
+
+    # Schema validation
+    person_df = validate_schema(person_df, person_schema, BQ_PERSON_TABLE)
+    contactinfo_df = validate_schema(contactinfo_df, contactinfo_schema, BQ_CONTACTINFO_TABLE)
+    language_df = validate_schema(language_df, language_schema, BQ_LANGUAGE_TABLE)
+
+    # Check target tables
+    if not check_table_exists(spark, BQ_PERSON_FQN):
+        logger.error(f"Target table {BQ_PERSON_FQN} does not exist. Exiting.")
+        sys.exit(1)
+    if not check_table_exists(spark, BQ_CONTACTINFO_FQN):
+        logger.error(f"Target table {BQ_CONTACTINFO_FQN} does not exist. Exiting.")
+        sys.exit(1)
+    if not check_table_exists(spark, BQ_LANGUAGE_FQN):
+        logger.error(f"Target table {BQ_LANGUAGE_FQN} does not exist. Exiting.")
+        sys.exit(1)
+
+    # Write to BigQuery via temporary GCS bucket
+    write_to_bq(person_df, BQ_PERSON_FQN)
+    write_to_bq(contactinfo_df, BQ_CONTACTINFO_FQN)
+    write_to_bq(language_df, BQ_LANGUAGE_FQN)
+
+    logger.info("Pipeline completed successfully.")
+
+if __name__ == "__main__":
+    main()
+```
+
+# Notes:
+- Replace `<XML_SOURCE_PATH>`, `<TEMP_BUCKET>`, `<BQ_PROJECT>`, `<BQ_DATASET>` with your actual values.
+- This script assumes the use of the Databricks XML package for Spark (`com.databricks.spark.xml`). If your XML is not standard, you may need to preprocess or flatten it before loading.
+- The pipeline is modular, fault-tolerant, and validates schema before writing.
+- Logging is used for operational visibility and error handling.
+- Data is staged in a temporary GCS bucket before loading into BigQuery.
+- The pipeline only appends data and does not alter target table schemas.
+- Handles gender mapping, missing/null fields, and data type conversions as specified.
+
+---
+apiCost: 0.00
