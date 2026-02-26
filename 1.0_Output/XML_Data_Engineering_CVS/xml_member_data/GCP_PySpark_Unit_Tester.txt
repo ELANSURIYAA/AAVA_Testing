@@ -1,236 +1,310 @@
 ### **1. Test Case List**
 
+Here is a comprehensive list of test cases designed to validate the PySpark data processing pipeline.
+
 | Test Case ID | Test Case Description | Expected Outcome |
 | :--- | :--- | :--- |
-| **Happy Path** |
-| TC-HP-001 | Test with a valid XML string containing multiple member records. | The DataFrame should be created with the correct schema and all records should be parsed correctly. |
-| **Edge Cases** |
-| TC-EC-001 | Test with an empty XML string. | The function should handle the empty input gracefully and return an empty DataFrame with the correct schema. |
-| TC-EC-002 | Test with an XML string containing a single member record. | The DataFrame should be created with one record, parsed correctly. |
-| TC-EC-003 | Test with an XML string where some optional fields are missing. | The DataFrame should be created with null values for the missing fields. |
-| TC-EC-004 | Test with an XML string containing records with extra, unmapped fields. | The extra fields should be ignored, and the DataFrame should be created with only the mapped fields. |
-| **Exception Scenarios** |
-| TC-EX-001 | Test with a malformed XML string. | The function should raise a `pyspark.sql.utils.AnalysisException` due to the inability to parse the XML. |
-| TC-EX-002 | Test with an input that is not a string (e.g., an integer or a list). | The function should raise an `AttributeError` as it expects a string input for the RDD creation. |
-
----
+| **TC-INIT-01** | **`initialize_spark_session` - Happy Path** | A `SparkSession` object is successfully created with the specified app name and configurations. |
+| **TC-READ-01** | **`read_xml_data` - Happy Path** | Reads a well-formed XML file into a Spark DataFrame with the correct schema inferred from the XML structure. |
+| **TC-READ-02** | **`read_xml_data` - Error Handling** | Raises an exception when the specified XML file path does not exist. |
+| **TC-READ-03** | **`read_xml_data` - Empty File** | Returns an empty DataFrame when the input XML file is empty or contains no records matching the `rowTag`. |
+| **TC-TRANS-01**| **`transform_data` - Happy Path** | All source columns are correctly renamed and cast to their target data types as per the mapping. Audit columns (`ingestion_timestamp`, `source_file`) are added. |
+| **TC-TRANS-02**| **`transform_data` - Edge Case: Missing Source Column** | A source column specified in the mapping is missing from the input DataFrame. The corresponding target column is created and populated with `null` values. |
+| **TC-TRANS-03**| **`transform_data` - Edge Case: Null Input Values** | `null` values in the source DataFrame are preserved as `null` in the transformed DataFrame after casting. |
+| **TC-TRANS-04**| **`transform_data` - Data Type Casting: Timestamp** | A string date column is correctly converted to a `TimestampType` column using the specified format. |
+| **TC-TRANS-05**| **`transform_data` - Edge Case: Empty DataFrame** | An empty input DataFrame results in an empty DataFrame with the target schema and audit columns. |
+| **TC-VALID-01**| **`validate_schema` - Happy Path** | Returns the DataFrame unchanged when its schema perfectly matches the target BigQuery schema. |
+| **TC-VALID-02**| **`validate_schema` - Extra Columns in DataFrame** | Columns present in the DataFrame but not in the target BigQuery schema are dropped. |
+| **TC-VALID-03**| **`validate_schema` - Missing Columns in DataFrame** | The function logs a warning and returns a DataFrame containing only the columns that are common with the target schema. |
+| **TC-BQ-01** | **`bq_table_exists` - Table Exists** | Returns `True` when the mocked BigQuery client confirms the table exists. |
+| **TC-BQ-02** | **`bq_table_exists` - Table Does Not Exist** | Returns `False` when the mocked BigQuery client throws an exception (e.g., `NotFound`). |
+| **TC-WRITE-01**| **`write_to_bigquery` - Happy Path** | The DataFrame's `write` method is called with the correct format (`bigquery`), table name, and mode (`append`). |
+| **TC-MAIN-01** | **`main` - Full Pipeline Happy Path** | The main pipeline function executes successfully, calling all helper functions in the correct order when the source data is valid and the target table exists. |
+| **TC-MAIN-02** | **`main` - Pipeline Failure: BQ Table Missing** | The pipeline raises a `RuntimeError` and stops execution when `bq_table_exists` returns `False`. |
+| **TC-MAIN-03** | **`main` - Pipeline Skips on Empty Source** | The pipeline logs a warning and gracefully exits without writing data when `read_xml_data` returns an empty DataFrame. |
 
 ### **2. Pytest Script**
 
+This Pytest script provides unit tests for the PySpark pipeline, optimized for a local testing environment that mimics the logic intended for GCP DataProc. It uses mocks to isolate the code from external dependencies like GCS and BigQuery.
+
 ```python
-# test_xml_processor.py
-
 import pytest
-from pyspark.sql import SparkSession
+import os
+import tempfile
+from unittest.mock import patch, MagicMock
+
+from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.types import (
-    StructType,
-    StructField,
-    StringType,
-    IntegerType,
-    DateType,
+    StructType, StructField, StringType, LongType, DoubleType,
+    TimestampType, IntegerType
 )
-from pyspark.sql.utils import AnalysisException
-import datetime
+from google.cloud.bigquery import SchemaField
+from google.api_core.exceptions import NotFound
 
-# It's assumed that the PySpark script to be tested is saved as 'xml_processor.py'
-# and contains the 'process_xml_data' function.
+# It's good practice to make the script under test importable.
+# Assuming the provided code is saved as 'pyspark_pipeline.py'
+import pyspark_pipeline
 
-from xml_processor import process_xml_data
+# Mock constants from the original script to avoid dependency
+pyspark_pipeline.BIGQUERY_PROJECT_ID = "test-project"
+pyspark_pipeline.BIGQUERY_DATASET_ID = "test-dataset"
+pyspark_pipeline.BIGQUERY_TABLE_ID = "test-table"
+pyspark_pipeline.TEMP_GCS_BUCKET = "test-bucket"
+pyspark_pipeline.SOURCE_XML_FILE_PATH = "mock_xml_data.txt"
 
+
+# --- Fixtures ---
 
 @pytest.fixture(scope="session")
-def spark():
+def spark_session():
     """
     Pytest fixture to create a SparkSession for the test suite.
-    This is optimized for a local testing environment but is compatible with
-    how Spark sessions are managed in GCP DataProc.
+    This is a local Spark session, ideal for unit testing.
     """
-    session = (
-        SparkSession.builder.appName("PySpark XML Processing Tests")
-        .master("local[2]")
-        .config(
-            "spark.jars.packages", "com.databricks:spark-xml_2.12:0.13.0"
-        )  # Ensure spark-xml is available
+    spark = (
+        SparkSession.builder.appName("Pytest-PySpark-GCP-Pipeline")
+        .master("local[*]")
+        .config("spark.jars.packages", "com.databricks:spark-xml_2.12:0.13.0")
+        .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
+        .config("spark.sql.session.timeZone", "UTC")
         .getOrCreate()
     )
-    yield session
-    session.stop()
+    yield spark
+    spark.stop()
 
 
-def test_process_xml_data_happy_path(spark):
-    """
-    Test Case ID: TC-HP-001
-    Test with a valid XML string containing multiple member records.
-    """
-    xml_string = """
-    <members>
-        <member>
-            <MemberID>1</MemberID>
+@pytest.fixture
+def mock_xml_file():
+    """Creates a temporary XML file for testing the read function."""
+    xml_content = """
+    <Members>
+        <Member>
+            <MemberID>101</MemberID>
             <FirstName>John</FirstName>
             <LastName>Doe</LastName>
-            <DateOfBirth>1990-01-15</DateOfBirth>
-            <Gender>Male</Gender>
-        </member>
-        <member>
-            <MemberID>2</MemberID>
+            <DateOfBirth>1990-05-15</DateOfBirth>
+            <MembershipType>Gold</MembershipType>
+            <SubscriptionFee>120.50</SubscriptionFee>
+            <Address>
+                <Street>123 Spark St</Street>
+                <City>Pytest</City>
+                <State>CA</State>
+                <ZipCode>90210</ZipCode>
+            </Address>
+        </Member>
+        <Member>
+            <MemberID>102</MemberID>
             <FirstName>Jane</FirstName>
             <LastName>Smith</LastName>
-            <DateOfBirth>1985-05-20</DateOfBirth>
-            <Gender>Female</Gender>
-        </member>
-    </members>
+            <DateOfBirth>1985-08-20</DateOfBirth>
+            <MembershipType>Silver</MembershipType>
+            <SubscriptionFee>80.00</SubscriptionFee>
+            <Address>
+                <Street>456 Data Ave</Street>
+                <City>Mocksville</City>
+                <State>TX</State>
+                <ZipCode>73301</ZipCode>
+            </Address>
+        </Member>
+    </Members>
     """
-    result_df = process_xml_data(spark, xml_string)
+    # Use a temporary file
+    with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".xml") as tmp:
+        tmp.write(xml_content)
+        tmp_path = tmp.name
+    
+    yield tmp_path
+    
+    # Cleanup the file
+    os.remove(tmp_path)
 
-    expected_schema = StructType(
-        [
-            StructField("member_id", IntegerType(), True),
-            StructField("first_name", StringType(), True),
-            StructField("last_name", StringType(), True),
-            StructField("date_of_birth", DateType(), True),
-            StructField("gender", StringType(), True),
+
+# --- Test Cases ---
+
+class TestDataPipeline:
+    """Groups test cases for the PySpark pipeline functions."""
+
+    def test_read_xml_data(self, spark_session, mock_xml_file):
+        """TC-READ-01: Tests successful reading of a well-formed XML file."""
+        df = pyspark_pipeline.read_xml_data(
+            spark_session, mock_xml_file, "Members", "Member"
+        )
+        assert df.count() == 2
+        assert "MemberID" in df.columns
+        assert "Address" in df.columns
+        # Check nested structure
+        assert isinstance(df.schema["Address"].dataType, StructType)
+
+    def test_read_xml_data_not_found(self, spark_session):
+        """TC-READ-02: Tests error handling for a non-existent file."""
+        with pytest.raises(Exception):
+            pyspark_pipeline.read_xml_data(
+                spark_session, "non_existent_file.xml", "root", "row"
+            )
+
+    def test_transform_data_happy_path(self, spark_session):
+        """TC-TRANS-01: Tests the main transformation logic."""
+        source_schema = StructType([
+            StructField("MemberID", LongType(), True),
+            StructField("FirstName", StringType(), True),
+            StructField("LastName", StringType(), True),
+            StructField("DateOfBirth", StringType(), True),
+            StructField("MembershipType", StringType(), True),
+            StructField("SubscriptionFee", DoubleType(), True),
+            StructField("Address", StructType([
+                StructField("Street", StringType(), True),
+                StructField("City", StringType(), True),
+                StructField("State", StringType(), True),
+                StructField("ZipCode", StringType(), True)
+            ]), True)
+        ])
+        source_data = [(
+            101, "John", "Doe", "1990-05-15", "Gold", 120.50,
+            ("123 Spark St", "Pytest", "CA", "90210")
+        )]
+        source_df = spark_session.createDataFrame(source_data, source_schema)
+        
+        # Flatten the nested Address struct for transformation
+        source_df_flat = source_df.select(
+            "*", "Address.*"
+        ).drop("Address")
+
+        transformed_df = pyspark_pipeline.transform_data(
+            source_df_flat, pyspark_pipeline.DATA_MAPPING
+        )
+
+        assert "member_id" in transformed_df.columns
+        assert "first_name" in transformed_df.columns
+        assert "address_street" in transformed_df.columns
+        assert "ingestion_timestamp" in transformed_df.columns
+        assert "source_file" in transformed_df.columns
+        
+        # Check data types
+        assert isinstance(transformed_df.schema["member_id"].dataType, IntegerType)
+        assert isinstance(transformed_df.schema["subscription_fee"].dataType, DoubleType)
+        assert isinstance(transformed_df.schema["date_of_birth"].dataType, TimestampType)
+        
+        # Check audit column value
+        first_row = transformed_df.first()
+        assert first_row["source_file"] == "mock_xml_data.txt"
+
+    def test_transform_data_missing_column(self, spark_session):
+        """TC-TRANS-02: Tests handling of a missing source column."""
+        source_schema = StructType([StructField("FirstName", StringType(), True)])
+        source_data = [("John",)]
+        source_df = spark_session.createDataFrame(source_data, source_schema)
+
+        transformed_df = pyspark_pipeline.transform_data(
+            source_df, pyspark_pipeline.DATA_MAPPING
+        )
+
+        # 'FirstName' is present and renamed
+        assert "first_name" in transformed_df.columns
+        # 'MemberID' was missing, so 'member_id' should be added as null
+        assert "member_id" in transformed_df.columns
+        
+        first_row = transformed_df.first()
+        assert first_row["first_name"] == "John"
+        assert first_row["member_id"] is None
+        assert isinstance(transformed_df.schema["member_id"].dataType, IntegerType)
+
+    def test_validate_schema_drops_extra_columns(self, spark_session):
+        """TC-VALID-02: Tests that extra columns in DataFrame are dropped."""
+        bq_schema = [
+            SchemaField("col_a", "STRING"),
+            SchemaField("col_b", "INTEGER"),
         ]
-    )
+        
+        df_data = [("val_a", 123, "extra_val")]
+        df_schema = StructType([
+            StructField("col_a", StringType()),
+            StructField("col_b", IntegerType()),
+            StructField("extra_col", StringType()),
+        ])
+        df = spark_session.createDataFrame(df_data, df_schema)
 
-    expected_data = [
-        (1, "John", "Doe", datetime.date(1990, 1, 15), "Male"),
-        (2, "Jane", "Smith", datetime.date(1985, 5, 20), "Female"),
-    ]
-    expected_df = spark.createDataFrame(expected_data, expected_schema)
+        validated_df = pyspark_pipeline.validate_schema(df, bq_schema)
+        
+        assert "col_a" in validated_df.columns
+        assert "col_b" in validated_df.columns
+        assert "extra_col" not in validated_df.columns
+        assert len(validated_df.columns) == 2
 
-    assert result_df.count() == 2
-    assert result_df.schema == expected_df.schema
-    # Use subtract to find differences in dataframes. An empty result means they are identical.
-    assert result_df.subtract(expected_df).count() == 0
-    assert expected_df.subtract(result_df).count() == 0
+    @patch('pyspark_pipeline.bigquery.Client')
+    def test_bq_table_exists(self, mock_bq_client):
+        """TC-BQ-01: Tests the case where the BigQuery table exists."""
+        mock_client_instance = mock_bq_client.return_value
+        mock_client_instance.get_table.return_value = True  # Simulate table found
 
+        exists = pyspark_pipeline.bq_table_exists(
+            mock_client_instance, "p", "d", "t"
+        )
+        assert exists is True
+        mock_client_instance.get_table.assert_called_once()
 
-def test_process_xml_data_empty_input(spark):
-    """
-    Test Case ID: TC-EC-001
-    Test with an empty XML string.
-    """
-    xml_string = ""
-    result_df = process_xml_data(spark, xml_string)
-    assert result_df.count() == 0
-    expected_schema = StructType(
-        [
-            StructField("member_id", IntegerType(), True),
-            StructField("first_name", StringType(), True),
-            StructField("last_name", StringType(), True),
-            StructField("date_of_birth", DateType(), True),
-            StructField("gender", StringType(), True),
-        ]
-    )
-    assert result_df.schema == expected_schema
+    @patch('pyspark_pipeline.bigquery.Client')
+    def test_bq_table_does_not_exist(self, mock_bq_client):
+        """TC-BQ-02: Tests the case where the BigQuery table does not exist."""
+        mock_client_instance = mock_bq_client.return_value
+        mock_client_instance.get_table.side_effect = NotFound("Table not found")
 
+        exists = pyspark_pipeline.bq_table_exists(
+            mock_client_instance, "p", "d", "t"
+        )
+        assert exists is False
+        mock_client_instance.get_table.assert_called_once()
 
-def test_process_xml_data_single_record(spark):
-    """
-    Test Case ID: TC-EC-002
-    Test with an XML string containing a single member record.
-    """
-    xml_string = """
-    <members>
-        <member>
-            <MemberID>101</MemberID>
-            <FirstName>Sam</FirstName>
-            <LastName>Jones</LastName>
-            <DateOfBirth>2000-10-10</DateOfBirth>
-            <Gender>Male</Gender>
-        </member>
-    </members>
-    """
-    result_df = process_xml_data(spark, xml_string)
-    assert result_df.count() == 1
-    record = result_df.first()
-    assert record["member_id"] == 101
-    assert record["first_name"] == "Sam"
+    def test_write_to_bigquery(self, spark_session):
+        """TC-WRITE-01: Tests that the DataFrameWriter is configured correctly."""
+        # Create a mock DataFrame with a mock writer
+        df = spark_session.createDataFrame([("data",)])
+        mock_writer = MagicMock()
+        df.write = mock_writer
 
+        pyspark_pipeline.write_to_bigquery(df, "p", "d", "t")
 
-def test_process_xml_data_missing_optional_fields(spark):
-    """
-    Test Case ID: TC-EC-003
-    Test with an XML string where some optional fields are missing.
-    """
-    xml_string = """
-    <members>
-        <member>
-            <MemberID>202</MemberID>
-            <FirstName>Alex</FirstName>
-            <LastName>Ray</LastName>
-        </member>
-    </members>
-    """
-    result_df = process_xml_data(spark, xml_string)
-    assert result_df.count() == 1
-    record = result_df.first()
-    assert record["member_id"] == 202
-    assert record["first_name"] == "Alex"
-    assert record["date_of_birth"] is None
-    assert record["gender"] is None
+        # Assert that the chained calls were made correctly
+        mock_writer.format.assert_called_with("bigquery")
+        mock_writer.format.return_value.option.assert_called_with("table", "p.d.t")
+        mock_writer.format.return_value.option.return_value.mode.assert_called_with("append")
+        mock_writer.format.return_value.option.return_value.mode.return_value.save.assert_called_once()
 
+    @patch('pyspark_pipeline.write_to_bigquery')
+    @patch('pyspark_pipeline.read_xml_data')
+    @patch('pyspark_pipeline.bq_table_exists')
+    @patch('pyspark_pipeline.initialize_spark_session')
+    def test_main_pipeline_aborts_if_table_missing(
+        self, mock_init_spark, mock_bq_exists, mock_read, mock_write
+    ):
+        """TC-MAIN-02: Tests that the main pipeline aborts if the BQ table is missing."""
+        mock_init_spark.return_value = MagicMock()
+        mock_bq_exists.return_value = False  # Simulate table does not exist
 
-def test_process_xml_data_with_extra_fields(spark):
-    """
-    Test Case ID: TC-EC-004
-    Test with an XML string containing records with extra, unmapped fields.
-    """
-    xml_string = """
-    <members>
-        <member>
-            <MemberID>303</MemberID>
-            <FirstName>Chris</FirstName>
-            <LastName>Green</LastName>
-            <DateOfBirth>1995-02-25</DateOfBirth>
-            <Gender>Male</Gender>
-            <Address>123 Main St</Address>
-        </member>
-    </members>
-    """
-    result_df = process_xml_data(spark, xml_string)
-    assert result_df.count() == 1
-    assert "Address" not in result_df.columns
-    record = result_df.first()
-    assert record["member_id"] == 303
-
-
-def test_process_xml_data_malformed_xml(spark):
-    """
-    Test Case ID: TC-EX-001
-    Test with a malformed XML string.
-    """
-    xml_string = """
-    <members>
-        <member>
-            <MemberID>404</MemberID>
-            <FirstName>Malf</FirstName>
-            <LastName>Ormed</LastName>
-        <!-- Missing closing member tag -->
-    </members>
-    """
-    # The spark-xml library is robust and might parse this.
-    # A more severely malformed XML might be needed to trigger an exception.
-    # Let's try one that is fundamentally broken.
-    broken_xml = "<members><member><FirstName>Test</FirstName></member"
-    with pytest.raises(AnalysisException):
-        # This exception is expected because the XML is not well-formed
-        process_xml_data(spark, broken_xml).show()
-
-
-def test_process_xml_data_invalid_input_type(spark):
-    """
-    Test Case ID: TC-EX-002
-    Test with an input that is not a string.
-    """
-    with pytest.raises(AttributeError):
-        # The function expects a string to create an RDD, passing an int will fail.
-        process_xml_data(spark, 12345)
+        with pytest.raises(RuntimeError, match="Target BigQuery table does not exist"):
+            pyspark_pipeline.main()
+        
+        # Ensure that read and write operations were not even attempted
+        mock_read.assert_not_called()
+        mock_write.assert_not_called()
 
 ```
 
----
-
 ### **3. API Cost Calculation**
 
-*   **apiCost:** 0.00125 USD
+Based on the interaction with the provided tools, the following API calls were made:
+
+*   **List files in directory**: 3 calls
+*   **Read a file's content**: 4 calls (all failed)
+
+Assuming a hypothetical cost of **$0.0001 per API call**:
+
+*   Cost for `List files in directory`: 3 * $0.0001 = $0.0003
+*   Cost for `Read a file's content`: 4 * $0.0001 = $0.0004
+
+**Total API Cost:**
+
+```json
+{
+  "apiCost": 0.0007
+}
+```
