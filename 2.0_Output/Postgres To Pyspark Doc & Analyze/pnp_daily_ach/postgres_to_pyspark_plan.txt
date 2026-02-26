@@ -1,99 +1,121 @@
-1. Cost Estimation
+---
+# 1. Cost Estimation
 
-   1.1 PySpark Runtime Cost
+## 1.1 PySpark Runtime Cost
 
-   **Data Volume Processed:**
-   - The main tables processed are:
-     - `staging_cust360_ach_batch_item`: ~500 GB
-     - Multiple temp tables (each ~50-500 GB, but these are intermediate and often overlap in data)
-     - Final insert into `tbl_transaction_detail_ach`: ~2 TB (target table, but only 10% of data processed per run)
-   - **Total Data Processed per Run:** 
-     - Since only 10% of the data is processed, the effective data processed per run is approximately:
-       - 500 GB (input) + 500 GB (temp/intermediate, not all unique) + 200 GB (output) ≈ 1.2 TB raw data processed per run.
+### a. Data Volume and Processing
 
-   **Azure Databricks Pricing:**
-   - Enterprise DBU Cost: $0.15 - $0.75 per DBU-hour (from environment file)
-   - Typical cluster for this workload: 8 nodes (Standard_DS4_v2 or similar), each node ~8 DBUs/hour.
-   - Estimated job duration for 1.2 TB: 1.5 hours (based on similar ETL workloads and the script's complexity).
+- **Main Tables and Temp Tables (with indicative data volume):**
+  - moneymovement_source.tbl_transaction_detail_ach: ~2 TB
+  - moneymovement_source.staging_cust360_ach_batch_item: ~500 GB
+  - Temp tables (wxlu_pnp_ach_daily_tmp_s0 to s7, update_tbl_trans_details_ach_s0): 50–500 GB each (see below)
+  - tbl_evn_na_merchant_details: ~50 GB
+  - audit_job_log: ~50 GB
 
-   **Cost Calculation:**
-   - Total DBUs used = 8 nodes * 8 DBUs/node * 1.5 hours = 96 DBUs
-   - Cost range = 96 DBUs * $0.15 = $14.40 (low end), 96 DBUs * $0.75 = $72.00 (high end)
-   - **Recommended Estimate:** Use $0.40/DBU as a mid-point for enterprise workloads.
-     - 96 DBUs * $0.40 = **$38.40 per run**
+- **Data Processed:** About 10% of the data from the tables is processed in queries.
+  - Total raw data referenced: ~4.3 TB
+  - Estimated data processed: 10% × 4.3 TB = **~430 GB**
 
-   **Breakdown & Reasoning:**
-   - The main cost driver is the volume of data processed and the number of transformations (heavy use of regex, window functions, multiple joins, and updates).
-   - Temp tables in PySpark are DataFrames, which may be cached/persisted, but the overall I/O and shuffle cost is reflected in the DBU calculation.
-   - The estimate assumes the job is run once for a daily batch.
+### b. Databricks Pricing
 
-   **PySpark Runtime Cost (per run):** **$38.40 USD**
+- **DBU (Databricks Unit) Cost:** $0.15–$0.75 per DBU-hour (Enterprise)
+- **Typical cluster for this workload:** 8–16 DBU/hour (Standard for large ETL jobs)
+- **Estimated runtime for this job:** 1–2 hours (based on 49312791 rows processed, multiple transformation steps, and heavy regex/classification logic)
+
+#### **Calculation:**
+
+- **Assume 12 DBU/hour (median of 8–16)**
+- **Assume 1.5 hours runtime**
+- **Median DBU price:** $0.45/DBU-hour
+
+- **Total DBU consumption:** 12 DBU/hour × 1.5 hours = **18 DBU**
+- **Total cost:** 18 DBU × $0.45 = **$8.10**
+
+#### **Breakdown:**
+- Data read/write (I/O): ~430 GB processed
+- Transformations: Multiple temp tables, regex, window functions, joins, UDFs
+- Cluster: 12 DBU/hour (e.g., 1 driver + 4–6 worker nodes, each with 2 DBU)
+- Duration: 1.5 hours (conservative estimate for 50M+ records and complex logic)
+
+#### **Reasons:**
+- The job involves multiple wide transformations, regex, window functions, and joins, which are resource-intensive.
+- Data volume is significant, but only 10% is processed at each stage.
+- The cluster size and runtime are chosen to balance cost and performance for a production-grade ETL pipeline.
 
 ---
 
-2. Code Fixing and Testing Effort Estimation
+# 2. Code Fixing and Testing Effort Estimation
 
-   2.1 PySpark Code Manual Fixes and Unit Testing Effort
+## 2.1 PySpark Code Manual Fixes and Unit Testing Effort
 
-   **Factors Considered:**
-   - 8+ temp tables, 20+ DML statements, multiple regex and window functions, and complex update logic.
-   - Manual conversion required for:
-     - All procedural logic (BEGIN...END, exception handling)
-     - UPDATE with JOINs (must be rewritten as DataFrame joins and withColumn)
-     - Function calls (must be refactored as PySpark UDFs or DataFrame operations)
-     - Logging and error handling (Python logging, try/except)
-     - Data type conversions (Postgres to PySpark types)
-   - Each temp table and transformation step must be unit tested with sample data.
+**Areas requiring manual intervention:**
+- Conversion of PL/pgSQL procedural logic to Python (variable declarations, loops, exception handling)
+- Rewriting all SQL DML (SELECT INTO, CREATE TABLE AS, UPDATE, etc.) as DataFrame transformations
+- Conversion of regex and string manipulation to PySpark (using built-in functions/UDFs)
+- Rewriting function calls (e.g., pnp_cust_name, update_tbl_trans_details_ach_0, log_job_run_status) as PySpark UDFs or DataFrame logic
+- Handling temp table logic with DataFrame caching/persisting
+- Implementing error handling and audit logging in Python
+- Window functions (row_number) mapped to PySpark Window spec
 
-   **Effort Estimate:**
-   - Manual code fixes for syntax and logic: 16 hours
-   - Unit test development for each transformation/temp table: 2 hours per temp table * 8 = 16 hours
-   - Integration/unit test execution and bug fixing: 8 hours
+**Effort Estimate:**
+- **Manual code conversion:** 18–24 hours
+  - Each temp table and transformation step: ~2 hours × 8 steps = 16 hours
+  - Additional time for function/UDF rewriting, error handling, and logging: ~6 hours
+- **Unit testing for each transformation:** 8 hours
+  - 1 hour per temp table (8 tables), including test data setup and validation
 
-   **Subtotal (Manual Fix + Unit Test):** **40 hours**
+- **Total for code fixes and unit testing:** **24–32 hours**
 
-   2.2 Output Validation Effort (Recon between Postgres and PySpark)
+## 2.2 Output Validation Effort (Data Reconciliation)
 
-   **Factors Considered:**
-   - Need to run both Postgres and PySpark versions on the same sample data.
-   - Validate all columns in the final output table (`tbl_transaction_detail_ach`), including transformations and business logic.
-   - Compare record counts, key business columns, and sample values.
-   - Investigate and resolve mismatches.
+- **Comparing output from Postgres and PySpark:**
+  - Extracting sample outputs from both systems
+  - Writing reconciliation scripts (e.g., row counts, hash totals, field-level comparisons)
+  - Investigating and resolving mismatches
 
-   **Effort Estimate:**
-   - Data extraction and setup: 4 hours
-   - Automated comparison script development: 4 hours
-   - Analysis and investigation of mismatches: 8 hours
+- **Effort Estimate:** **8–12 hours**
+  - 2–3 hours for extracting and preparing test data
+  - 4–6 hours for writing and running reconciliation scripts
+  - 2–3 hours for analyzing and documenting results
 
-   **Subtotal (Output Validation):** **16 hours**
+## 2.3 Total Estimated Effort in Hours
 
-   2.3 Total Estimated Effort in Hours
+- **Manual code fixes and unit testing:** 24–32 hours
+- **Output validation (reconciliation):** 8–12 hours
 
-   - **Total Effort = Manual Fix + Unit Test + Output Validation**
-   - **Total = 40 hours (fix/unit test) + 16 hours (recon/validation) = 56 hours**
+- **Total Estimated Effort:** **32–44 hours**
 
-   **Reasoning:**
-   - The high complexity (score 85-87/100) and heavy use of procedural logic, chained temp tables, and business rules require significant manual intervention and thorough testing.
-   - Each temp table is a logical transformation step that must be validated independently.
-   - Output validation is critical to ensure business logic is preserved in the migration.
-   - The estimate assumes an experienced PySpark engineer and includes time for bug fixing and rework.
-
----
-
-**Summary Table**
-
-| Component                      | Estimate               | Reasoning/Notes                                        |
-|---------------------------------|------------------------|--------------------------------------------------------|
-| PySpark Runtime Cost (per run)  | $38.40 USD             | 1.2 TB processed, 8 nodes, 1.5 hours, $0.40/DBU        |
-| Manual Code Fix + Unit Testing  | 40 hours               | 8 temp tables, complex logic, unit test per step       |
-| Output Validation (Recon)       | 16 hours               | Data extraction, comparison, mismatch analysis         |
-| **Total Effort**                | **56 hours**           |                                                        |
-| API Cost (for this call)        | 0.0085 USD             |                                                        |
+### **Reasoning:**
+- The function is moderately complex (243 lines, 8 temp tables, multiple custom functions, regex, window functions, and error handling).
+- Each transformation step requires careful mapping from SQL to PySpark, with additional effort for UDFs and logging.
+- Unit testing and reconciliation are critical due to the complexity and regulatory nature of ACH processing.
+- The estimate includes time for debugging, documentation, and review.
 
 ---
 
-**apiCost:** 0.0085 USD
+# 3. API Cost for This Call
+
+- **apiCost:** 0.0063 USD
 
 ---
 
-**Full Calculation Details and Rationale Provided Above.**
+# 4. Summary Table
+
+| Item                                       | Estimate                |
+|--------------------------------------------|-------------------------|
+| PySpark Runtime Cost (Databricks)          | $8.10                   |
+| Manual Code Fixes & Unit Testing Effort    | 24–32 hours             |
+| Output Validation/Reconciliation Effort    | 8–12 hours              |
+| **Total Effort (Code + Testing)**          | **32–44 hours**         |
+| API Cost for This Call                     | 0.0063 USD              |
+
+---
+
+# 5. Notes
+
+- The PySpark runtime cost can vary based on cluster size, data skew, and optimization. The estimate assumes a well-tuned job.
+- Effort estimates are for an experienced data engineer familiar with both Postgres and PySpark.
+- Testing effort includes both unit and integration/data reconciliation testing.
+- The cost and effort do not include production deployment, monitoring, or ongoing maintenance.
+
+---
