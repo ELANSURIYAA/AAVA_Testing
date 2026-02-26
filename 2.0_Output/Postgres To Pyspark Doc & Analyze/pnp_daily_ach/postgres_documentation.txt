@@ -4,324 +4,231 @@
 
 ## 1. Overview of Program
 
-### Purpose
-The `pnp_daily_ach` function processes daily Automated Clearing House (ACH) transaction data. It extracts, transforms, classifies, and loads transaction records into the target table `moneymovement_source.tbl_transaction_detail_ach`. The function applies business logic to classify entities (Person, Business, Unidentifiable), updates relevant codes, and logs job execution details.
+**Purpose:**  
+The `pnp_daily_ach` function orchestrates the daily processing of Automated Clearing House (ACH) transaction data. It extracts, transforms, classifies, and loads ACH transaction records, applying business rules to identify transaction parties (Person, Business, Unidentifiable), and enriches the data with additional business codes. The function also logs audit details for traceability and error management.
 
-### Business Problem Addressed
-The function addresses the need for accurate classification and enrichment of ACH transaction data for downstream analytics and reporting. It ensures that customer names are standardized, entity types are correctly identified, and business-specific codes are updated. This improves data quality, supports regulatory compliance, and enables reliable business intelligence.
+**Business Problem Addressed:**  
+The function addresses the need to accurately classify and enrich ACH transaction data for downstream financial processing, compliance, and reporting. By standardizing customer names, classifying entity types, and updating business codes, it ensures data quality and supports business analytics, fraud detection, and regulatory compliance.
 
 ---
 
 ## 2. Code Structure and Design
 
-### Structure and Flow
+**Structure and Flow:**  
+- The function is written in PL/pgSQL and is executed in the `moneymovement_source` schema.
+- It processes data in several staged steps using temporary tables.
+- It applies transformations, invokes helper functions, and performs updates and inserts.
+- It logs execution details and handles errors gracefully.
 
-- **Language:** PL/pgSQL (PostgreSQL procedural language)
-- **Function Name:** `moneymovement_source.pnp_daily_ach`
-- **Return Type:** `_int8` (array of bigints)
-- **Primary Steps:**
-  1. Set search path and initialize variables
-  2. Extract latest ACH transaction data
-  3. Clean and transform customer names
-  4. Classify entities (Person, Business, Unidentifiable)
-  5. Update entity types based on business rules
-  6. Enrich records with business codes
-  7. Insert processed data into target table
-  8. Log job execution and handle errors
-
-### Primary PostgreSQL Components
-
-- **Tables:**
+**Primary PostgreSQL Components Used:**  
+- **Tables:**  
   - `moneymovement_source.tbl_transaction_detail_ach`
   - `moneymovement_source.staging_cust360_ach_batch_item`
   - `moneymovement_source.tbl_evn_na_merchant_details`
-  - Multiple temporary tables (`wxlu_pnp_ach_daily_tmp_s0` to `wxlu_pnp_ach_daily_tmp_s7`)
   - `moneymovement_source.audit_job_log`
-- **Views:** None explicitly referenced
-- **Stored Procedures/Functions:**
+  - Multiple temp tables: `wxlu_pnp_ach_daily_tmp_s0` to `wxlu_pnp_ach_daily_tmp_s7`
+- **Stored Procedures/Functions:**  
   - `moneymovement_source.pnp_cust_name`
   - `moneymovement_source.update_tbl_trans_details_ach_0`
   - `moneymovement_source.log_job_run_status`
-- **Joins:** Multiple LEFT JOINs and INNER JOINs
-- **Aggregations:** Use of `max()`, `row_number()`, `count()`
-- **Subqueries:** Used in CTEs and WHERE clauses
-- **CTEs:** Used for data extraction and transformation
+- **Joins:**  
+  - Used extensively for data enrichment and classification.
+- **Aggregations:**  
+  - `max(business_dt)`, `row_number() over (partition by ...)`
+- **Subqueries & CTEs:**  
+  - Used for filtering and staging data.
+- **DML Statements:**  
+  - `SELECT`, `INSERT`, `UPDATE`, `DROP TABLE`, `CREATE TABLE`
+- **Exception Handling:**  
+  - `EXCEPTION WHEN OTHERS THEN ...`
 
 ---
 
 ## 3. Data Flow and Processing Logic
 
-### Processing Logic Components
+### Step-by-Step Processing Logic
 
-#### Step 1: Extract Latest ACH Data
+#### Step 0: Initialization & Audit Start
+- Capture initial timestamp and record count from `tbl_transaction_detail_ach`.
 
-- **Source:** `staging_cust360_ach_batch_item`
-- **Logic:** Extract records newer than the latest processed date in `tbl_transaction_detail_ach`, within the last 25 days.
-- **Transformation:** None at this stage.
+#### Step 1: Data Extraction & Staging
+- Extract latest business date from `tbl_transaction_detail_ach`.
+- Filter new records from `staging_cust360_ach_batch_item` based on business date.
+- Store results in `wxlu_pnp_ach_daily_tmp_s0`.
 
-#### Step 2: Clean and Transform Customer Names
+#### Step 2: Name Cleaning & Transformation
+- Select and rename relevant columns.
+- Clean and standardize customer names using regex (remove extra spaces, uppercase, remove '1/').
+- Store results in `wxlu_pnp_ach_daily_tmp_s1`.
 
-- **Source:** `wxlu_pnp_ach_daily_tmp_s0`
-- **Logic:** Standardize customer names using regex (remove extra spaces, convert to uppercase, strip certain patterns).
-- **Transformation:** `regexp_replace`, `upper`
+#### Step 3: Name Classification
+- Call `pnp_cust_name` function to classify names (Person, Business, etc.), output to `wxlu_pnp_ach_daily_tmp_s2`.
+- Join classification results to `wxlu_pnp_ach_daily_tmp_s1` to create `wxlu_pnp_ach_daily_tmp_s3`.
+- Update `entity_type` based on business logic:
+  - If not clearly identified, set as 'PERSON-TBR' or 'BUSINESS-TBR' based on amount and flags.
+  - Use regex patterns to further classify as 'PERSON' or 'BUSINESS'.
+  - Set as 'UNIDENTIFIABLE' if name is too short.
 
-#### Step 3: Classify Entities
+#### Step 4: Data Enrichment
+- Join enriched data back to original, add new columns (destination_pnp_cde, etc.) in `wxlu_pnp_ach_daily_tmp_s4`.
+- Further filter and classify using merchant details and company IDs in `wxlu_pnp_ach_daily_tmp_s5`.
+- Update `destination_pnp_cde` for certain records.
 
-- **Source:** `wxlu_pnp_ach_daily_tmp_s1`
-- **Logic:** Call `pnp_cust_name` function to classify names as Person, Business, Non-Profit, etc.
-- **Transformation:** Classification logic based on name patterns and business rules.
+#### Step 5: De-duplication & Final Preparation
+- Deduplicate on `transaction_par_nbr` and `business_dt` using `row_number()`, keep first.
+- Store in `wxlu_pnp_ach_daily_tmp_s6`.
+- Prepare update table for transaction details.
 
-#### Step 4: Update Entity Types
+#### Step 6: External Function Calls
+- Call `update_tbl_trans_details_ach_0()` to further update details, output to `wxlu_pnp_ach_daily_tmp_s7`.
 
-- **Source:** `wxlu_pnp_ach_daily_tmp_s3`
-- **Logic:** Update `entity_type` based on:
-  - Amount thresholds
-  - Name patterns (regex for business/consumer)
-  - Business-only flags
-  - Unidentifiable criteria (short names)
-- **Transformation:** Conditional updates using `UPDATE` and regex matching.
+#### Step 7: Final Enrichment
+- Update DP Code, USB Cashflow Code, and On-US/Off-US status from `wxlu_pnp_ach_daily_tmp_s7` into `wxlu_pnp_ach_daily_tmp_s6`.
 
-#### Step 5: Enrich Data with Codes
+#### Step 8: Insert Final Results
+- Insert processed records into `tbl_transaction_detail_ach`.
 
-- **Source:** `wxlu_pnp_ach_daily_tmp_s4`, `tbl_evn_na_merchant_details`
-- **Logic:** Join with merchant details to update codes (`dp_cde`, `usb_cashflow_cde`, `usb_onus_external_tnx_cde`).
-- **Transformation:** Joins and conditional updates.
+#### Step 9: Audit Logging
+- Log job run status and record counts.
+- Handle exceptions and log failures.
 
-#### Step 6: Deduplicate and Finalize Records
+---
 
-- **Source:** `wxlu_pnp_ach_daily_tmp_s6`
-- **Logic:** Deduplicate using `row_number()` partitioned by transaction and date.
+### Transformations Applied
 
-#### Step 7: Insert into Target Table
-
-- **Target:** `tbl_transaction_detail_ach`
-- **Logic:** Insert all processed and enriched records.
-
-#### Step 8: Logging and Error Handling
-
-- **Logic:** Log job execution details and handle errors using exception blocks.
+- **Filtering:**  
+  - By business date, company ID, and entity type.
+- **Joins:**  
+  - To enrich with classification and merchant details.
+- **Aggregations:**  
+  - Max date, deduplication via `row_number()`.
+- **Regex & String Functions:**  
+  - Cleaning and standardizing customer names.
+- **Conditional Updates:**  
+  - Business logic for entity classification.
+- **Data Enrichment:**  
+  - Adding business codes and party IDs.
 
 ---
 
 ## 4. Data Mapping
 
-### Source-to-Target Lineage
+| Target Table Name                      | Target Column Name           | Source Table Name                                 | Source Column Name         | Remarks                                                                                  |
+|----------------------------------------|-----------------------------|---------------------------------------------------|---------------------------|------------------------------------------------------------------------------------------|
+| wxlu_pnp_ach_daily_tmp_s0              | * (all columns)             | staging_cust360_ach_batch_item                    | *                         | 1 to 1 mapping; filtered by business date                                                |
+| wxlu_pnp_ach_daily_tmp_s1              | trans_id                    | wxlu_pnp_ach_daily_tmp_s0                         | transaction_par_nbr       | 1 to 1 mapping; column rename                                                            |
+| wxlu_pnp_ach_daily_tmp_s1              | zxx__cust_name              | wxlu_pnp_ach_daily_tmp_s0                         | dest_customer_nm          | 1 to 1 mapping; column rename                                                            |
+| wxlu_pnp_ach_daily_tmp_s1              | trans_amt                   | wxlu_pnp_ach_daily_tmp_s0                         | dest_transaction_amt      | 1 to 1 mapping; column rename                                                            |
+| wxlu_pnp_ach_daily_tmp_s1              | bus_date                    | wxlu_pnp_ach_daily_tmp_s0                         | business_dt               | 1 to 1 mapping; column rename                                                            |
+| wxlu_pnp_ach_daily_tmp_s1              | zxx__cust_name_mod          | wxlu_pnp_ach_daily_tmp_s0                         | dest_customer_nm          | Transformation; cleaned and uppercased using regex                                       |
+| wxlu_pnp_ach_daily_tmp_s3              | entity_type                 | wxlu_pnp_ach_daily_tmp_s2                         | entity_type               | 1 to 1 mapping; with conditional updates                                                 |
+| wxlu_pnp_ach_daily_tmp_s3              | zxx__cust_name_mod_new      | wxlu_pnp_ach_daily_tmp_s2                         | zxx__cust_name_mod_new    | 1 to 1 mapping                                                                          |
+| wxlu_pnp_ach_daily_tmp_s4              | destination_pnp_cde         | wxlu_pnp_ach_daily_tmp_s3                         | entity_type               | 1 to 1 mapping                                                                          |
+| wxlu_pnp_ach_daily_tmp_s4              | originator_pnp_cde          | -                                                 | -                         | Default value: ''                                                                        |
+| wxlu_pnp_ach_daily_tmp_s4              | dp_cde                      | -                                                 | -                         | Default value: ''                                                                        |
+| wxlu_pnp_ach_daily_tmp_s4              | destination_party_mma_id    | -                                                 | -                         | Default value: ''                                                                        |
+| wxlu_pnp_ach_daily_tmp_s4              | originator_party_mma_id     | -                                                 | -                         | Default value: ''                                                                        |
+| wxlu_pnp_ach_daily_tmp_s4              | destination_party_lpid      | -                                                 | -                         | Default value: ''                                                                        |
+| wxlu_pnp_ach_daily_tmp_s4              | originator_party_lpid       | -                                                 | -                         | Default value: ''                                                                        |
+| wxlu_pnp_ach_daily_tmp_s4              | originator_3rdparty_mma_id  | -                                                 | -                         | Default value: ''                                                                        |
+| wxlu_pnp_ach_daily_tmp_s4              | usb_onus_external_tnx_cde   | -                                                 | -                         | Default value: ''                                                                        |
+| wxlu_pnp_ach_daily_tmp_s4              | usb_cashflow_cde            | -                                                 | -                         | Default value: ''                                                                        |
+| wxlu_pnp_ach_daily_tmp_s4              | pymt_purpose_cde            | -                                                 | -                         | Default value: ''                                                                        |
+| wxlu_pnp_ach_daily_tmp_s5              | destination_pnp_cde         | wxlu_pnp_ach_daily_tmp_s4                         | destination_pnp_cde       | 1 to 1 mapping                                                                          |
+| wxlu_pnp_ach_daily_tmp_s5              | dest_customer_nm            | wxlu_pnp_ach_daily_tmp_s4                         | dest_customer_nm          | 1 to 1 mapping                                                                          |
+| wxlu_pnp_ach_daily_tmp_s5              | dest_check_nbr              | wxlu_pnp_ach_daily_tmp_s4                         | dest_check_nbr            | 1 to 1 mapping                                                                          |
+| wxlu_pnp_ach_daily_tmp_s5              | originator_company_id       | wxlu_pnp_ach_daily_tmp_s4                         | originator_company_id     | 1 to 1 mapping                                                                          |
+| wxlu_pnp_ach_daily_tmp_s5              | ...                         | ...                                               | ...                       | ...                                                                                      |
+| tbl_transaction_detail_ach             | transaction_par_nbr         | wxlu_pnp_ach_daily_tmp_s6                         | transaction_par_nbr       | 1 to 1 mapping                                                                          |
+| tbl_transaction_detail_ach             | dest_transaction_amt        | wxlu_pnp_ach_daily_tmp_s6                         | dest_transaction_amt      | 1 to 1 mapping                                                                          |
+| tbl_transaction_detail_ach             | credit_debit_cde            | wxlu_pnp_ach_daily_tmp_s6                         | credit_debit_cde          | 1 to 1 mapping                                                                          |
+| tbl_transaction_detail_ach             | nacha_sec_code              | wxlu_pnp_ach_daily_tmp_s6                         | nacha_sec_code            | 1 to 1 mapping                                                                          |
+| tbl_transaction_detail_ach             | destination_pnp_cde         | wxlu_pnp_ach_daily_tmp_s6                         | destination_pnp_cde       | 1 to 1 mapping                                                                          |
+| tbl_transaction_detail_ach             | originator_pnp_cde          | wxlu_pnp_ach_daily_tmp_s6                         | originator_pnp_cde        | 1 to 1 mapping                                                                          |
+| tbl_transaction_detail_ach             | dp_cde                      | wxlu_pnp_ach_daily_tmp_s6                         | dp_cde                    | 1 to 1 mapping                                                                          |
+| tbl_transaction_detail_ach             | usb_cashflow_cde            | wxlu_pnp_ach_daily_tmp_s6                         | usb_cashflow_cde          | 1 to 1 mapping                                                                          |
+| tbl_transaction_detail_ach             | usb_onus_external_tnx_cde   | wxlu_pnp_ach_daily_tmp_s6                         | usb_onus_external_tnx_cde | 1 to 1 mapping                                                                          |
+| tbl_transaction_detail_ach             | pymt_purpose_cde            | wxlu_pnp_ach_daily_tmp_s6                         | pymt_purpose_cde          | 1 to 1 mapping                                                                          |
+| tbl_transaction_detail_ach             | ...                         | wxlu_pnp_ach_daily_tmp_s6                         | ...                       | 1 to 1 mapping for all other columns                                                     |
 
-| Target Table Name                     | Target Column Name           | Source Table Name                       | Source Column Name         | Remarks                                      |
-|---------------------------------------|------------------------------|-----------------------------------------|---------------------------|-----------------------------------------------|
-| tbl_transaction_detail_ach            | transaction_par_nbr          | wxlu_pnp_ach_daily_tmp_s6               | transaction_par_nbr       | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_transaction_amt         | wxlu_pnp_ach_daily_tmp_s6               | dest_transaction_amt      | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | credit_debit_cde             | wxlu_pnp_ach_daily_tmp_s6               | credit_debit_cde          | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | nacha_sec_code               | wxlu_pnp_ach_daily_tmp_s6               | nacha_sec_code            | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | nacha_transaction_cde        | wxlu_pnp_ach_daily_tmp_s6               | nacha_transaction_cde     | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | desti_return_reason_desc     | wxlu_pnp_ach_daily_tmp_s6               | desti_return_reason_desc  | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | transaction_desc             | wxlu_pnp_ach_daily_tmp_s6               | transaction_desc          | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | discretionary_txt            | wxlu_pnp_ach_daily_tmp_s6               | discretionary_txt         | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | originating_rt_nbr           | wxlu_pnp_ach_daily_tmp_s6               | originating_rt_nbr        | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | originator_company_id        | wxlu_pnp_ach_daily_tmp_s6               | originator_company_id     | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | originator_company_name      | wxlu_pnp_ach_daily_tmp_s6               | originator_company_name   | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | src_settlmnt_arrangement_nbr | wxlu_pnp_ach_daily_tmp_s6               | src_settlmnt_arrangement_nbr | 1-to-1 mapping                            |
-| tbl_transaction_detail_ach            | settlement_arrangement_id    | wxlu_pnp_ach_daily_tmp_s6               | settlement_arrangement_id | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | src_bill_arrangement_nbr     | wxlu_pnp_ach_daily_tmp_s6               | src_bill_arrangement_nbr  | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | bill_arrangement_id          | wxlu_pnp_ach_daily_tmp_s6               | bill_arrangement_id       | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_tr_nbr                  | wxlu_pnp_ach_daily_tmp_s6               | dest_tr_nbr               | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | src_dest_arrangement_nbr     | wxlu_pnp_ach_daily_tmp_s6               | src_dest_arrangement_nbr  | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_customer_nm             | wxlu_pnp_ach_daily_tmp_s6               | dest_customer_nm          | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_check_nbr               | wxlu_pnp_ach_daily_tmp_s6               | dest_check_nbr            | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_arrangement_type_cde    | wxlu_pnp_ach_daily_tmp_s6               | dest_arrangement_type_cde | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_arrangement_id          | wxlu_pnp_ach_daily_tmp_s6               | dest_arrangement_id       | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | transaction_effective_dt     | wxlu_pnp_ach_daily_tmp_s6               | transaction_effective_dt  | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | batch_collctn_dt             | wxlu_pnp_ach_daily_tmp_s6               | batch_collctn_dt          | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | business_dt                  | wxlu_pnp_ach_daily_tmp_s6               | business_dt               | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | batch_processing_window_cde  | wxlu_pnp_ach_daily_tmp_s6               | batch_processing_window_cde | 1-to-1 mapping                            |
-| tbl_transaction_detail_ach            | batch_received_tm            | wxlu_pnp_ach_daily_tmp_s6               | batch_received_tm         | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | load_ts                      | wxlu_pnp_ach_daily_tmp_s6               | CURRENT_TIMESTAMP         | Transformation: load timestamp                |
-| tbl_transaction_detail_ach            | ach_site_id                  | wxlu_pnp_ach_daily_tmp_s6               | ach_site_id               | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | origination_iso_currency_cde | wxlu_pnp_ach_daily_tmp_s6               | origination_iso_currency_cde | 1-to-1 mapping                            |
-| tbl_transaction_detail_ach            | dest_iso_currency_cde        | wxlu_pnp_ach_daily_tmp_s6               | dest_iso_currency_cde     | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_iso_country_cde         | wxlu_pnp_ach_daily_tmp_s6               | dest_iso_country_cde      | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | fx_exchange_cde              | wxlu_pnp_ach_daily_tmp_s6               | fx_exchange_cde           | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | fx_exchange_reference_cde    | wxlu_pnp_ach_daily_tmp_s6               | fx_exchange_reference_cde | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | fx_exchange_reference_txt    | wxlu_pnp_ach_daily_tmp_s6               | fx_exchange_reference_txt | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | iat_indicator_cde            | wxlu_pnp_ach_daily_tmp_s6               | iat_indicator_cde         | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | collctn_point_cde            | wxlu_pnp_ach_daily_tmp_s6               | collctn_point_cde         | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | collctn_applctn_batch_id     | wxlu_pnp_ach_daily_tmp_s6               | collctn_applctn_batch_id  | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | collctn_applctn_type_cde     | wxlu_pnp_ach_daily_tmp_s6               | collctn_applctn_type_cde  | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | setlmnt_point_applctn_id     | wxlu_pnp_ach_daily_tmp_s6               | setlmnt_point_applctn_id  | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | originating_applctn_type_cde | wxlu_pnp_ach_daily_tmp_s6               | originating_applctn_type_cde | 1-to-1 mapping                            |
-| tbl_transaction_detail_ach            | status_code                  | wxlu_pnp_ach_daily_tmp_s6               | status_code               | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_tran_type_cde           | wxlu_pnp_ach_daily_tmp_s6               | dest_tran_type_cde        | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | match_type_cde               | wxlu_pnp_ach_daily_tmp_s6               | match_type_cde            | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | origination_ex_status_cde    | wxlu_pnp_ach_daily_tmp_s6               | origination_ex_status_cde | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_acct_group_cde          | wxlu_pnp_ach_daily_tmp_s6               | dest_acct_group_cde       | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_disc_txt                | wxlu_pnp_ach_daily_tmp_s6               | dest_disc_txt             | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_item_type_cde           | wxlu_pnp_ach_daily_tmp_s6               | dest_item_type_cde        | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_mask_cde                | wxlu_pnp_ach_daily_tmp_s6               | dest_mask_cde             | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_ex_status_cde           | wxlu_pnp_ach_daily_tmp_s6               | dest_ex_status_cde        | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | desti_tracer_nbr             | wxlu_pnp_ach_daily_tmp_s6               | desti_tracer_nbr          | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | transaction_dm_nbr           | wxlu_pnp_ach_daily_tmp_s6               | transaction_dm_nbr        | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | dest_org_trace_cde           | wxlu_pnp_ach_daily_tmp_s6               | dest_org_trace_cde        | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | ach_file_nbr                 | wxlu_pnp_ach_daily_tmp_s6               | ach_file_nbr              | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | ach_batch_nbr                | wxlu_pnp_ach_daily_tmp_s6               | ach_batch_nbr             | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | collctn_file_nm              | wxlu_pnp_ach_daily_tmp_s6               | collctn_file_nm           | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | collctn_batch_nbr            | wxlu_pnp_ach_daily_tmp_s6               | collctn_batch_nbr         | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | process_ts                   | wxlu_pnp_ach_daily_tmp_s6               | process_ts                | 1-to-1 mapping                                |
-| tbl_transaction_detail_ach            | destination_pnp_cde          | wxlu_pnp_ach_daily_tmp_s6               | destination_pnp_cde       | Transformation: classified entity type        |
-| tbl_transaction_detail_ach            | originator_pnp_cde           | wxlu_pnp_ach_daily_tmp_s6               | originator_pnp_cde        | Transformation: default ''                    |
-| tbl_transaction_detail_ach            | dp_cde                       | wxlu_pnp_ach_daily_tmp_s6               | dp_cde                    | Transformation: updated via join              |
-| tbl_transaction_detail_ach            | destination_party_mma_id     | wxlu_pnp_ach_daily_tmp_s6               | destination_party_mma_id  | Transformation: default ''                    |
-| tbl_transaction_detail_ach            | originator_party_mma_id      | wxlu_pnp_ach_daily_tmp_s6               | originator_party_mma_id   | Transformation: default ''                    |
-| tbl_transaction_detail_ach            | destination_party_lpid       | wxlu_pnp_ach_daily_tmp_s6               | destination_party_lpid    | Transformation: default ''                    |
-| tbl_transaction_detail_ach            | originator_party_lpid        | wxlu_pnp_ach_daily_tmp_s6               | originator_party_lpid     | Transformation: default ''                    |
-| tbl_transaction_detail_ach            | originator_3rdparty_mma_id   | wxlu_pnp_ach_daily_tmp_s6               | originator_3rdparty_mma_id| Transformation: default ''                    |
-| tbl_transaction_detail_ach            | usb_onus_external_tnx_cde    | wxlu_pnp_ach_daily_tmp_s6               | usb_onus_external_tnx_cde | Transformation: updated via join              |
-| tbl_transaction_detail_ach            | usb_cashflow_cde             | wxlu_pnp_ach_daily_tmp_s6               | usb_cashflow_cde          | Transformation: updated via join              |
-| tbl_transaction_detail_ach            | pymt_purpose_cde             | wxlu_pnp_ach_daily_tmp_s6               | pymt_purpose_cde          | Transformation: default ''                    |
-
-**Remarks:**  
-- Most columns are 1-to-1 mappings from the source temporary table to the target.
-- Some columns are transformed or updated via business logic or joins.
-- Entity type classification is a transformation based on regex and business rules.
+*Note: The table above is a representative sample. All columns from the final staging table are inserted into the target table, with some being defaulted or transformed as described.*
 
 ---
 
 ## 5. Complexity Analysis
 
-| Metric                     | Value                                        |
-|----------------------------|----------------------------------------------|
-| Lines of Code (LOC)        | ~200                                         |
-| Cyclomatic Complexity      | 15 (multiple IF, CASE, JOIN, UPDATE paths)   |
-| Nesting Depth              | 3 (CTEs, IF, exception blocks)               |
-| Tables                     | 12 (including temp tables and audit log)     |
-| Temporary tables           | 8                                            |
-| DML Statements             | 20+ (SELECT, INSERT, UPDATE, DELETE)         |
-| Joins                      | 6                                            |
-| Subqueries                 | 8                                            |
-| CTEs                       | 6                                            |
-| Aggregation Queries        | 4 (GROUP BY, HAVING, PARTITION BY)           |
-| Input Parameters           | 0                                            |
-| Output Parameters          | 1 (_int8 array)                              |
-| Data Transformations       | 10+ (regex, string, coalesce, upper, etc.)   |
-| Function Calls             | 3 (external function/procedure calls)        |
-| **Overall Complexity Score** | **85/100**                                 |
+| Metric                    | Value (Approximate) |
+|---------------------------|---------------------|
+| Lines of Code (LOC)       | 250                 |
+| Cyclomatic Complexity     | 18                  |
+| Nesting Depth             | 3                   |
+| Tables                    | 8                   |
+| Temporary tables          | 8                   |
+| DML Statements            | 30                  |
+| Joins                     | 8                   |
+| Subqueries                | 6                   |
+| CTEs                      | 3                   |
+| Aggregation Queries       | 2                   |
+| Input Parameters          | 0                   |
+| Output Parameters         | 1 (array)           |
+| Data Transformations      | 10+                 |
+| Function Calls            | 3                   |
+
+**Overall Complexity Score:** 78/100  
+*This function is moderately complex due to multiple transformation steps, business logic, regex usage, and error handling.*
 
 ---
 
 ## 6. Key Outputs
 
 - **Inserts:**  
-  - Final processed records are inserted into `moneymovement_source.tbl_transaction_detail_ach`.
+  - Final processed ACH transaction records are inserted into `moneymovement_source.tbl_transaction_detail_ach`.
 - **Updates:**  
-  - Entity types and business codes are updated in temporary tables before final insert.
-- **Deletes:**  
-  - Temporary tables are dropped at each stage to ensure clean processing.
-- **Logging:**  
-  - Job execution details are logged in `moneymovement_source.audit_job_log`.
+  - Entity type and business codes are updated in staging tables.
+- **Audit Logging:**  
+  - Job execution details are logged in `moneymovement_source.audit_job_log` via `log_job_run_status`.
 
 ---
 
 ## 7. Error Handling and Logging
 
-### Methods Used
-
 - **Try-Catch Mechanism:**  
-  - Exception block (`exception when others then`) captures any errors during execution.
-  - Logs error details (timestamp, job name, status, audit text, user).
-  - Uses `RAISE INFO` to print SQL error messages and states.
-
-- **Logging Table:**  
-  - `moneymovement_source.log_job_run_status` function records job status, timestamps, audit text, record counts, and user.
-
-- **Retry Mechanisms:**  
-  - No explicit retry mechanism, but error logging allows for manual intervention and rerun.
+  - The function uses an `EXCEPTION WHEN OTHERS THEN` block to catch and handle all errors.
+- **Error Logging:**  
+  - On error, logs the failure in `audit_job_log` with status 'FAILED' and records the error message and state.
+- **Audit Trail:**  
+  - Logs job name, status, timestamps, and record counts for both successful and failed runs.
+- **No explicit retry mechanism** is present, but errors are logged for operational follow-up.
 
 ---
 
-## Field Descriptions
+## 8. Field Descriptions
 
-All fields used in the process are listed below with brief descriptions:
+Below are key fields used and their descriptions:
 
-| Field Name                    | Description                                                               |
-|-------------------------------|---------------------------------------------------------------------------|
-| transaction_par_nbr           | Unique transaction identifier                                             |
-| dest_transaction_amt          | Transaction amount                                                        |
-| credit_debit_cde              | Code indicating credit or debit                                           |
-| nacha_sec_code                | NACHA SEC code for ACH transactions                                       |
-| nacha_transaction_cde         | NACHA transaction code                                                    |
-| desti_return_reason_desc      | Description of return reason                                              |
-| transaction_desc              | Transaction description                                                   |
-| discretionary_txt             | Additional discretionary text                                             |
-| originating_rt_nbr            | Originating routing number                                                |
-| originator_company_id         | Originator company identifier                                             |
-| originator_company_name       | Originator company name                                                   |
-| src_settlmnt_arrangement_nbr  | Source settlement arrangement number                                      |
-| settlement_arrangement_id     | Settlement arrangement identifier                                         |
-| src_bill_arrangement_nbr      | Source bill arrangement number                                            |
-| bill_arrangement_id           | Bill arrangement identifier                                               |
-| dest_tr_nbr                   | Destination transaction number                                            |
-| src_dest_arrangement_nbr      | Source-destination arrangement number                                     |
-| dest_customer_nm              | Destination customer name                                                 |
-| dest_check_nbr                | Destination check number                                                  |
-| dest_arrangement_type_cde     | Destination arrangement type code                                         |
-| dest_arrangement_id           | Destination arrangement identifier                                        |
-| transaction_effective_dt      | Effective date of transaction                                             |
-| batch_collctn_dt              | Batch collection date                                                     |
-| business_dt                   | Business date                                                             |
-| batch_processing_window_cde   | Batch processing window code                                              |
-| batch_received_tm             | Batch received timestamp                                                  |
-| load_ts                       | Load timestamp (current timestamp)                                        |
-| ach_site_id                   | ACH site identifier                                                       |
-| origination_iso_currency_cde  | Origination ISO currency code                                             |
-| dest_iso_currency_cde         | Destination ISO currency code                                             |
-| dest_iso_country_cde          | Destination ISO country code                                              |
-| fx_exchange_cde               | Foreign exchange code                                                     |
-| fx_exchange_reference_cde     | Foreign exchange reference code                                           |
-| fx_exchange_reference_txt     | Foreign exchange reference text                                           |
-| iat_indicator_cde             | IAT indicator code                                                        |
-| collctn_point_cde             | Collection point code                                                     |
-| collctn_applctn_batch_id      | Collection application batch ID                                           |
-| collctn_applctn_type_cde      | Collection application type code                                          |
-| setlmnt_point_applctn_id      | Settlement point application ID                                           |
-| originating_applctn_type_cde  | Originating application type code                                         |
-| status_code                   | Status code                                                               |
-| dest_tran_type_cde            | Destination transaction type code                                         |
-| match_type_cde                | Match type code                                                           |
-| origination_ex_status_cde     | Origination external status code                                          |
-| dest_acct_group_cde           | Destination account group code                                            |
-| dest_disc_txt                 | Destination discretionary text                                            |
-| dest_item_type_cde            | Destination item type code                                                |
-| dest_mask_cde                 | Destination mask code                                                     |
-| dest_ex_status_cde            | Destination external status code                                          |
-| desti_tracer_nbr              | Destination tracer number                                                 |
-| transaction_dm_nbr            | Transaction DM number                                                     |
-| dest_org_trace_cde            | Destination organization trace code                                       |
-| ach_file_nbr                  | ACH file number                                                           |
-| ach_batch_nbr                 | ACH batch number                                                          |
-| collctn_file_nm               | Collection file name                                                      |
-| collctn_batch_nbr             | Collection batch number                                                   |
-| process_ts                    | Process timestamp                                                         |
-| destination_pnp_cde           | Classified entity type (Person/Business/Unidentifiable)                   |
-| originator_pnp_cde            | Originator entity type (default '')                                       |
-| dp_cde                        | DP code (updated via join)                                                |
-| destination_party_mma_id      | Destination party MMA ID (default '')                                     |
-| originator_party_mma_id       | Originator party MMA ID (default '')                                      |
-| destination_party_lpid        | Destination party LPID (default '')                                       |
-| originator_party_lpid         | Originator party LPID (default '')                                        |
-| originator_3rdparty_mma_id    | Originator 3rd party MMA ID (default '')                                  |
-| usb_onus_external_tnx_cde     | USB On-US/External transaction code (updated via join)                    |
-| usb_cashflow_cde              | USB cashflow code (updated via join)                                      |
-| pymt_purpose_cde              | Payment purpose code (default '')                                         |
+| Field Name                  | Description                                                        |
+|-----------------------------|--------------------------------------------------------------------|
+| transaction_par_nbr         | Unique transaction identifier                                      |
+| dest_customer_nm            | Destination customer name                                          |
+| dest_transaction_amt        | Transaction amount                                                 |
+| business_dt                 | Business date                                                      |
+| entity_type                 | Classified entity type (PERSON, BUSINESS, UNIDENTIFIABLE, etc.)    |
+| destination_pnp_cde         | Final classified party code                                        |
+| originator_pnp_cde          | Originator party code (defaulted)                                  |
+| dp_cde                      | DP Code (business logic derived)                                   |
+| usb_cashflow_cde            | USB Cashflow Code (business logic derived)                         |
+| usb_onus_external_tnx_cde   | On-US/Off-US transaction code                                      |
+| pymt_purpose_cde            | Payment purpose code                                               |
+| credit_debit_cde            | Credit/Debit indicator                                             |
+| nacha_sec_code              | NACHA SEC code (transaction type)                                  |
+| originator_company_id       | Originator company identifier                                      |
+| dest_check_nbr              | Destination check number                                           |
+| ...                         | Other fields as per transaction detail table                       |
 
 ---
 
-## Organization and Readability
+## 9. Summary
 
-- Each section is clearly labeled and structured.
-- Data mapping is provided in a table for easy reference.
-- Complexity metrics are tabulated for transparency.
-- Field descriptions are comprehensive and business-friendly.
-- Documentation is suitable for both technical and non-technical stakeholders.
+This function is a critical data pipeline component for ACH transaction processing. It ensures data quality through cleaning, classification, and enrichment, and provides robust logging and error handling for operational transparency. The design leverages temporary tables for stepwise transformation, modular function calls for classification and enrichment, and comprehensive audit logging for traceability.
 
 ---
-
-**End of Documentation**
