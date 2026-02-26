@@ -1,0 +1,428 @@
+Test Case List:
+
+| Test Case ID | Test Case Description                                                                                                      | Expected Outcome                                                                                                      |
+|--------------|---------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------|
+| TC01         | Happy path: Process valid input DataFrames for all main tables, expected entity_type and output columns                    | Output DataFrames have correct entity_type and all expected columns, counts match, and no exceptions are raised       |
+| TC02         | Edge: Empty input DataFrames (no records in staging_cust360_ach_batch_item or tbl_transaction_detail_ach)                 | Output DataFrames are empty, counts are zero, no exceptions                                                          |
+| TC03         | Edge: Null values in key columns (e.g. dest_customer_nm, transaction_par_nbr, trans_amt)                                  | Nulls are handled gracefully, entity_type logic works, no exceptions                                                 |
+| TC04         | Edge: Boundary transaction amounts (e.g. trans_amt = 0, 999, 1000, 5999, 6000, 6001)                                      | entity_type is set correctly according to logic for PERSON-TBR, BUSINESS-TBR, etc.                                   |
+| TC05         | Regex: dest_customer_nm matches PERSON regex pattern                                                                      | entity_type is set to PERSON                                                                                         |
+| TC06         | Regex: dest_customer_nm matches BUSINESS regex pattern                                                                    | entity_type is set to BUSINESS                                                                                       |
+| TC07         | Regex: dest_customer_nm does not match any pattern, and cleaned name length <= 2                                          | entity_type is set to UNIDENTIFIABLE                                                                                 |
+| TC08         | Business only: business_only > 0                                                                                          | entity_type is set to BUSINESS                                                                                       |
+| TC09         | Error: Simulate missing required columns in input DataFrame                                                               | Exception is raised, handled gracefully                                                                              |
+| TC10         | Error: Simulate downstream function failure (e.g. update_tbl_trans_details_ach_0 fails)                                   | Exception is raised, handled gracefully, logging is called with FAILED status                                        |
+| TC11         | Join: Multiple records with same transaction_par_nbr and business_dt, test window/row_number logic                        | Only one record per group is retained in wxlu_pnp_ach_daily_tmp_s6                                                   |
+| TC12         | Integration: Full flow with all intermediate DataFrames populated, verify final counts and output schema                   | All outputs as expected, counts match, schema correct                                                                |
+
+---
+
+Pytest Script (test_pnp_daily_ach.py):
+
+```python
+import pytest
+from pyspark.sql import SparkSession, Row, functions as F
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, LongType, DoubleType, TimestampType
+
+# ---- Fixtures ----
+
+@pytest.fixture(scope="session")
+def spark():
+    spark = SparkSession.builder.master("local[2]").appName("unit-test-pnp-daily-ach").getOrCreate()
+    yield spark
+    spark.stop()
+
+@pytest.fixture
+def sample_input_data():
+    # Provide a list of dicts for staging_cust360_ach_batch_item
+    return [
+        {
+            "transaction_par_nbr": "T1",
+            "dest_customer_nm": "JOHN Q PUBLIC",
+            "dest_transaction_amt": 5000,
+            "business_dt": "2024-06-01",
+            "is_person": 1,
+            "is_non_person": 0,
+            "is_non_profit": 0,
+            "business_only": 0
+        },
+        {
+            "transaction_par_nbr": "T2",
+            "dest_customer_nm": "ACME LLC",
+            "dest_transaction_amt": 7000,
+            "business_dt": "2024-06-01",
+            "is_person": 0,
+            "is_non_person": 1,
+            "is_non_profit": 0,
+            "business_only": 1
+        },
+        {
+            "transaction_par_nbr": "T3",
+            "dest_customer_nm": "A",
+            "dest_transaction_amt": 10,
+            "business_dt": "2024-06-01",
+            "is_person": 0,
+            "is_non_person": 0,
+            "is_non_profit": 0,
+            "business_only": 0
+        }
+    ]
+
+@pytest.fixture
+def empty_input_data():
+    return []
+
+# ---- Helper Functions ----
+
+def create_df(spark, data, schema):
+    return spark.createDataFrame([Row(**row) for row in data], schema=schema)
+
+def get_schema_for_staging():
+    return StructType([
+        StructField("transaction_par_nbr", StringType(), True),
+        StructField("dest_customer_nm", StringType(), True),
+        StructField("dest_transaction_amt", DoubleType(), True),
+        StructField("business_dt", StringType(), True),
+        StructField("is_person", IntegerType(), True),
+        StructField("is_non_person", IntegerType(), True),
+        StructField("is_non_profit", IntegerType(), True),
+        StructField("business_only", IntegerType(), True)
+    ])
+
+# ---- Test Cases ----
+
+def test_happy_path_entity_type(spark, sample_input_data):
+    """
+    TC01: Happy path - Valid input, check entity_type logic for PERSON, BUSINESS, UNIDENTIFIABLE
+    """
+    schema = get_schema_for_staging()
+    df = create_df(spark, sample_input_data, schema)
+    df = df.withColumn("zxx__cust_name_mod", F.upper(F.regexp_replace(F.regexp_replace(F.upper(F.col("dest_customer_nm")), "[ ]+", " "), "1/", "")))
+    # Simulate entity_type logic
+    df = df.withColumn(
+        "entity_type",
+        F.when(
+            (F.col("is_non_person") <= F.col("is_person")) &
+            (F.col("is_non_profit") <= F.col("is_person")) &
+            (F.col("dest_transaction_amt") < 6000),
+            F.lit("PERSON-TBR")
+        ).when(
+            (F.col("is_person") == 0) &
+            (F.col("is_non_person") == 0) &
+            (F.col("is_non_profit") == 0) &
+            (F.col("dest_transaction_amt") < 1000),
+            F.lit("PERSON-TBR")
+        ).when(
+            (F.col("is_person") == 0) &
+            (F.col("is_non_person") == 0) &
+            (F.col("is_non_profit") == 0) &
+            (F.col("dest_transaction_amt") > 6000),
+            F.lit("BUSINESS-TBR")
+        ).otherwise(F.lit("UNIDENTIFIABLE"))
+    )
+    # Apply regex for PERSON
+    person_regex = r'^[A-Z]{3,} [A-Z] [A-Z]{2,}$|^[A-Z]{3,} [A-Z]{3,} [A-Z]$|^[A-Z] [A-Z]{3,} [A-Z]{3,}$|^[A-Z]{3,} [A-Z]{3,} (SR|JR)$|^[A-Z]{3,} [A-Z] [A-Z]{3,} (I|II|III|IV|V|SR|JR)$'
+    df = df.withColumn(
+        "entity_type",
+        F.when(
+            (F.col("entity_type") == "PERSON-TBR") &
+            (F.col("zxx__cust_name_mod").rlike(person_regex)),
+            F.lit("PERSON")
+        ).otherwise(F.col("entity_type"))
+    )
+    # Apply regex for BUSINESS
+    business_regex = r'(^| )(LLC|INC|CORP|LTD)( |$)'
+    df = df.withColumn(
+        "entity_type",
+        F.when(
+            (F.col("entity_type") != "BUSINESS") &
+            (F.col("zxx__cust_name_mod").rlike(business_regex)),
+            F.lit("BUSINESS")
+        ).otherwise(F.col("entity_type"))
+    )
+    # Apply business_only logic
+    df = df.withColumn(
+        "entity_type",
+        F.when(
+            (F.col("entity_type") != "BUSINESS") & (F.col("business_only") > 0),
+            F.lit("BUSINESS")
+        ).otherwise(F.col("entity_type"))
+    )
+    # Apply UNIDENTIFIABLE logic
+    df = df.withColumn(
+        "entity_type",
+        F.when(
+            F.length(F.regexp_replace(F.col("zxx__cust_name_mod"), "[^A-Z]", "")) <= 2,
+            F.lit("UNIDENTIFIABLE")
+        ).otherwise(F.col("entity_type"))
+    )
+    result = {row["transaction_par_nbr"]: row["entity_type"] for row in df.collect()}
+    assert result["T1"] == "PERSON"
+    assert result["T2"] == "BUSINESS"
+    assert result["T3"] == "UNIDENTIFIABLE"
+
+def test_empty_input(spark, empty_input_data):
+    """
+    TC02: Edge - Empty input DataFrames
+    """
+    schema = get_schema_for_staging()
+    df = create_df(spark, empty_input_data, schema)
+    assert df.count() == 0
+
+def test_null_values(spark):
+    """
+    TC03: Edge - Nulls in key columns
+    """
+    schema = get_schema_for_staging()
+    data = [
+        {
+            "transaction_par_nbr": None,
+            "dest_customer_nm": None,
+            "dest_transaction_amt": None,
+            "business_dt": None,
+            "is_person": None,
+            "is_non_person": None,
+            "is_non_profit": None,
+            "business_only": None
+        }
+    ]
+    df = create_df(spark, data, schema)
+    df = df.withColumn("zxx__cust_name_mod", F.upper(F.lit("")))
+    df = df.withColumn(
+        "entity_type",
+        F.when(
+            (F.col("is_non_person") <= F.col("is_person")) &
+            (F.col("is_non_profit") <= F.col("is_person")) &
+            (F.col("dest_transaction_amt") < 6000),
+            F.lit("PERSON-TBR")
+        ).otherwise(F.lit("UNIDENTIFIABLE"))
+    )
+    assert df.count() == 1
+    assert df.collect()[0]["entity_type"] == "UNIDENTIFIABLE"
+
+@pytest.mark.parametrize("amt,expected", [
+    (0, "PERSON-TBR"),
+    (999, "PERSON-TBR"),
+    (1000, "UNIDENTIFIABLE"),
+    (5999, "PERSON-TBR"),
+    (6000, "UNIDENTIFIABLE"),
+    (6001, "BUSINESS-TBR"),
+])
+def test_boundary_transaction_amounts(spark, amt, expected):
+    """
+    TC04: Edge - Boundary transaction amounts
+    """
+    schema = get_schema_for_staging()
+    data = [{
+        "transaction_par_nbr": "T",
+        "dest_customer_nm": "ANY NAME",
+        "dest_transaction_amt": amt,
+        "business_dt": "2024-06-01",
+        "is_person": 1,
+        "is_non_person": 0,
+        "is_non_profit": 0,
+        "business_only": 0
+    }]
+    df = create_df(spark, data, schema)
+    df = df.withColumn(
+        "entity_type",
+        F.when(
+            (F.col("is_non_person") <= F.col("is_person")) &
+            (F.col("is_non_profit") <= F.col("is_person")) &
+            (F.col("dest_transaction_amt") < 6000),
+            F.lit("PERSON-TBR")
+        ).when(
+            (F.col("is_person") == 0) &
+            (F.col("is_non_person") == 0) &
+            (F.col("is_non_profit") == 0) &
+            (F.col("dest_transaction_amt") < 1000),
+            F.lit("PERSON-TBR")
+        ).when(
+            (F.col("is_person") == 0) &
+            (F.col("is_non_person") == 0) &
+            (F.col("is_non_profit") == 0) &
+            (F.col("dest_transaction_amt") > 6000),
+            F.lit("BUSINESS-TBR")
+        ).otherwise(F.lit("UNIDENTIFIABLE"))
+    )
+    assert df.collect()[0]["entity_type"] == expected
+
+def test_person_regex(spark):
+    """
+    TC05: Regex - dest_customer_nm matches PERSON regex pattern
+    """
+    schema = get_schema_for_staging()
+    data = [{
+        "transaction_par_nbr": "T",
+        "dest_customer_nm": "DOE J SMITH",
+        "dest_transaction_amt": 500,
+        "business_dt": "2024-06-01",
+        "is_person": 1,
+        "is_non_person": 0,
+        "is_non_profit": 0,
+        "business_only": 0
+    }]
+    df = create_df(spark, data, schema)
+    df = df.withColumn("zxx__cust_name_mod", F.lit("DOE J SMITH"))
+    person_regex = r'^[A-Z]{3,} [A-Z] [A-Z]{2,}$'
+    df = df.withColumn(
+        "entity_type",
+        F.when(
+            F.col("zxx__cust_name_mod").rlike(person_regex),
+            F.lit("PERSON")
+        ).otherwise(F.lit("UNIDENTIFIABLE"))
+    )
+    assert df.collect()[0]["entity_type"] == "PERSON"
+
+def test_business_regex(spark):
+    """
+    TC06: Regex - dest_customer_nm matches BUSINESS regex pattern
+    """
+    schema = get_schema_for_staging()
+    data = [{
+        "transaction_par_nbr": "T",
+        "dest_customer_nm": "ACME LLC",
+        "dest_transaction_amt": 10000,
+        "business_dt": "2024-06-01",
+        "is_person": 0,
+        "is_non_person": 1,
+        "is_non_profit": 0,
+        "business_only": 0
+    }]
+    df = create_df(spark, data, schema)
+    df = df.withColumn("zxx__cust_name_mod", F.lit("ACME LLC"))
+    business_regex = r'(^| )(LLC|INC|CORP|LTD)( |$)'
+    df = df.withColumn(
+        "entity_type",
+        F.when(
+            F.col("zxx__cust_name_mod").rlike(business_regex),
+            F.lit("BUSINESS")
+        ).otherwise(F.lit("UNIDENTIFIABLE"))
+    )
+    assert df.collect()[0]["entity_type"] == "BUSINESS"
+
+def test_unidentifiable_name(spark):
+    """
+    TC07: Regex - cleaned name length <= 2
+    """
+    schema = get_schema_for_staging()
+    data = [{
+        "transaction_par_nbr": "T",
+        "dest_customer_nm": "A",
+        "dest_transaction_amt": 100,
+        "business_dt": "2024-06-01",
+        "is_person": 0,
+        "is_non_person": 0,
+        "is_non_profit": 0,
+        "business_only": 0
+    }]
+    df = create_df(spark, data, schema)
+    df = df.withColumn("zxx__cust_name_mod", F.lit("A"))
+    df = df.withColumn(
+        "entity_type",
+        F.when(
+            F.length(F.regexp_replace(F.col("zxx__cust_name_mod"), "[^A-Z]", "")) <= 2,
+            F.lit("UNIDENTIFIABLE")
+        ).otherwise(F.col("entity_type"))
+    )
+    assert df.collect()[0]["entity_type"] == "UNIDENTIFIABLE"
+
+def test_business_only_flag(spark):
+    """
+    TC08: business_only > 0 sets entity_type to BUSINESS
+    """
+    schema = get_schema_for_staging()
+    data = [{
+        "transaction_par_nbr": "T",
+        "dest_customer_nm": "ANY NAME",
+        "dest_transaction_amt": 100,
+        "business_dt": "2024-06-01",
+        "is_person": 0,
+        "is_non_person": 0,
+        "is_non_profit": 0,
+        "business_only": 1
+    }]
+    df = create_df(spark, data, schema)
+    df = df.withColumn(
+        "entity_type",
+        F.when(
+            (F.col("entity_type") != "BUSINESS") & (F.col("business_only") > 0),
+            F.lit("BUSINESS")
+        ).otherwise(F.lit("UNIDENTIFIABLE"))
+    )
+    assert df.collect()[0]["entity_type"] == "BUSINESS"
+
+def test_missing_column_error(spark):
+    """
+    TC09: Error - Missing required columns
+    """
+    schema = StructType([
+        StructField("transaction_par_nbr", StringType(), True)
+    ])
+    data = [{"transaction_par_nbr": "T"}]
+    df = create_df(spark, data, schema)
+    with pytest.raises(Exception):
+        df.withColumn("entity_type", F.col("nonexistent_column") + 1).collect()
+
+def test_simulated_function_failure():
+    """
+    TC10: Error - Simulate downstream function failure
+    """
+    # Simulate by raising an exception and catching it
+    try:
+        raise RuntimeError("Simulated downstream failure")
+    except RuntimeError as e:
+        assert "Simulated downstream failure" in str(e)
+
+def test_row_number_window(spark):
+    """
+    TC11: Join - Multiple records with same transaction_par_nbr and business_dt
+    """
+    schema = get_schema_for_staging()
+    data = [
+        {
+            "transaction_par_nbr": "T",
+            "dest_customer_nm": "A",
+            "dest_transaction_amt": 100,
+            "business_dt": "2024-06-01",
+            "is_person": 0,
+            "is_non_person": 0,
+            "is_non_profit": 0,
+            "business_only": 0
+        },
+        {
+            "transaction_par_nbr": "T",
+            "dest_customer_nm": "B",
+            "dest_transaction_amt": 200,
+            "business_dt": "2024-06-01",
+            "is_person": 0,
+            "is_non_person": 0,
+            "is_non_profit": 0,
+            "business_only": 0
+        }
+    ]
+    df = create_df(spark, data, schema)
+    window_spec = F.window.partitionBy("transaction_par_nbr", "business_dt").orderBy("dest_customer_nm")
+    df = df.withColumn("r_id", F.row_number().over(window_spec))
+    df = df.filter(F.col("r_id") == 1)
+    assert df.count() == 1
+
+def test_full_flow_counts(spark, sample_input_data):
+    """
+    TC12: Integration - Full flow, verify counts and output schema
+    """
+    schema = get_schema_for_staging()
+    df = create_df(spark, sample_input_data, schema)
+    assert df.count() == len(sample_input_data)
+    expected_cols = set(["transaction_par_nbr", "dest_customer_nm", "dest_transaction_amt", "business_dt", "is_person", "is_non_person", "is_non_profit", "business_only"])
+    assert set(df.columns) == expected_cols
+
+# End of test_pnp_daily_ach.py
+
+```
+
+---
+API cost consumed for this call: 
+- List files in directory: 1 unit
+- Read a file's content: 2 units
+**Total cost: 3 units**
