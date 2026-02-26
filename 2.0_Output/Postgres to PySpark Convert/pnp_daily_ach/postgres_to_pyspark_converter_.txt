@@ -1,0 +1,329 @@
+# Converted PySpark Code for PostgreSQL Function: moneymovement_source.pnp_daily_ach
+
+```python
+from pyspark.sql import SparkSession, functions as F, Window
+from pyspark.sql.types import StringType, IntegerType, LongType, ArrayType, TimestampType
+
+# Initialize Spark session
+spark = SparkSession.builder.appName("PNP_ACH_Daily").getOrCreate()
+
+# Helper UDFs (if needed, e.g., for regex replacement)
+import re
+from pyspark.sql.functions import udf
+
+def regex_replace_all(val, pattern, repl):
+    if val is None:
+        return None
+    return re.sub(pattern, repl, val)
+
+regex_replace_all_udf = udf(regex_replace_all, StringType())
+
+# 1. Initial record count and timestamp
+initial_ts = F.current_timestamp()
+tbl_transaction_detail_ach = spark.table("moneymovement_source.tbl_transaction_detail_ach")
+initial_record_count = tbl_transaction_detail_ach.count()
+
+# Step 0: Get max business_dt from tbl_transaction_detail_ach for last 27 days
+dt_max = (
+    tbl_transaction_detail_ach
+    .filter(F.col("business_dt") >= F.date_sub(F.current_date(), 27))
+    .agg(F.max("business_dt").alias("dt_max"))
+    .collect()[0]["dt_max"]
+)
+
+# Step 1: Create wxlu_pnp_ach_daily_tmp_s0
+staging_cust360_ach_batch_item = spark.table("moneymovement_source.staging_cust360_ach_batch_item")
+wxlu_pnp_ach_daily_tmp_s0 = (
+    staging_cust360_ach_batch_item
+    .filter(
+        (F.col("business_dt") >= F.date_sub(F.current_date(), 25)) &
+        (F.col("business_dt") > F.lit(dt_max))
+    )
+)
+
+wxlu_pnp_ach_daily_tmp_s0.createOrReplaceTempView("wxlu_pnp_ach_daily_tmp_s0")
+
+# Step 2: Create wxlu_pnp_ach_daily_tmp_s1
+wxlu_pnp_ach_daily_tmp_s1 = (
+    wxlu_pnp_ach_daily_tmp_s0
+    .select(
+        F.lit("ACH").alias("sor_type"),
+        F.col("transaction_par_nbr").alias("trans_id"),
+        F.lit("zxx__cust_name").alias("col_name"),
+        F.upper(
+            F.regexp_replace(
+                F.regexp_replace(
+                    F.upper(F.col("dest_customer_nm")),
+                    "[ ]+", " "
+                ),
+                "1/", ""
+            )
+        ).alias("zxx__cust_name_mod"),
+        F.col("dest_transaction_amt").alias("trans_amt"),
+        F.col("business_dt").alias("bus_date")
+    )
+)
+wxlu_pnp_ach_daily_tmp_s1.createOrReplaceTempView("wxlu_pnp_ach_daily_tmp_s1")
+
+# Step 3: Call moneymovement_source.pnp_cust_name (Assume this is a Python function or PySpark UDF)
+# Placeholder: You must implement this function in PySpark or call equivalent logic.
+# For now, let's assume it creates wxlu_pnp_ach_daily_tmp_s2 as a DataFrame.
+# wxlu_pnp_ach_daily_tmp_s2 = pnp_cust_name(wxlu_pnp_ach_daily_tmp_s1)
+
+# Step 4: Create wxlu_pnp_ach_daily_tmp_s3
+wxlu_pnp_ach_daily_tmp_s2 = spark.table("moneymovement_sandbox_lab.wxlu_pnp_ach_daily_tmp_s2")
+wxlu_pnp_ach_daily_tmp_s3 = (
+    wxlu_pnp_ach_daily_tmp_s1.alias("a")
+    .join(
+        wxlu_pnp_ach_daily_tmp_s2.alias("b"),
+        F.col("a.zxx__cust_name_mod") == F.col("b.zxx__cust_name_mod"),
+        "left"
+    )
+    .selectExpr(
+        "a.*",
+        "b.zxx__cust_name_mod_new",
+        "b.is_person",
+        "b.is_non_person",
+        "b.is_non_profit",
+        "b.business_only",
+        "coalesce(b.entity_type, 'UNIDENTIFIABLE') as entity_type"
+    )
+    .distinct()
+)
+wxlu_pnp_ach_daily_tmp_s3.createOrReplaceTempView("wxlu_pnp_ach_daily_tmp_s3")
+
+# Step 5: Update entity_type to 'PERSON-TBR'
+wxlu_pnp_ach_daily_tmp_s3 = wxlu_pnp_ach_daily_tmp_s3.withColumn(
+    "entity_type",
+    F.when(
+        (~F.col("entity_type").isin("PERSON", "PERSON-TBR")) &
+        (
+            ((F.col("is_non_person") <= F.col("is_person")) & 
+             (F.col("is_non_profit") <= F.col("is_person")) &
+             (F.col("trans_amt") < 6000)) |
+            ((F.col("is_person") == 0) & 
+             (F.col("is_non_person") == 0) & 
+             (F.col("is_non_profit") == 0) & 
+             (F.col("trans_amt") < 1000))
+        ),
+        F.lit("PERSON-TBR")
+    ).otherwise(F.col("entity_type"))
+)
+
+# Step 6: Update entity_type to 'BUSINESS-TBR'
+wxlu_pnp_ach_daily_tmp_s3 = wxlu_pnp_ach_daily_tmp_s3.withColumn(
+    "entity_type",
+    F.when(
+        (~F.col("entity_type").isin("PERSON")) &
+        (F.col("is_person") == 0) &
+        (F.col("is_non_person") == 0) &
+        (F.col("is_non_profit") == 0) &
+        (F.col("trans_amt") > 6000),
+        F.lit("BUSINESS-TBR")
+    ).otherwise(F.col("entity_type"))
+)
+
+# Step 7: Update entity_type to 'PERSON' using regex patterns
+person_patterns = [
+    r'^[A-Z]{3,} [A-Z] [A-Z]{2,}$',
+    r'^[A-Z]{3,} [A-Z]{3,} [A-Z]$',
+    r'^[A-Z] [A-Z]{3,} [A-Z]{3,}$',
+    r'^[A-Z]{3,} [A-Z]{3,} (SR|JR)$',
+    r'^[A-Z]{3,} [A-Z] [A-Z]{3,} (I|II|III|IV|V|SR|JR)$'
+]
+person_regex = "|".join(person_patterns)
+wxlu_pnp_ach_daily_tmp_s3 = wxlu_pnp_ach_daily_tmp_s3.withColumn(
+    "entity_type",
+    F.when(
+        (F.col("entity_type") == "PERSON-TBR") &
+        (F.col("zxx__cust_name_mod_new").rlike(person_regex)),
+        F.lit("PERSON")
+    ).otherwise(F.col("entity_type"))
+)
+
+# Step 8: Update entity_type to 'BUSINESS' using business patterns
+business_patterns = [
+    r'(^| )(ADVI|AMBA|APS|AVE|AG|BV|CIC|CIO|CITY|CO|COM|COMM|COMP|CORP|CTR|CU|DBA|DDS|DMD|DNO|DOO)( |$)',
+    r'(^| )(ECU|EIRL|EQUI|EURL|FCP|FCR|FICC|FMBA|FOOD|FUEL|GIE|GIU|GMBH|HOA|HOSP|ILP|INC|INH|INN)( |$)',
+    r'(^| )(IVS|JDOO|JTD|KFT|LC|LDA|LIFE|LLC|LP|LLP|LLLP|LMP|LOGI|LPN|LTD|LTDA|MBH|MD|MFG|MTG)( |$)',
+    r'(^| )(NA|NEW|NL|NO|NV|OOO|OPS|PAYM|PAYR|PC|PCA|PEEC|PHYS|PLC|PLLC|PSC|PTE|PTY)( |$)',
+    r'(^| )(SA|SAD|SARL|SAS|SASU|SCA|SCI|SCOP|SCP|SCPA|SCR|SCRA|SCS|SEM|SEP|SGR|SICC)( |$)',
+    r'(^| )(SLL|SLNE|SLP|SMBA|SNC|SOC|SPA|SPPL|SPV|SRL|SVC|SVS|SYS|SÀ|SÀRL|TECH|TRUST|UNIV|USA|UTE)( |$)',
+    r'(^| )(US BANK|U S BANK|BANK OF AMERICA|LIQUOR|CAFE|SUSHI)( |$)',
+    r'(^| )(L L C|L L P|L T D)( |$)'
+]
+business_regex = "|".join(business_patterns)
+wxlu_pnp_ach_daily_tmp_s3 = wxlu_pnp_ach_daily_tmp_s3.withColumn(
+    "entity_type",
+    F.when(
+        (F.col("entity_type") != "BUSINESS") &
+        (F.regexp_replace(F.regexp_replace(F.col("zxx__cust_name_mod"), "C/O ", " "), "[^A-Z]", " ").rlike(business_regex) |
+         F.col("zxx__cust_name_mod_new").rlike(r"(^| )(L L C|L L P|L T D)( |$)")
+        ),
+        F.lit("BUSINESS")
+    ).otherwise(F.col("entity_type"))
+)
+
+# Step 9: Update entity_type to 'BUSINESS' where business_only > 0
+wxlu_pnp_ach_daily_tmp_s3 = wxlu_pnp_ach_daily_tmp_s3.withColumn(
+    "entity_type",
+    F.when(
+        (F.col("entity_type") != "BUSINESS") & (F.col("business_only") > 0),
+        F.lit("BUSINESS")
+    ).otherwise(F.col("entity_type"))
+)
+
+# Step 10: Update entity_type to 'UNIDENTIFIABLE' where length of cleaned name <= 2
+wxlu_pnp_ach_daily_tmp_s3 = wxlu_pnp_ach_daily_tmp_s3.withColumn(
+    "entity_type",
+    F.when(
+        F.length(F.regexp_replace(F.col("zxx__cust_name_mod"), "[^A-Z]", "")) <= 2,
+        F.lit("UNIDENTIFIABLE")
+    ).otherwise(F.col("entity_type"))
+)
+
+wxlu_pnp_ach_daily_tmp_s3.createOrReplaceTempView("wxlu_pnp_ach_daily_tmp_s3")
+
+# Step 11: Create wxlu_pnp_ach_daily_tmp_s4
+wxlu_pnp_ach_daily_tmp_s4 = (
+    wxlu_pnp_ach_daily_tmp_s0.alias("a")
+    .join(
+        wxlu_pnp_ach_daily_tmp_s3.alias("b"),
+        F.col("a.transaction_par_nbr") == F.col("b.trans_id"),
+        "left"
+    )
+    .selectExpr(
+        "a.*",
+        "b.entity_type as destination_pnp_cde",
+        "'' as originator_pnp_cde",
+        "'' as dp_cde",
+        "'' as destination_party_mma_id",
+        "'' as originator_party_mma_id",
+        "'' as destination_party_lpid",
+        "'' as originator_party_lpid",
+        "'' as originator_3rdparty_mma_id",
+        "'' as usb_onus_external_tnx_cde",
+        "'' as usb_cashflow_cde",
+        "'' as pymt_purpose_cde"
+    )
+    .distinct()
+)
+wxlu_pnp_ach_daily_tmp_s4.createOrReplaceTempView("wxlu_pnp_ach_daily_tmp_s4")
+
+# Step 12: Create wxlu_pnp_ach_daily_tmp_s5
+tbl_evn_na_merchant_details = spark.table("moneymovement_source.tbl_evn_na_merchant_details")
+wxlu_pnp_ach_daily_tmp_s5 = (
+    wxlu_pnp_ach_daily_tmp_s4.join(
+        tbl_evn_na_merchant_details,
+        F.col("dest_check_nbr") == F.concat(F.expr("repeat('0', 15-length(prcs_sys_id_txt))"), F.col("prcs_sys_id_txt")),
+        "inner"
+    )
+    .filter(
+        (~F.col("destination_pnp_cde").isin("BUSINESS")) &
+        (F.col("originator_company_id").isin([
+            '1841010148', '2841010148', 'A581916822', '6819168223', '1295686500', '5819168222', 'P410417860',
+            'A591916822', '1158191682', '9581916822', 'A410417860', '3581916822', '5581916822', '1821826444',
+            'A581916823', '7047690210', '2953433174', '1430988997', 'C581916822', 'D581916822', '2581916822',
+            '1660690062', '1940475440', '9750300655', '9990100039'
+        ]))
+    )
+    .select(
+        "transaction_par_nbr", "destination_pnp_cde", "dest_customer_nm", "dest_check_nbr", "dest_transaction_amt",
+        "credit_debit_cde", "nacha_sec_code", "transaction_desc", "discretionary_txt", "originator_company_id",
+        "originator_company_name", "src_dest_arrangement_nbr", "originating_rt_nbr", "desti_return_reason_desc",
+        "dest_arrangement_id"
+    )
+)
+wxlu_pnp_ach_daily_tmp_s5.createOrReplaceTempView("wxlu_pnp_ach_daily_tmp_s5")
+
+# Step 13: Update wxlu_pnp_ach_daily_tmp_s4 set destination_pnp_cde = 'BUSINESS' for matching transaction_par_nbr
+business_ids = [row["transaction_par_nbr"] for row in wxlu_pnp_ach_daily_tmp_s5.select("transaction_par_nbr").distinct().collect()]
+wxlu_pnp_ach_daily_tmp_s4 = wxlu_pnp_ach_daily_tmp_s4.withColumn(
+    "destination_pnp_cde",
+    F.when(F.col("transaction_par_nbr").isin(business_ids), F.lit("BUSINESS")).otherwise(F.col("destination_pnp_cde"))
+)
+wxlu_pnp_ach_daily_tmp_s4.createOrReplaceTempView("wxlu_pnp_ach_daily_tmp_s4")
+
+# Step 14: Create wxlu_pnp_ach_daily_tmp_s6 with row_number window
+window_spec = Window.partitionBy("transaction_par_nbr", "business_dt").orderBy("destination_pnp_cde")
+wxlu_pnp_ach_daily_tmp_s6 = (
+    wxlu_pnp_ach_daily_tmp_s4
+    .withColumn("r_id", F.row_number().over(window_spec))
+    .filter(F.col("r_id") == 1)
+    .drop("r_id")
+)
+wxlu_pnp_ach_daily_tmp_s6.createOrReplaceTempView("wxlu_pnp_ach_daily_tmp_s6")
+
+# Step 15: Create moneymovement_sandbox_lab.wxlu_update_tbl_trans_details_ach_s0
+wxlu_update_tbl_trans_details_ach_s0 = (
+    wxlu_pnp_ach_daily_tmp_s6
+    .select(
+        "transaction_par_nbr", "dest_check_nbr", "dest_tr_nbr", "originator_company_id",
+        "originating_rt_nbr", "dest_arrangement_id", "collctn_point_cde", "credit_debit_cde", "business_dt"
+    )
+)
+wxlu_update_tbl_trans_details_ach_s0.createOrReplaceTempView("moneymovement_sandbox_lab.wxlu_update_tbl_trans_details_ach_s0")
+
+# Step 16: Call moneymovement_source.update_tbl_trans_details_ach_0() (Assume this is a Python function or PySpark UDF)
+# Placeholder: You must implement this function in PySpark or call equivalent logic.
+# wxlu_pnp_ach_daily_tmp_s7 = update_tbl_trans_details_ach_0()
+
+# Step 17: Update wxlu_pnp_ach_daily_tmp_s6 with dp_cde, usb_cashflow_cde, usb_onus_external_tnx_cde from wxlu_pnp_ach_daily_tmp_s7
+wxlu_pnp_ach_daily_tmp_s7 = spark.table("moneymovement_sandbox_lab.wxlu_pnp_ach_daily_tmp_s7")
+wxlu_pnp_ach_daily_tmp_s6 = (
+    wxlu_pnp_ach_daily_tmp_s6.alias("z")
+    .join(
+        wxlu_pnp_ach_daily_tmp_s7.alias("a"),
+        (F.col("z.transaction_par_nbr") == F.col("a.transaction_par_nbr")) &
+        (F.col("z.business_dt") == F.col("a.business_dt")),
+        "left"
+    )
+    .select(
+        "z.*",
+        F.col("a.dp_cde"),
+        F.col("a.usb_cashflow_cde"),
+        F.col("a.usb_onus_external_tnx_cde")
+    )
+)
+wxlu_pnp_ach_daily_tmp_s6.createOrReplaceTempView("wxlu_pnp_ach_daily_tmp_s6")
+
+# Step 18: Insert into moneymovement_source.tbl_transaction_detail_ach
+# (Assuming the schema matches, otherwise select columns as needed)
+wxlu_pnp_ach_daily_tmp_s6.write.insertInto("moneymovement_source.tbl_transaction_detail_ach", overwrite=False)
+
+# Step 19: Get counts for logging
+cnt1 = wxlu_pnp_ach_daily_tmp_s1.count()
+cnt2 = wxlu_update_tbl_trans_details_ach_s0.count()
+cnt3 = wxlu_pnp_ach_daily_tmp_s3.count()
+cnts = [cnt1, cnt2, cnt3]
+
+# Step 20: Final record count and timestamp
+final_record_count = spark.table("moneymovement_source.tbl_transaction_detail_ach").count()
+final_ts = F.current_timestamp()
+
+# Step 21: Logging (Assume log_job_run_status is a Python function or PySpark UDF)
+job_name = "PNP_ACH_Daily"
+run_status = "SUCCESS"
+audit_text = "pnp_daily_ach"
+# log_job_run_status(job_name, run_status, initial_ts, final_ts, audit_text, final_record_count-initial_record_count, session_user)
+
+# Exception handling should be implemented in the driver code as try/except in Python.
+
+# Return counts
+print(cnts)
+```
+
+# Notes:
+- Some PostgreSQL stored procedure calls (e.g., `moneymovement_source.pnp_cust_name`, `moneymovement_source.update_tbl_trans_details_ach_0`, `moneymovement_source.log_job_run_status`) are assumed to be implemented as PySpark functions or handled externally.
+- All table references are assumed to be accessible via Spark catalog.
+- Regex and string manipulations are handled using PySpark's `regexp_replace`, `rlike`, and UDFs where needed.
+- All DataFrame transformations are chained and intermediate results are registered as temp views for SQL compatibility.
+- For update operations, PySpark DataFrames are reassigned with the updated column logic.
+- Comments are included to explain complex transformations.
+- The code follows PEP 8 style guidelines and is well-formatted.
+
+---
+API cost consumed for this call: 
+- List files in directory: 1 unit
+- Read a file's content: 2 units
+**Total cost: 3 units**
