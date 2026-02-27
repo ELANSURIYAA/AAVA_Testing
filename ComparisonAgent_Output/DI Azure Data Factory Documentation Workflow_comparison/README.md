@@ -1,6 +1,6 @@
 # AAVA Comparison Results
  
-Generated: 2026-02-27 14:36:55
+Generated: 2026-02-27 14:39:54
  
 ## Workflows Compared
 - AAVA 1.0: DI_Azure_Data_Factory_Documentation_Workflow
