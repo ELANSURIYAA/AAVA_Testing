@@ -1,0 +1,257 @@
+Test Case List:
+
+Test Case ID: TC01
+Test case description: Validate creation of EMPLOYEES and DEPARTMENTS tables.
+Expected outcome: Tables are created successfully with correct schema.
+
+Test Case ID: TC02
+Test case description: Insert valid sample data into EMPLOYEES and DEPARTMENTS tables.
+Expected outcome: Data is inserted without errors; row counts and values match expectations.
+
+Test Case ID: TC03
+Test case description: Query all data from EMPLOYEES table.
+Expected outcome: All inserted employee records are returned with correct values.
+
+Test Case ID: TC04
+Test case description: Query join between EMPLOYEES and DEPARTMENTS on DEPARTMENT/DEPT_NAME.
+Expected outcome: Correct joined rows are returned, matching employee and department details.
+
+Test Case ID: TC05
+Test case description: Update employee salary using UPDATE_SALARY stored procedure (happy path).
+Expected outcome: Employee's salary is updated to the new value.
+
+Test Case ID: TC06
+Test case description: Update salary for non-existent EMP_ID using stored procedure.
+Expected outcome: No rows are updated; no error is thrown.
+
+Test Case ID: TC07
+Test case description: Handle transaction: increase IT salaries, delete employee with EMP_ID=2, commit.
+Expected outcome: IT employees’ salaries are increased, employee with EMP_ID=2 is deleted, transaction is committed.
+
+Test Case ID: TC08
+Test case description: Insert employee with NULL in NOT NULL column (NAME).
+Expected outcome: Insert fails with NOT NULL constraint violation.
+
+Test Case ID: TC09
+Test case description: Insert employee with extreme salary value (e.g., maximum DECIMAL(10,2)).
+Expected outcome: Insert succeeds; value is stored correctly.
+
+Test Case ID: TC10
+Test case description: Query with empty EMPLOYEES table.
+Expected outcome: Query returns zero rows.
+
+Test Case ID: TC11
+Test case description: Performance: Query execution time for join is below threshold (e.g., < 1 sec for small data).
+Expected outcome: Query completes within threshold.
+
+Test Case ID: TC12
+Test case description: Attempt to create duplicate DEPT_ID in DEPARTMENTS.
+Expected outcome: Insert fails with PRIMARY KEY constraint violation.
+
+---
+
+Pytest Script for Each Test Case
+
+```python
+import pytest
+import pyodbc
+import time
+
+# Pytest fixture for DB connection
+@pytest.fixture(scope="module")
+def synapse_conn():
+    conn = pyodbc.connect(
+        "DRIVER={ODBC Driver 17 for SQL Server};SERVER=your_server;DATABASE=your_db;UID=your_user;PWD=your_pwd"
+    )
+    yield conn
+    conn.close()
+
+# Helper to reset DB to known state
+def reset_db(conn):
+    cursor = conn.cursor()
+    cursor.execute("IF OBJECT_ID('EMPLOYEES') IS NOT NULL DROP TABLE EMPLOYEES;")
+    cursor.execute("IF OBJECT_ID('DEPARTMENTS') IS NOT NULL DROP TABLE DEPARTMENTS;")
+    cursor.execute("""
+        CREATE TABLE EMPLOYEES (
+            EMP_ID INT IDENTITY(1,1) PRIMARY KEY,
+            NAME VARCHAR(100) NOT NULL,
+            DEPARTMENT VARCHAR(50),
+            SALARY DECIMAL(10,2),
+            JOIN_DATE DATE
+        );
+    """)
+    cursor.execute("""
+        CREATE TABLE DEPARTMENTS (
+            DEPT_ID INT PRIMARY KEY,
+            DEPT_NAME VARCHAR(50),
+            MANAGER_NAME VARCHAR(100)
+        );
+    """)
+    conn.commit()
+
+@pytest.fixture(autouse=True)
+def setup_teardown(synapse_conn):
+    reset_db(synapse_conn)
+    yield
+    reset_db(synapse_conn)
+
+def insert_sample_data(conn):
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO EMPLOYEES (NAME, DEPARTMENT, SALARY, JOIN_DATE) VALUES
+        ('Alice Johnson', 'HR', 60000.00, '2022-03-15'),
+        ('Bob Smith', 'Finance', 75000.00, '2021-08-20'),
+        ('Charlie Brown', 'IT', 85000.00, '2019-11-25');
+    """)
+    cursor.execute("""
+        INSERT INTO DEPARTMENTS (DEPT_ID, DEPT_NAME, MANAGER_NAME) VALUES
+        (1, 'HR', 'Lisa Green'),
+        (2, 'Finance', 'James White'),
+        (3, 'IT', 'Michael Black');
+    """)
+    conn.commit()
+
+def create_update_salary_proc(conn):
+    cursor = conn.cursor()
+    cursor.execute("""
+        IF OBJECT_ID('UPDATE_SALARY', 'P') IS NOT NULL DROP PROCEDURE UPDATE_SALARY;
+        EXEC('CREATE PROCEDURE UPDATE_SALARY
+            @EMPLOYEE_ID INT,
+            @NEW_SALARY DECIMAL(10,2)
+        AS
+        BEGIN
+            UPDATE EMPLOYEES
+            SET SALARY = @NEW_SALARY
+            WHERE EMP_ID = @EMPLOYEE_ID;
+        END;')
+    """)
+    conn.commit()
+
+# TC01: Validate table creation
+def test_create_tables(synapse_conn):
+    cursor = synapse_conn.cursor()
+    cursor.execute("SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='EMPLOYEES'")
+    assert cursor.fetchone() is not None
+    cursor.execute("SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='DEPARTMENTS'")
+    assert cursor.fetchone() is not None
+
+# TC02: Insert valid data
+def test_insert_sample_data(synapse_conn):
+    insert_sample_data(synapse_conn)
+    cursor = synapse_conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM EMPLOYEES")
+    assert cursor.fetchone()[0] == 3
+    cursor.execute("SELECT COUNT(*) FROM DEPARTMENTS")
+    assert cursor.fetchone()[0] == 3
+
+# TC03: Query all employees
+def test_query_employees(synapse_conn):
+    insert_sample_data(synapse_conn)
+    cursor = synapse_conn.cursor()
+    cursor.execute("SELECT * FROM EMPLOYEES")
+    rows = cursor.fetchall()
+    assert len(rows) == 3
+    names = [row.NAME for row in rows]
+    assert "Alice Johnson" in names
+
+# TC04: Join employees and departments
+def test_join_employees_departments(synapse_conn):
+    insert_sample_data(synapse_conn)
+    cursor = synapse_conn.cursor()
+    cursor.execute("""
+        SELECT E.NAME, D.DEPT_NAME, D.MANAGER_NAME, E.SALARY
+        FROM EMPLOYEES E
+        JOIN DEPARTMENTS D ON E.DEPARTMENT = D.DEPT_NAME
+    """)
+    rows = cursor.fetchall()
+    assert len(rows) == 3
+    assert any(row.NAME == "Charlie Brown" and row.DEPT_NAME == "IT" for row in rows)
+
+# TC05: Update salary via stored procedure
+def test_update_salary_proc(synapse_conn):
+    insert_sample_data(synapse_conn)
+    create_update_salary_proc(synapse_conn)
+    cursor = synapse_conn.cursor()
+    cursor.execute("EXEC UPDATE_SALARY @EMPLOYEE_ID=1, @NEW_SALARY=65000.00")
+    synapse_conn.commit()
+    cursor.execute("SELECT SALARY FROM EMPLOYEES WHERE EMP_ID=1")
+    assert float(cursor.fetchone()[0]) == 65000.00
+
+# TC06: Update salary for non-existent EMP_ID
+def test_update_salary_nonexistent(synapse_conn):
+    insert_sample_data(synapse_conn)
+    create_update_salary_proc(synapse_conn)
+    cursor = synapse_conn.cursor()
+    cursor.execute("EXEC UPDATE_SALARY @EMPLOYEE_ID=999, @NEW_SALARY=12345.67")
+    synapse_conn.commit()
+    cursor.execute("SELECT COUNT(*) FROM EMPLOYEES WHERE SALARY=12345.67")
+    assert cursor.fetchone()[0] == 0
+
+# TC07: Transaction: update IT salaries, delete EMP_ID=2
+def test_transaction_update_delete(synapse_conn):
+    insert_sample_data(synapse_conn)
+    cursor = synapse_conn.cursor()
+    cursor.execute("BEGIN TRANSACTION")
+    cursor.execute("UPDATE EMPLOYEES SET SALARY = SALARY + 5000 WHERE DEPARTMENT = 'IT'")
+    cursor.execute("DELETE FROM EMPLOYEES WHERE EMP_ID = 2")
+    cursor.execute("COMMIT TRANSACTION")
+    cursor.execute("SELECT SALARY FROM EMPLOYEES WHERE NAME = 'Charlie Brown'")
+    assert float(cursor.fetchone()[0]) == 90000.00
+    cursor.execute("SELECT COUNT(*) FROM EMPLOYEES WHERE EMP_ID = 2")
+    assert cursor.fetchone()[0] == 0
+
+# TC08: Insert NULL into NOT NULL column
+def test_insert_null_not_null(synapse_conn):
+    cursor = synapse_conn.cursor()
+    with pytest.raises(pyodbc.IntegrityError):
+        cursor.execute("INSERT INTO EMPLOYEES (NAME, DEPARTMENT, SALARY, JOIN_DATE) VALUES (NULL, 'HR', 50000, '2022-01-01')")
+        synapse_conn.commit()
+
+# TC09: Insert extreme salary value
+def test_insert_extreme_salary(synapse_conn):
+    cursor = synapse_conn.cursor()
+    max_salary = 99999999.99
+    cursor.execute("INSERT INTO EMPLOYEES (NAME, DEPARTMENT, SALARY, JOIN_DATE) VALUES ('Max Salary', 'Finance', ?, '2022-01-01')", max_salary)
+    synapse_conn.commit()
+    cursor.execute("SELECT SALARY FROM EMPLOYEES WHERE NAME='Max Salary'")
+    assert float(cursor.fetchone()[0]) == max_salary
+
+# TC10: Query with empty EMPLOYEES table
+def test_query_empty_employees(synapse_conn):
+    cursor = synapse_conn.cursor()
+    cursor.execute("SELECT * FROM EMPLOYEES")
+    rows = cursor.fetchall()
+    assert len(rows) == 0
+
+# TC11: Performance of join query
+def test_join_performance(synapse_conn):
+    insert_sample_data(synapse_conn)
+    cursor = synapse_conn.cursor()
+    start = time.time()
+    cursor.execute("""
+        SELECT E.NAME, D.DEPT_NAME, D.MANAGER_NAME, E.SALARY
+        FROM EMPLOYEES E
+        JOIN DEPARTMENTS D ON E.DEPARTMENT = D.DEPT_NAME
+    """)
+    cursor.fetchall()
+    elapsed = time.time() - start
+    assert elapsed < 1.0  # 1 second threshold for small data
+
+# TC12: Insert duplicate DEPT_ID
+def test_insert_duplicate_dept_id(synapse_conn):
+    insert_sample_data(synapse_conn)
+    cursor = synapse_conn.cursor()
+    with pytest.raises(pyodbc.IntegrityError):
+        cursor.execute("INSERT INTO DEPARTMENTS (DEPT_ID, DEPT_NAME, MANAGER_NAME) VALUES (1, 'Legal', 'John Doe')")
+        synapse_conn.commit()
+```
+
+# Notes:
+- Replace connection string parameters in `synapse_conn` fixture as appropriate.
+- Each test is independent and resets the DB state.
+- Helper functions and fixtures are provided for setup/teardown and stored procedure creation.
+- All assertions check for correctness, constraints, and performance.
+- Comments are included for clarity.
+- Tests are grouped and named logically.
+
+Cost consumed by the API for this call: 2 file read operations
