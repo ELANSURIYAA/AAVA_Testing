@@ -1,27 +1,27 @@
 # AAVA Comparison Results
  
-Generated: 2026-02-19 18:06:13
+Generated: 2026-02-27 14:48:39
  
 ## Workflows Compared
-- AAVA 1.0: Sqlserver_to_DBT__Doc_Analyze
+- AAVA 1.0: DI_SSIS_To_DBTCloud_Doc_Analysis
 - AAVA 2.0: Sqlserver to DBT _Doc&Analyze
  
 ## Agent Comparisons
  
 Total Agents: 3
  
-### SqlServer_to_DBT_Analyzer
-- AAVA 1.0: `SqlServer_to_DBT_Analyzer.txt`
-- AAVA 2.0: `sqlserver_to_dbt_analyzer.txt`
-- Results: [SqlServer_to_DBT_Analyzer/](./SqlServer_to_DBT_Analyzer/)
+### DI_SSIS_Documentation
+- AAVA 1.0: `DI_SSIS_Documentation.txt`
+- AAVA 2.0: `DI_SSIS_Documentation.txt`
+- Results: [DI_SSIS_Documentation/](./DI_SSIS_Documentation/)
 
-### SqlServer_to_DBT_Documentation
-- AAVA 1.0: `SqlServer_to_DBT_Documentation.txt`
-- AAVA 2.0: `sqlserver_to_dbt_documentation.txt`
-- Results: [SqlServer_to_DBT_Documentation/](./SqlServer_to_DBT_Documentation/)
+### DI_SSIS_To_DBTCloud_Analyzer_
+- AAVA 1.0: `DI_SSIS_To_DBTCloud_Analyzer_.txt`
+- AAVA 2.0: `DI_SSIS_To_DBTCloud_Analyzer_`
+- Results: [DI_SSIS_To_DBTCloud_Analyzer_/](./DI_SSIS_To_DBTCloud_Analyzer_/)
 
-### SqlServer_to_DBT_Plan
-- AAVA 1.0: `SqlServer_to_DBT_Plan.txt`
-- AAVA 2.0: `sqlserver_to_dbt_plan.txt`
-- Results: [SqlServer_to_DBT_Plan/](./SqlServer_to_DBT_Plan/)
+### DI_SSIS_To_DBTCloud_Plan
+- AAVA 1.0: `DI_SSIS_To_DBTCloud_Plan.txt`
+- AAVA 2.0: `DI_SSIS_To_DBTCloud_Plan.txt`
+- Results: [DI_SSIS_To_DBTCloud_Plan/](./DI_SSIS_To_DBTCloud_Plan/)
 
