@@ -1,7 +1,7 @@
 # Agent Comparison Report: DI_Azure_Synapse_To_Bigquery_Plan
  
-Generated: 2026-02-05 12:15:54
-Execution ID: 0d6fd7d2-60d0-405f-abd9-8c0cc6bb80c6
+Generated: 2026-02-27 14:53:56
+Execution ID: 469eefcd-a126-43db-b6c1-711bbf4f0a4b
  
 ## Files Compared
 - AAVA 1.0: DI_Azure_Synapse_To_Bigquery_Plan.txt
