@@ -1,6 +1,6 @@
 # AAVA Comparison Results
  
-Generated: 2026-02-05 12:16:02
+Generated: 2026-02-27 14:53:59
  
 ## Workflows Compared
 - AAVA 1.0: DI_Azure_Synapse_To_Bigquery_Doc_Analyze
