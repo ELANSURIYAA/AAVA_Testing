@@ -1,7 +1,7 @@
 # Agent Comparison Report: DI_Azure_Synapse_To_Databricks_DeclarativeSQL_Plan
  
-Generated: 2026-02-20 11:25:53
-Execution ID: dee9f51e-92ac-413f-b4a4-bba049357073
+Generated: 2026-03-04 14:32:42
+Execution ID: 5aaf7d30-8e93-4874-8ca2-0219372fc0a8
  
 ## Files Compared
 - AAVA 1.0: DI_Azure_Synapse_To_Databricks_DeclarativeSQL_Plan.txt
