@@ -1,6 +1,6 @@
 # AAVA Comparison Results
  
-Generated: 2026-02-19 18:40:22
+Generated: 2026-03-04 15:36:51
  
 ## Workflows Compared
 - AAVA 1.0: DI-DataQuality_SF-INFA
@@ -8,13 +8,8 @@ Generated: 2026-02-19 18:40:22
  
 ## Agent Comparisons
  
-Total Agents: 2
+Total Agents: 1
  
-### DI-DQ_Rule-to-Informatica_Mapping
-- AAVA 1.0: `DI-DQ_Rule-to-Informatica_Mapping.txt`
-- AAVA 2.0: `di-dq_rule-to-informatica_mapping.txt`
-- Results: [DI-DQ_Rule-to-Informatica_Mapping/](./DI-DQ_Rule-to-Informatica_Mapping/)
-
 ### DI-DQ_Rule-to-Snowflake_SP
 - AAVA 1.0: `DI-DQ_Rule-to-Snowflake_SP.txt`
 - AAVA 2.0: `di-dq_rule-to-snowflake_sp.txt`
