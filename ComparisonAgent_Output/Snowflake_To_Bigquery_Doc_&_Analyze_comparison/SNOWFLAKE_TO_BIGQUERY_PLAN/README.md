@@ -1,7 +1,7 @@
 # Agent Comparison Report: SNOWFLAKE_TO_BIGQUERY_PLAN
  
-Generated: 2026-02-19 17:37:10
-Execution ID: 0e202c74-56c1-444d-ad4e-83b122a74f4f
+Generated: 2026-03-05 13:32:04
+Execution ID: 911ecf71-73ae-48de-8740-a2f72209ecab
  
 ## Files Compared
 - AAVA 1.0: SNOWFLAKE_TO_BIGQUERY_PLAN.txt
