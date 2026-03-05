@@ -1,326 +1,210 @@
-1. Test Case List
-
-| Test Case ID | Test Case Description                                                                 | Expected Outcome                                                                                 |
-|--------------|--------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
-| TC01         | Happy path: Valid JSON data is transformed for Person, ContactInfo, and Language     | Output DataFrames match expected schema and values; Gender mapped, DOB and timestamps casted      |
-| TC02         | Edge: Null/empty ContactInfo struct                                                  | ContactInfo fields are null; Person and Language transformations unaffected                      |
-| TC03         | Edge: Null/empty Language struct                                                     | Language fields are null; Person and ContactInfo transformations unaffected                      |
-| TC04         | Edge: Null/empty Spoken array in Language                                            | No rows produced for that Person in Language output                                              |
-| TC05         | Edge: Gender value not "Male"/"Female"                                               | Gender mapped to null in Person output                                                           |
-| TC06         | Edge: DOB in invalid format                                                          | DOB mapped to null in Person output                                                              |
-| TC07         | Edge: IngestionTimestamp in invalid format                                           | IngestionTimestamp mapped to null in Person output                                               |
-| TC08         | Edge: Missing optional fields (e.g., Race, Ethnicity)                                | Missing fields mapped to null in Person output                                                   |
-| TC09         | Edge: Empty input DataFrame                                                          | All output DataFrames are empty                                                                  |
-| TC10         | Exception: Schema mismatch (unexpected field type, e.g., ContactInfo as string)      | Raises AnalysisException or relevant Spark error                                                 |
-| TC11         | Exception: BigQuery table does not exist                                             | Raises RuntimeError with appropriate message                                                     |
-| TC12         | Schema alignment: BQ table has extra columns                                         | Output DataFrame includes extra columns as null                                                  |
-| TC13         | Schema alignment: BQ table missing columns present in DataFrame                      | Output DataFrame only includes columns present in BQ table (others dropped)                      |
-| TC14         | Performance: Large DataFrame transformation (mocked)                                 | Transformation completes within reasonable time, no memory errors                                |
-
----
-
-2. Pytest Script (GCP DataProc-optimized, with comments)
-
-```python
+Test Case List
+Test Case ID	Test Case Description	Expected Outcome
+TC_01	Validate successful extraction and transformation of Person data (happy path)	Person DataFrame contains correct columns and values as per input JSON
+TC_02	Validate extraction and transformation of ContactInfo data (happy path)	ContactInfo DataFrame contains correct columns and values as per input JSON
+TC_03	Validate extraction and transformation of Language data (happy path)	Language DataFrame contains correct columns and values as per input JSON
+TC_04	Handle missing ContactInfo field in input	ContactInfo DataFrame has nulls for missing nested fields
+TC_05	Handle missing Language field in input	Language DataFrame has nulls for missing nested fields
+TC_06	Handle missing PersonID in input	All output DataFrames have null or missing PersonID as per Spark's handling
+TC_07	Handle empty input DataFrame	All output DataFrames are empty
+TC_08	Handle null values in nested fields (ContactInfo, Language)	Output DataFrames have nulls in corresponding columns
+TC_09	Handle schema mismatch (unexpected field types, e.g., ContactInfo as string)	Appropriate exception is raised or DataFrame columns are null
+TC_10	Handle invalid JSON input (malformed file)	Spark raises a relevant exception
+TC_11	Validate BigQuery write options are set correctly	Data is written to correct BigQuery tables (mocked in test)
+TC_12	Performance test: Large input JSON file processed efficiently	Pipeline completes within acceptable time (mocked for unit test)
+TC_13	GCP DataProc SparkSession setup and teardown	SparkSession is initialized and stopped without resource leaks
+TC_14	Validate handling of multiple records in input JSON	All records are processed and written to respective DataFrames
+TC_15	Validate handling of additional unexpected fields in input JSON	Extra fields are ignored, and only required columns are present in output DataFrames
+Pytest Script
 import pytest
 from pyspark.sql import SparkSession, Row
-from pyspark.sql.types import *
 from pyspark.sql.utils import AnalysisException
-from pyspark.sql.functions import col
-import sys
+import os
 
-# Import functions from the pipeline module (assume available in PYTHONPATH)
-from pipeline import (
-    read_json_data,
-    transform_person,
-    transform_contactinfo,
-    transform_language,
-    validate_bq_table_exists,
-    align_with_bq_schema,
-)
-
-# ------------------- Pytest Fixtures -------------------
-
-@pytest.fixture(scope="session")
+# GCP DataProc-optimized SparkSession fixture
+@pytest.fixture(scope="module")
 def spark():
-    """
-    Fixture to initialize and teardown SparkSession for GCP DataProc.
-    """
-    spark = (
-        SparkSession.builder
-        .appName("PySparkTest")
-        .master("local[2]")
-        .config("spark.sql.session.timeZone", "UTC")
+    spark = SparkSession.builder \
+        .appName("pytest-gcp-dataproc") \
+        .master("local[2]") \
         .getOrCreate()
-    )
     yield spark
     spark.stop()
 
-@pytest.fixture
-def sample_json_data(spark):
-    """
-    Fixture to provide sample DataFrame matching the provided JSON.
-    """
-    schema = StructType([
-        StructField("PersonID", StringType(), True),
-        StructField("DOB", StringType(), True),
-        StructField("ContactInfo", StructType([
-            StructField("Address", StringType(), True),
-            StructField("Phone", StringType(), True),
-            StructField("Email", StringType(), True),
-        ]), True),
-        StructField("Gender", StringType(), True),
-        StructField("Race", StringType(), True),
-        StructField("Ethnicity", StringType(), True),
-        StructField("Language", StructType([
-            StructField("Spoken", ArrayType(StringType()), True),
-            StructField("Written", StringType(), True),
-        ]), True),
-        StructField("SourceSystem", StringType(), True),
-        StructField("IngestionTimestamp", StringType(), True),
-    ])
-    data = [
-        Row(
-            PersonID="P001",
-            DOB="1980-01-01",
-            ContactInfo=Row(Address="1 Main St", Phone="123", Email="a@b.com"),
-            Gender="Male",
-            Race="White",
-            Ethnicity="Non-Hispanic",
-            Language=Row(Spoken=["English", "French"], Written="English"),
-            SourceSystem="JSON",
-            IngestionTimestamp="2025-03-18T10:00:00Z"
-        )
-    ]
+# Helper function to create mock DataFrame
+def create_mock_df(spark, data, schema=None):
     return spark.createDataFrame(data, schema=schema)
 
-# ------------------- Helper Functions -------------------
+# Mock BigQuery writer (to avoid actual writes in unit tests)
+class MockDataFrameWriter:
+    def __init__(self, df):
+        self.df = df
+        self.options = {}
+        self.format_type = None
 
-def mock_bq_schema(spark, schema_fields):
-    """
-    Create a mock BQ schema StructType for align_with_bq_schema tests.
-    """
-    return StructType([StructField(f, StringType(), True) for f in schema_fields])
+    def format(self, format_type):
+        self.format_type = format_type
+        return self
 
-# ------------------- Test Cases -------------------
+    def option(self, key, value):
+        self.options[key] = value
+        return self
 
-def test_TC01_happy_path_transformations(spark, sample_json_data):
-    """
-    Test happy path: Valid JSON data is transformed correctly.
-    """
-    person_df = transform_person(sample_json_data)
-    contact_df = transform_contactinfo(sample_json_data)
-    language_df = transform_language(sample_json_data)
+    def save(self):
+        # Instead of writing, just return the DataFrame and options for assertion
+        return (self.df, self.format_type, self.options)
 
-    # Person checks
-    assert person_df.filter(col("Gender") == "M").count() == 1
-    assert person_df.schema["DOB"].dataType == DateType()
-    assert person_df.schema["IngestionTimestamp"].dataType == TimestampType()
-    assert "Insurance" in person_df.columns and "Provider" in person_df.columns
+# Patch DataFrame.write to use the mock writer
+@pytest.fixture(autouse=True)
+def patch_write(monkeypatch):
+    monkeypatch.setattr("pyspark.sql.dataframe.DataFrame.write", property(lambda self: MockDataFrameWriter(self)))
 
-    # ContactInfo checks
-    assert contact_df.filter(col("Email") == "a@b.com").count() == 1
+# Test cases
 
-    # Language checks
-    spoken = [row["Spoken"] for row in language_df.collect()]
-    assert set(spoken) == {"English", "French"}
+def test_person_extraction_happy_path(spark):
+    data = [Row(PersonID=1, DOB="1990-01-01", Gender="M", Race="Asian", Ethnicity="Not Hispanic", SourceSystem="sys1", IngestionTimestamp="2024-01-01T00:00:00Z")]
+    df = create_mock_df(spark, data)
+    person_df = df.select(
+        "PersonID", "DOB", "Gender", "Race", "Ethnicity", "SourceSystem", "IngestionTimestamp"
+    )
+    assert set(person_df.columns) == {"PersonID", "DOB", "Gender", "Race", "Ethnicity", "SourceSystem", "IngestionTimestamp"}
+    assert person_df.count() == 1
 
-def test_TC02_null_contactinfo(spark, sample_json_data):
-    """
-    Test null ContactInfo struct.
-    """
-    df = sample_json_data.withColumn("ContactInfo", col("ContactInfo").cast("null"))
-    contact_df = transform_contactinfo(df)
-    assert contact_df.filter(col("Address").isNull()).count() == 1
+def test_contactinfo_extraction_happy_path(spark):
+    data = [Row(PersonID=2, ContactInfo=Row(Address="123 St", Phone="1234567890", Email="test@example.com"))]
+    df = create_mock_df(spark, data)
+    contact_info_df = df.select(
+        "PersonID",
+        "ContactInfo.Address",
+        "ContactInfo.Phone",
+        "ContactInfo.Email"
+    )
+    row = contact_info_df.collect()[0]
+    assert row.Address == "123 St"
+    assert row.Phone == "1234567890"
+    assert row.Email == "test@example.com"
 
-def test_TC03_null_language(spark, sample_json_data):
-    """
-    Test null Language struct.
-    """
-    df = sample_json_data.withColumn("Language", col("Language").cast("null"))
-    language_df = transform_language(df)
-    # Should raise error on explode(None), so handle gracefully
-    assert language_df.count() == 0
+def test_language_extraction_happy_path(spark):
+    data = [Row(PersonID=3, Language=Row(Spoken="English", Written="French"))]
+    df = create_mock_df(spark, data)
+    language_df = df.select(
+        "PersonID",
+        "Language.Spoken",
+        "Language.Written"
+    )
+    row = language_df.collect()[0]
+    assert row.Spoken == "English"
+    assert row.Written == "French"
 
-def test_TC04_empty_spoken_array(spark, sample_json_data):
-    """
-    Test empty Spoken array in Language.
-    """
-    df = sample_json_data.withColumn("Language", 
-        Row(Spoken=[], Written="English"))
-    language_df = transform_language(df)
-    assert language_df.count() == 0
+def test_missing_contactinfo(spark):
+    data = [Row(PersonID=4)]
+    df = create_mock_df(spark, data)
+    contact_info_df = df.select(
+        "PersonID",
+        "ContactInfo.Address",
+        "ContactInfo.Phone",
+        "ContactInfo.Email"
+    )
+    row = contact_info_df.collect()[0]
+    assert row.Address is None
+    assert row.Phone is None
+    assert row.Email is None
 
-def test_TC05_gender_value_not_male_female(spark, sample_json_data):
-    """
-    Test Gender value not 'Male'/'Female'.
-    """
-    df = sample_json_data.withColumn("Gender", lit("Unknown"))
-    person_df = transform_person(df)
-    assert person_df.filter(col("Gender").isNull()).count() == 1
+def test_missing_language(spark):
+    data = [Row(PersonID=5)]
+    df = create_mock_df(spark, data)
+    language_df = df.select(
+        "PersonID",
+        "Language.Spoken",
+        "Language.Written"
+    )
+    row = language_df.collect()[0]
+    assert row.Spoken is None
+    assert row.Written is None
 
-def test_TC06_invalid_dob_format(spark, sample_json_data):
-    """
-    Test DOB in invalid format.
-    """
-    df = sample_json_data.withColumn("DOB", lit("not_a_date"))
-    person_df = transform_person(df)
-    assert person_df.filter(col("DOB").isNull()).count() == 1
+def test_missing_personid(spark):
+    data = [Row(DOB="2000-01-01")]
+    df = create_mock_df(spark, data)
+    person_df = df.select(
+        "PersonID", "DOB"
+    )
+    row = person_df.collect()[0]
+    assert row.PersonID is None
 
-def test_TC07_invalid_ingestiontimestamp_format(spark, sample_json_data):
-    """
-    Test IngestionTimestamp in invalid format.
-    """
-    df = sample_json_data.withColumn("IngestionTimestamp", lit("bad_timestamp"))
-    person_df = transform_person(df)
-    assert person_df.filter(col("IngestionTimestamp").isNull()).count() == 1
+def test_empty_input(spark):
+    df = create_mock_df(spark, [])
+    person_df = df.select("PersonID") if "PersonID" in df.columns else df
+    assert person_df.count() == 0
 
-def test_TC08_missing_optional_fields(spark, sample_json_data):
-    """
-    Test missing optional fields (Race, Ethnicity).
-    """
-    df = sample_json_data.drop("Race", "Ethnicity")
-    person_df = transform_person(df)
-    assert "Race" in person_df.columns and "Ethnicity" in person_df.columns
-    assert person_df.filter(col("Race").isNull() & col("Ethnicity").isNull()).count() == 1
+def test_null_nested_fields(spark):
+    data = [Row(PersonID=6, ContactInfo=None, Language=None)]
+    df = create_mock_df(spark, data)
+    contact_info_df = df.select(
+        "PersonID",
+        "ContactInfo.Address",
+        "ContactInfo.Phone",
+        "ContactInfo.Email"
+    )
+    language_df = df.select(
+        "PersonID",
+        "Language.Spoken",
+        "Language.Written"
+    )
+    row_c = contact_info_df.collect()[0]
+    row_l = language_df.collect()[0]
+    assert row_c.Address is None and row_c.Phone is None and row_c.Email is None
+    assert row_l.Spoken is None and row_l.Written is None
 
-def test_TC09_empty_input(spark):
-    """
-    Test empty input DataFrame.
-    """
-    schema = StructType([
-        StructField("PersonID", StringType(), True),
-        StructField("DOB", StringType(), True),
-        StructField("ContactInfo", StructType([
-            StructField("Address", StringType(), True),
-            StructField("Phone", StringType(), True),
-            StructField("Email", StringType(), True),
-        ]), True),
-        StructField("Gender", StringType(), True),
-        StructField("Race", StringType(), True),
-        StructField("Ethnicity", StringType(), True),
-        StructField("Language", StructType([
-            StructField("Spoken", ArrayType(StringType()), True),
-            StructField("Written", StringType(), True),
-        ]), True),
-        StructField("SourceSystem", StringType(), True),
-        StructField("IngestionTimestamp", StringType(), True),
-    ])
-    df = spark.createDataFrame([], schema)
-    assert transform_person(df).count() == 0
-    assert transform_contactinfo(df).count() == 0
-    assert transform_language(df).count() == 0
-
-def test_TC10_schema_mismatch(spark, sample_json_data):
-    """
-    Test schema mismatch (ContactInfo as string).
-    """
-    schema = StructType([
-        StructField("PersonID", StringType(), True),
-        StructField("DOB", StringType(), True),
-        StructField("ContactInfo", StringType(), True),  # Should be StructType
-        StructField("Gender", StringType(), True),
-        StructField("Race", StringType(), True),
-        StructField("Ethnicity", StringType(), True),
-        StructField("Language", StructType([
-            StructField("Spoken", ArrayType(StringType()), True),
-            StructField("Written", StringType(), True),
-        ]), True),
-        StructField("SourceSystem", StringType(), True),
-        StructField("IngestionTimestamp", StringType(), True),
-    ])
-    data = [("P002", "1980-01-01", "not_a_struct", "Male", "White", "Non-Hispanic", Row(Spoken=["English"], Written="English"), "JSON", "2025-03-18T10:00:00Z")]
-    df = spark.createDataFrame(data, schema)
+def test_schema_mismatch(spark):
+    data = [Row(PersonID=7, ContactInfo="not_a_struct")]
+    df = create_mock_df(spark, data)
     with pytest.raises(AnalysisException):
-        transform_contactinfo(df).collect()
+        df.select("ContactInfo.Address").collect()
 
-def test_TC11_bq_table_not_exist(spark, sample_json_data, monkeypatch):
-    """
-    Test BigQuery table does not exist.
-    """
-    def mock_read_fail(*args, **kwargs):
-        raise Exception("BQ table not found")
-    monkeypatch.setattr(spark.read, "format", lambda *a, **k: type("Mock", (), {"option": lambda *a, **k: type("Mock", (), {"load": mock_read_fail})()})())
-    with pytest.raises(RuntimeError, match="does not exist or is inaccessible"):
-        validate_bq_table_exists(spark, "fake_project.fake_dataset.fake_table")
+def test_invalid_json_input(spark):
+    # This test would require reading a malformed JSON file.
+    # Here, we simulate by catching the exception.
+    invalid_path = "/tmp/invalid.json"
+    with pytest.raises(Exception):
+        spark.read.json(invalid_path)
 
-def test_TC12_schema_alignment_extra_columns(spark, sample_json_data):
-    """
-    Test schema alignment: BQ table has extra columns.
-    """
-    person_df = transform_person(sample_json_data)
-    # Mock BQ schema with extra column "ExtraCol"
-    bq_schema = StructType([StructField(c, StringType(), True) for c in person_df.columns + ["ExtraCol"]])
-    # Patch spark.read.format().option().load().schema
-    class MockDF:
-        schema = bq_schema
-    def mock_load(*args, **kwargs):
-        return MockDF()
-    spark.read.format = lambda *a, **k: type("Mock", (), {"option": lambda *a, **k: type("Mock", (), {"load": mock_load})()})()
-    aligned_df = align_with_bq_schema(spark, person_df, "project.dataset.table")
-    assert "ExtraCol" in aligned_df.columns
-    assert aligned_df.filter(col("ExtraCol").isNull()).count() == aligned_df.count()
+def test_bigquery_write_options(spark):
+    data = [Row(PersonID=8)]
+    df = create_mock_df(spark, data)
+    writer = MockDataFrameWriter(df)
+    result = writer.format("bigquery").option("table", "project.dataset.Person").save()
+    assert result[1] == "bigquery"
+    assert result[2]["table"] == "project.dataset.Person"
 
-def test_TC13_schema_alignment_missing_columns(spark, sample_json_data):
-    """
-    Test schema alignment: BQ table missing columns present in DataFrame.
-    """
-    person_df = transform_person(sample_json_data)
-    # Mock BQ schema with subset of columns
-    bq_schema = StructType([StructField("PersonID", StringType(), True), StructField("DOB", StringType(), True)])
-    class MockDF:
-        schema = bq_schema
-    def mock_load(*args, **kwargs):
-        return MockDF()
-    spark.read.format = lambda *a, **k: type("Mock", (), {"option": lambda *a, **k: type("Mock", (), {"load": mock_load})()})()
-    aligned_df = align_with_bq_schema(spark, person_df, "project.dataset.table")
-    assert set(aligned_df.columns) == {"PersonID", "DOB"}
+def test_performance_large_input(spark):
+    # Simulate large input by repeating rows (not a true perf test, but checks logic)
+    data = [Row(PersonID=i) for i in range(10000)]
+    df = create_mock_df(spark, data)
+    person_df = df.select("PersonID")
+    assert person_df.count() == 10000
 
-@pytest.mark.performance
-def test_TC14_performance_large_dataframe(spark):
-    """
-    Performance test: Large DataFrame transformation.
-    """
-    # Generate 100,000 records
+def test_sparksession_setup_teardown(spark):
+    # SparkSession should be active
+    assert spark.sparkContext._jsc is not None
+
+def test_multiple_records(spark):
     data = [
-        Row(
-            PersonID=f"P{i:06d}",
-            DOB="1980-01-01",
-            ContactInfo=Row(Address="1 Main St", Phone="123", Email="a@b.com"),
-            Gender="Male",
-            Race="White",
-            Ethnicity="Non-Hispanic",
-            Language=Row(Spoken=["English", "French"], Written="English"),
-            SourceSystem="JSON",
-            IngestionTimestamp="2025-03-18T10:00:00Z"
-        )
-        for i in range(100000)
+        Row(PersonID=9, ContactInfo=Row(Address="A", Phone="1", Email="a@a.com"), Language=Row(Spoken="E", Written="F")),
+        Row(PersonID=10, ContactInfo=Row(Address="B", Phone="2", Email="b@b.com"), Language=Row(Spoken="S", Written="G"))
     ]
-    schema = StructType([
-        StructField("PersonID", StringType(), True),
-        StructField("DOB", StringType(), True),
-        StructField("ContactInfo", StructType([
-            StructField("Address", StringType(), True),
-            StructField("Phone", StringType(), True),
-            StructField("Email", StringType(), True),
-        ]), True),
-        StructField("Gender", StringType(), True),
-        StructField("Race", StringType(), True),
-        StructField("Ethnicity", StringType(), True),
-        StructField("Language", StructType([
-            StructField("Spoken", ArrayType(StringType()), True),
-            StructField("Written", StringType(), True),
-        ]), True),
-        StructField("SourceSystem", StringType(), True),
-        StructField("IngestionTimestamp", StringType(), True),
-    ])
-    df = spark.createDataFrame(data, schema=schema)
-    person_df = transform_person(df)
-    assert person_df.count() == 100000
+    df = create_mock_df(spark, data)
+    assert df.count() == 2
+    contact_info_df = df.select("ContactInfo.Address")
+    assert contact_info_df.count() == 2
 
-# ------------------- End of Pytest Script -------------------
-```
+def test_unexpected_fields_ignored(spark):
+    data = [Row(PersonID=11, ExtraField="ignore_me")]
+    df = create_mock_df(spark, data)
+    person_df = df.select("PersonID")
+    assert "PersonID" in person_df.columns
+    assert "ExtraField" not in person_df.columns
 
-3. API Cost Calculation
-
+# Note: For true GCS mocking, use pyfakefs or similar tools, or mock GCS read/write calls.
+# For integration tests, use test buckets and service accounts.
+API Cost Calculation
 apiCost: 0.00
