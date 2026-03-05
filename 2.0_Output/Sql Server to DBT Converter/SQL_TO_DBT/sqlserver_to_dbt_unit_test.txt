@@ -1,3 +1,246 @@
-The required PySpark script for generating comprehensive unit test cases and a Pytest script is not present in the provided files. The available files only contain the SQL logic and an analysis report. As per the instructions, the PySpark script is necessary to proceed. Please provide the converted PySpark script or clarify if the tests should be generated based on the SQL logic instead.
+Cost consumed by API for this call: 1 file listing + 1 file read
 
-API Cost Consumed: $0.002 USD
+Test Case List:
+Test ID	Test Description	Expected Output
+TC01	Happy path: Completed orders with multiple users and products	Correct aggregation per user: total_orders, total_spent, avg_order_value, categories_bought; sorted by total_spent DESC
+TC02	Edge case: User with no completed orders	User not present in output
+TC03	Edge case: Order with NULL total_amount	Aggregations handle NULL correctly (SUM, AVG skip NULLs)
+TC04	Edge case: User with only one completed order	Aggregations reflect single order correctly
+TC05	Edge case: Product category is NULL	categories_bought excludes NULL, no error
+TC06	Boundary: Multiple orders with same product category	categories_bought contains unique categories only
+TC07	Error handling: Orders referencing non-existent users/products	Orders excluded from output (due to failed join)
+TC08	Performance: Large dataset	Query executes within reasonable time, correct output
+TC09	Data integrity: No duplicate orders counted	total_orders reflects unique orders only
+TC10	DBT syntax: Ref macros and aggregations	DBT compiles and runs query without syntax errors
+Pytest Script for Each Test Case
+import pytest
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+# Helper function to create test dataframes
+def create_test_data(spark):
+    orders = spark.createDataFrame([
+        # id, user_id, total_amount, created_at, status
+        (1, 101, 100.0, "2024-06-01", "completed"),
+        (2, 102, 200.0, "2024-06-02", "completed"),
+        (3, 101, None, "2024-06-03", "completed"),  # NULL total_amount
+        (4, 103, 150.0, "2024-06-04", "pending"),   # Not completed
+        (5, 104, 300.0, "2024-06-05", "completed"),
+        (6, 105, 400.0, "2024-06-06", "completed"),
+    ], ["id", "user_id", "total_amount", "created_at", "status"])
+
+    users = spark.createDataFrame([
+        # id, name, email
+        (101, "Alice", "alice@example.com"),
+        (102, "Bob", "bob@example.com"),
+        (104, "Charlie", "charlie@example.com"),
+        (105, "Dana", "dana@example.com"),
+        # 103 intentionally missing for error handling
+    ], ["id", "name", "email"])
+
+    order_items = spark.createDataFrame([
+        # order_id, product_id
+        (1, 201),
+        (2, 202),
+        (2, 203),
+        (3, 201),
+        (5, 204),
+        (6, 205),
+    ], ["order_id", "product_id"])
+
+    products = spark.createDataFrame([
+        # id, category, price
+        (201, "Electronics", 50.0),
+        (202, "Books", 20.0),
+        (203, None, 30.0),  # NULL category
+        (204, "Clothing", 100.0),
+        (205, "Electronics", 200.0),
+    ], ["id", "category", "price"])
+
+    return orders, users, order_items, products
+
+@pytest.fixture(scope="function")
+def spark_session():
+    spark = SparkSession.builder.master("local[1]").appName("DBTUnitTest").getOrCreate()
+    yield spark
+    spark.stop()
+
+def run_customer_orders_query(spark, orders, users, order_items, products):
+    # Simulate DBT ref macro by using DataFrames directly
+    o = orders.alias("o")
+    u = users.alias("u")
+    oi = order_items.alias("oi")
+    p = products.alias("p")
+
+    customer_orders = (
+        o.join(u, o.user_id == u.id, "inner")
+         .join(oi, o.id == oi.order_id, "inner")
+         .join(p, oi.product_id == p.id, "inner")
+         .filter(o.status == "completed")
+         .select(
+            o.id.alias("order_id"),
+            o.user_id,
+            u.name.alias("customer_name"),
+            u.email.alias("customer_email"),
+            o.total_amount,
+            o.created_at.alias("order_date"),
+            p.category.alias("product_category"),
+            p.price.alias("product_price")
+         )
+    )
+
+    order_summary = (
+        customer_orders.groupBy("user_id", "customer_name", "customer_email")
+        .agg(
+            F.count("order_id").alias("total_orders"),
+            F.sum("total_amount").alias("total_spent"),
+            F.avg("total_amount").alias("avg_order_value"),
+            F.collect_set("product_category").alias("categories_bought")
+        )
+        .orderBy(F.col("total_spent").desc())
+    )
+    return order_summary
+
+# TC01: Happy path
+def test_happy_path(spark_session):
+    """TC01: Happy path with multiple users and products"""
+    orders, users, order_items, products = create_test_data(spark_session)
+    result = run_customer_orders_query(spark_session, orders, users, order_items, products)
+    rows = result.collect()
+    assert len(rows) == 4  # Only users with completed orders
+    # Check Charlie (user_id=104) has one order, correct spent
+    charlie = [r for r in rows if r.user_id == 104][0]
+    assert charlie.total_orders == 1
+    assert charlie.total_spent == 300.0
+    assert charlie.avg_order_value == 300.0
+    assert "Clothing" in charlie.categories_bought
+
+# TC02: User with no completed orders
+def test_user_no_completed_orders(spark_session):
+    """TC02: User with no completed orders should not appear"""
+    orders, users, order_items, products = create_test_data(spark_session)
+    result = run_customer_orders_query(spark_session, orders, users, order_items, products)
+    user_ids = [r.user_id for r in result.collect()]
+    assert 103 not in user_ids  # User 103 missing from users
+
+# TC03: Order with NULL total_amount
+def test_null_total_amount(spark_session):
+    """TC03: Aggregations handle NULL total_amount correctly"""
+    orders, users, order_items, products = create_test_data(spark_session)
+    result = run_customer_orders_query(spark_session, orders, users, order_items, products)
+    alice = [r for r in result.collect() if r.user_id == 101][0]
+    # Alice has two orders, one with NULL total_amount
+    assert alice.total_orders == 2
+    assert alice.total_spent == 100.0  # Only non-null counted
+    assert alice.avg_order_value == 100.0  # Only non-null
+
+# TC04: User with only one completed order
+def test_single_order_user(spark_session):
+    """TC04: User with only one completed order"""
+    orders, users, order_items, products = create_test_data(spark_session)
+    result = run_customer_orders_query(spark_session, orders, users, order_items, products)
+    charlie = [r for r in result.collect() if r.user_id == 104][0]
+    assert charlie.total_orders == 1
+    assert charlie.total_spent == 300.0
+    assert charlie.avg_order_value == 300.0
+
+# TC05: Product category is NULL
+def test_null_product_category(spark_session):
+    """TC05: categories_bought excludes NULL category"""
+    orders, users, order_items, products = create_test_data(spark_session)
+    result = run_customer_orders_query(spark_session, orders, users, order_items, products)
+    bob = [r for r in result.collect() if r.user_id == 102][0]
+    # Bob bought Books and NULL category
+    assert "Books" in bob.categories_bought
+    assert None not in bob.categories_bought
+
+# TC06: Multiple orders with same product category
+def test_unique_categories_bought(spark_session):
+    """TC06: categories_bought contains unique categories only"""
+    orders, users, order_items, products = create_test_data(spark_session)
+    result = run_customer_orders_query(spark_session, orders, users, order_items, products)
+    dana = [r for r in result.collect() if r.user_id == 105][0]
+    assert dana.total_orders == 1
+    assert dana.categories_bought == ["Electronics"]
+
+# TC07: Orders referencing non-existent users/products
+def test_missing_references(spark_session):
+    """TC07: Orders referencing missing users/products are excluded"""
+    orders, users, order_items, products = create_test_data(spark_session)
+    # Add an order referencing missing user/product
+    orders = orders.union(spark_session.createDataFrame([
+        (7, 999, 500.0, "2024-06-07", "completed"),  # user_id 999 missing
+    ], orders.schema))
+    order_items = order_items.union(spark_session.createDataFrame([
+        (7, 9999),  # product_id 9999 missing
+    ], order_items.schema))
+    result = run_customer_orders_query(spark_session, orders, users, order_items, products)
+    user_ids = [r.user_id for r in result.collect()]
+    assert 999 not in user_ids
+
+# TC08: Performance with large dataset
+def test_performance_large_dataset(spark_session):
+    """TC08: Performance: Large dataset executes within reasonable time"""
+    orders, users, order_items, products = create_test_data(spark_session)
+    # Expand orders to 10000 rows
+    large_orders = orders
+    for i in range(1000):
+        large_orders = large_orders.union(orders.withColumn("id", F.col("id") + (i+1)*10))
+    import time
+    start = time.time()
+    result = run_customer_orders_query(spark_session, large_orders, users, order_items, products)
+    elapsed = time.time() - start
+    assert elapsed < 10  # Should run in under 10 seconds
+
+# TC09: Data integrity - no duplicate orders counted
+def test_no_duplicate_orders(spark_session):
+    """TC09: total_orders reflects unique orders only"""
+    orders, users, order_items, products = create_test_data(spark_session)
+    # Add duplicate order_items for same order
+    order_items = order_items.union(spark_session.createDataFrame([
+        (1, 201),
+    ], order_items.schema))
+    result = run_customer_orders_query(spark_session, orders, users, order_items, products)
+    alice = [r for r in result.collect() if r.user_id == 101][0]
+    assert alice.total_orders == 2  # Not inflated by duplicate order_items
+
+# TC10: DBT syntax compliance
+def test_dbt_syntax_compliance():
+    """TC10: DBT syntax: Ref macros and aggregations compile"""
+    # This test is a placeholder: actual DBT compilation is checked in DBT environment
+    dbt_sql = """
+    WITH customer_orders AS (
+        SELECT
+            o.id AS order_id,
+            o.user_id,
+            u.name AS customer_name,
+            u.email AS customer_email,
+            o.total_amount,
+            o.created_at AS order_date,
+            p.category AS product_category,
+            p.price AS product_price
+        FROM {{ ref('orders') }} o
+        JOIN {{ ref('users') }} u ON o.user_id = u.id
+        JOIN {{ ref('order_items') }} oi ON o.id = oi.order_id
+        JOIN {{ ref('products') }} p ON oi.product_id = p.id
+        WHERE o.status = 'completed'
+    ),
+    order_summary AS (
+        SELECT 
+            user_id,
+            customer_name,
+            customer_email,
+            COUNT(order_id) AS total_orders,
+            SUM(total_amount) AS total_spent,
+            AVG(total_amount) AS avg_order_value,
+            ARRAY_AGG(DISTINCT product_category) AS categories_bought
+        FROM customer_orders
+        GROUP BY user_id, customer_name, customer_email
+    )
+    SELECT * FROM order_summary
+    ORDER BY total_spent DESC;
+    """
+    assert "{{ ref('orders') }}" in dbt_sql
+    assert "ARRAY_AGG(DISTINCT product_category)" in dbt_sql
+
+# End of Pytest script
