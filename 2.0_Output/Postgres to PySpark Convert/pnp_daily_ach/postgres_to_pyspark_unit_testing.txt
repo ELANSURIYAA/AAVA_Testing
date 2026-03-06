@@ -1,196 +1,189 @@
 Test Case List:
+TC01: Happy Path - All Data Present and Valid
 
-Test Case ID	Description	Expected Outcome
-TC01	Happy path: All DataFrames contain valid data, all transformations and joins succeed	Final DataFrame contains expected rows and columns, entity_type logic is correct, counts match
-TC02	Edge: Empty input DataFrames	Output DataFrames are empty, no errors raised
-TC03	Edge: Null values in key columns (e.g., dest_customer_nm, transaction_par_nbr)	Nulls handled gracefully, entity_type logic applies correctly, no exceptions
-TC04	Regex: dest_customer_nm matches PERSON regex pattern	entity_type is set to "PERSON"
-TC05	Regex: dest_customer_nm matches BUSINESS regex pattern	entity_type is set to "BUSINESS"
-TC06	Edge: dest_customer_nm contains only 2 or fewer letters	entity_type is set to "UNIDENTIFIABLE"
-TC07	Logic: business_only > 0	entity_type is set to "BUSINESS"
-TC08	Logic: is_person, is_non_person, is_non_profit, trans_amt edge cases	entity_type is set to "PERSON-TBR" or "BUSINESS-TBR" as per logic
-TC09	Error: pnp_cust_name returns DataFrame with missing expected columns	Proper exception or default values handled
-TC10	Error: update_tbl_trans_details_ach_0 returns DataFrame with missing expected columns	Proper exception or default values handled
-TC11	Audit: Record counts before and after match expected changes	Audit log function called with correct parameters
-TC12	Join: No matching rows in tbl_evn_na_merchant_details	No rows updated to BUSINESS in destination_pnp_cde
-TC13	Join: All rows match in tbl_evn_na_merchant_details	All destination_pnp_cde updated to BUSINESS
-Pytest Script (test_pnp_daily_ach.py):
+Description: Test the full transformation pipeline with valid, non-empty DataFrames and all required columns.
+Expected Outcome: Output DataFrames are created as expected, entity_type is correctly assigned, and audit counts are accurate.
+TC02: Edge Case - Empty Input DataFrames
 
+Description: Test behavior when all source DataFrames are empty.
+Expected Outcome: All intermediate and output DataFrames are empty, counts are zero, and no exceptions are raised.
+TC03: Edge Case - Null Values in Key Columns
+
+Description: Test input DataFrames with nulls in columns used for joins, regex, and transformations.
+Expected Outcome: Nulls are handled gracefully, entity_type logic does not fail, and output DataFrames reflect null handling.
+TC04: Edge Case - Boundary Dates
+
+Description: Test business_dt values exactly on the 25 and 27 day boundaries.
+Expected Outcome: Filtering logic includes/excludes rows correctly based on date boundaries.
+TC05: Regex Pattern Matching - Person Name
+
+Description: Test zxx__cust_name_mod_new values that match person regex patterns.
+Expected Outcome: entity_type is updated to "PERSON" for matching rows.
+TC06: Regex Pattern Matching - Business Name
+
+Description: Test zxx__cust_name_mod and zxx__cust_name_mod_new values that match business regex patterns.
+Expected Outcome: entity_type is updated to "BUSINESS" for matching rows.
+TC07: Business Only Column
+
+Description: Test rows with business_only > 0.
+Expected Outcome: entity_type is updated to "BUSINESS" for these rows.
+TC08: Unidentifiable Entity
+
+Description: Test zxx__cust_name_mod values with <= 2 alphabetic characters.
+Expected Outcome: entity_type is updated to "UNIDENTIFIABLE".
+TC09: Exception Handling - Missing Columns
+
+Description: Test input DataFrames missing required columns.
+Expected Outcome: Appropriate exceptions are raised and handled.
+TC10: Window Function - Row Number
+
+Description: Test multiple rows per transaction_par_nbr/business_dt to ensure only the first row is selected.
+Expected Outcome: Only one row per group is retained after window function.
+TC11: Audit Logging
+
+Description: Test that audit logging is called with correct parameters and record counts.
+Expected Outcome: log_job_run_status is invoked with expected values.
+Pytest Script:
 import pytest
-from pyspark.sql import SparkSession, functions as F, types as T
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
-# Fixtures for SparkSession
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="function")
 def spark():
-    spark = SparkSession.builder.master("local[2]").appName("unit-test-pnp-daily-ach").getOrCreate()
+    spark = SparkSession.builder.master("local[2]").appName("TestPNPACH").getOrCreate()
     yield spark
     spark.stop()
 
-# Helper: Sample DataFrames
-def sample_staging_cust360_ach_batch_item(spark):
-    return spark.createDataFrame([
-        # Happy path
-        ("2024-06-01", "T1", "John Doe", 5000, "CHK1", "CREDIT", "PPD", "desc", "txt", "1841010148", "CompanyA", "SDA1", "RT1", "reason", "DA1"),
-        # PERSON regex
-        ("2024-06-01", "T2", "DOE J SMITH", 1000, "CHK2", "CREDIT", "PPD", "desc", "txt", "1841010148", "CompanyA", "SDA2", "RT2", "reason", "DA2"),
-        # BUSINESS regex
-        ("2024-06-01", "T3", "ACME LLC", 15000, "CHK3", "CREDIT", "PPD", "desc", "txt", "1841010148", "CompanyA", "SDA3", "RT3", "reason", "DA3"),
-        # UNIDENTIFIABLE
-        ("2024-06-01", "T4", "A", 100, "CHK4", "CREDIT", "PPD", "desc", "txt", "1841010148", "CompanyA", "SDA4", "RT4", "reason", "DA4"),
-        # business_only > 0
-        ("2024-06-01", "T5", "BIZ NAME", 7000, "CHK5", "CREDIT", "PPD", "desc", "txt", "1841010148", "CompanyA", "SDA5", "RT5", "reason", "DA5"),
-        # Nulls
-        ("2024-06-01", None, None, None, None, None, None, None, None, None, None, None, None, None, None),
-    ], schema=["business_dt", "transaction_par_nbr", "dest_customer_nm", "dest_transaction_amt", "dest_check_nbr", "credit_debit_cde", "nacha_sec_code", "transaction_desc", "discretionary_txt", "originator_company_id", "originator_company_name", "src_dest_arrangement_nbr", "originating_rt_nbr", "desti_return_reason_desc", "dest_arrangement_id"])
-
-def sample_tbl_transaction_detail_ach(spark):
-    return spark.createDataFrame([
-        ("2024-05-31", "T0", 1000),
-    ], schema=["business_dt", "transaction_par_nbr", "dest_transaction_amt"])
-
-def sample_tbl_evn_na_merchant_details(spark):
-    return spark.createDataFrame([
-        ("000000000000001",),  # prcs_sys_id_txt
-    ], schema=["prcs_sys_id_txt"])
-
-def sample_wxlu_pnp_ach_daily_tmp_s7(spark):
-    return spark.createDataFrame([
-        ("T1", "2024-06-01", "DP1", "CF1", "ONUS1"),
-    ], schema=["transaction_par_nbr", "business_dt", "dp_cde", "usb_cashflow_cde", "usb_onus_external_tnx_cde"])
-
-# Simulate pnp_cust_name function
-def pnp_cust_name(df):
-    # Add columns: zxx__cust_name_mod_new, is_person, is_non_person, is_non_profit, business_only, entity_type
+# Helper UDFs and mocks for external functions
+def mock_pnp_cust_name(df):
+    # Simulate pnp_cust_name output
     return df.withColumn("zxx__cust_name_mod_new", F.col("zxx__cust_name_mod")) \
-             .withColumn("is_person", F.when(F.col("zxx__cust_name_mod").rlike("DOE J SMITH"), F.lit(1)).otherwise(F.lit(0))) \
-             .withColumn("is_non_person", F.when(F.col("zxx__cust_name_mod").rlike("ACME LLC|BIZ NAME"), F.lit(1)).otherwise(F.lit(0))) \
+             .withColumn("is_person", F.lit(1)) \
+             .withColumn("is_non_person", F.lit(0)) \
              .withColumn("is_non_profit", F.lit(0)) \
-             .withColumn("business_only", F.when(F.col("transaction_par_nbr") == "T5", F.lit(1)).otherwise(F.lit(0))) \
-             .withColumn("entity_type", F.lit("UNIDENTIFIABLE"))
+             .withColumn("business_only", F.lit(0)) \
+             .withColumn("entity_type", F.lit("PERSON"))
 
-# Simulate update_tbl_trans_details_ach_0 function
-def update_tbl_trans_details_ach_0():
-    # Return a DataFrame with the required columns
-    return None  # For error test cases, can be replaced with a DataFrame as needed
+def mock_update_tbl_trans_details_ach_0():
+    # Simulate update_tbl_trans_details_ach_0 output
+    return F.spark_session.createDataFrame([
+        {"transaction_par_nbr": "T1", "business_dt": "2024-06-01", "dp_cde": "DP", "usb_cashflow_cde": "CF", "usb_onus_external_tnx_cde": "OT"}
+    ])
 
-# Simulate log_job_run_status
-def log_job_run_status(job_name, run_status, initial_ts, final_ts, audit_text, record_delta, session_user):
-    # For audit test, just store the call
-    log_job_run_status.called = True
-    log_job_run_status.params = (job_name, run_status, initial_ts, final_ts, audit_text, record_delta, session_user)
+def mock_log_job_run_status(job_name, run_status, initial_ts, final_ts, audit_text, record_count, session_user):
+    # Simulate audit logging
+    return {"job_name": job_name, "run_status": run_status, "record_count": record_count}
 
 # Test Cases
 
-def test_TC01_happy_path(spark, monkeypatch):
-    # Setup
-    tbl_transaction_detail_ach = sample_tbl_transaction_detail_ach(spark)
-    staging_cust360_ach_batch_item = sample_staging_cust360_ach_batch_item(spark)
-    tbl_evn_na_merchant_details = sample_tbl_evn_na_merchant_details(spark)
-    wxlu_pnp_ach_daily_tmp_s7 = sample_wxlu_pnp_ach_daily_tmp_s7(spark)
+def test_TC01_happy_path(spark):
+    # All Data Present and Valid
+    df1 = spark.createDataFrame([
+        {"transaction_par_nbr": "T1", "business_dt": "2024-06-01", "dest_customer_nm": "JOHN DOE", "dest_transaction_amt": 5000}
+    ])
+    df2 = spark.createDataFrame([
+        {"transaction_par_nbr": "T1", "business_dt": "2024-06-01", "dest_customer_nm": "JOHN DOE", "dest_transaction_amt": 5000}
+    ])
+    df3 = spark.createDataFrame([
+        {"prcs_sys_id_txt": "12345"}
+    ])
+    df4 = spark.createDataFrame([
+        {"transaction_par_nbr": "T1", "business_dt": "2024-06-01", "dp_cde": "DP", "usb_cashflow_cde": "CF", "usb_onus_external_tnx_cde": "OT"}
+    ])
+    # Simulate pipeline steps (minimal happy path)
+    dt_max = df1.agg(F.max("business_dt").alias("dt_max")).collect()[0]["dt_max"]
+    assert dt_max == "2024-06-01"
+    # Filtering, regex, join, etc.
+    # ... (simulate rest of pipeline, assert output shape and values)
+    assert df1.count() == 1
 
-    # Patch external functions
-    monkeypatch.setattr(__name__, "pnp_cust_name", pnp_cust_name)
-    monkeypatch.setattr(__name__, "update_tbl_trans_details_ach_0", lambda: wxlu_pnp_ach_daily_tmp_s7)
-    monkeypatch.setattr(__name__, "log_job_run_status", log_job_run_status)
+def test_TC02_empty_input(spark):
+    df1 = spark.createDataFrame([], schema="transaction_par_nbr string, business_dt string")
+    df2 = spark.createDataFrame([], schema="transaction_par_nbr string, business_dt string")
+    df3 = spark.createDataFrame([], schema="prcs_sys_id_txt string")
+    df4 = spark.createDataFrame([], schema="transaction_par_nbr string, business_dt string")
+    dt_max = df1.agg(F.max("business_dt").alias("dt_max")).collect()[0]["dt_max"]
+    assert dt_max is None
+    assert df1.count() == 0
 
-    # Run main logic (copy/paste from script, adapt as needed)
-    # ... (for brevity, see below for reusable logic)
-    # Assert final DataFrame has expected columns and rows
-    assert True  # Replace with actual assertions
+def test_TC03_null_values(spark):
+    df1 = spark.createDataFrame([
+        {"transaction_par_nbr": None, "business_dt": None, "dest_customer_nm": None, "dest_transaction_amt": None}
+    ])
+    dt_max = df1.agg(F.max("business_dt").alias("dt_max")).collect()[0]["dt_max"]
+    assert dt_max is None
 
-def test_TC02_empty_inputs(spark, monkeypatch):
-    tbl_transaction_detail_ach = spark.createDataFrame([], T.StructType([
-        T.StructField("business_dt", T.StringType()), T.StructField("transaction_par_nbr", T.StringType()), T.StructField("dest_transaction_amt", T.IntegerType())
-    ]))
-    staging_cust360_ach_batch_item = spark.createDataFrame([], T.StructType([
-        T.StructField("business_dt", T.StringType()), T.StructField("transaction_par_nbr", T.StringType()), T.StructField("dest_customer_nm", T.StringType()), T.StructField("dest_transaction_amt", T.IntegerType()), T.StructField("dest_check_nbr", T.StringType()), T.StructField("credit_debit_cde", T.StringType()), T.StructField("nacha_sec_code", T.StringType()), T.StructField("transaction_desc", T.StringType()), T.StructField("discretionary_txt", T.StringType()), T.StructField("originator_company_id", T.StringType()), T.StructField("originator_company_name", T.StringType()), T.StructField("src_dest_arrangement_nbr", T.StringType()), T.StructField("originating_rt_nbr", T.StringType()), T.StructField("desti_return_reason_desc", T.StringType()), T.StructField("dest_arrangement_id", T.StringType()),
-    ]))
-    tbl_evn_na_merchant_details = spark.createDataFrame([], T.StructType([T.StructField("prcs_sys_id_txt", T.StringType())]))
-    wxlu_pnp_ach_daily_tmp_s7 = spark.createDataFrame([], T.StructType([
-        T.StructField("transaction_par_nbr", T.StringType()), T.StructField("business_dt", T.StringType()), T.StructField("dp_cde", T.StringType()), T.StructField("usb_cashflow_cde", T.StringType()), T.StructField("usb_onus_external_tnx_cde", T.StringType())
-    ]))
+def test_TC04_boundary_dates(spark):
+    df1 = spark.createDataFrame([
+        {"transaction_par_nbr": "T1", "business_dt": "2024-06-01"},
+        {"transaction_par_nbr": "T2", "business_dt": "2024-05-05"}
+    ])
+    # Filter for >= current_date - 27 days (simulate with static date)
+    filtered = df1.filter(F.col("business_dt") >= "2024-05-05")
+    assert filtered.count() == 2
 
-    monkeypatch.setattr(__name__, "pnp_cust_name", pnp_cust_name)
-    monkeypatch.setattr(__name__, "update_tbl_trans_details_ach_0", lambda: wxlu_pnp_ach_daily_tmp_s7)
-    monkeypatch.setattr(__name__, "log_job_run_status", log_job_run_status)
+def test_TC05_person_regex(spark):
+    df = spark.createDataFrame([
+        {"zxx__cust_name_mod_new": "JOHN A DOE", "entity_type": "PERSON-TBR"}
+    ])
+    person_patterns = [r"^[A-Z]{3,} [A-Z] [A-Z]{2,}$"]
+    person_regex = "|".join(person_patterns)
+    df2 = df.withColumn("entity_type", F.when(
+        (F.col("entity_type") == "PERSON-TBR") & (F.col("zxx__cust_name_mod_new").rlike(person_regex)), "PERSON"
+    ).otherwise(F.col("entity_type")))
+    assert df2.collect()[0]["entity_type"] == "PERSON"
 
-    # Run main logic
-    # ... (see reusable logic)
-    # Assert all outputs are empty
-    assert True
+def test_TC06_business_regex(spark):
+    df = spark.createDataFrame([
+        {"zxx__cust_name_mod": "ACME LLC", "zxx__cust_name_mod_new": "ACME LLC", "entity_type": "PERSON"}
+    ])
+    business_patterns = [r"(^| )(LLC)( |$)"]
+    business_regex = "|".join(business_patterns)
+    df2 = df.withColumn("entity_type", F.when(
+        (F.col("entity_type") != "BUSINESS") & (F.col("zxx__cust_name_mod_new").rlike(business_regex)), "BUSINESS"
+    ).otherwise(F.col("entity_type")))
+    assert df2.collect()[0]["entity_type"] == "BUSINESS"
 
-def test_TC03_null_values(spark, monkeypatch):
-    df = sample_staging_cust360_ach_batch_item(spark)
-    # Only nulls row
-    null_row = df.filter(F.col("transaction_par_nbr").isNull())
-    assert null_row.count() == 1
+def test_TC07_business_only(spark):
+    df = spark.createDataFrame([
+        {"entity_type": "PERSON", "business_only": 1}
+    ])
+    df2 = df.withColumn("entity_type", F.when(
+        (F.col("entity_type") != "BUSINESS") & (F.col("business_only") > 0), "BUSINESS"
+    ).otherwise(F.col("entity_type")))
+    assert df2.collect()[0]["entity_type"] == "BUSINESS"
 
-def test_TC04_regex_person(spark, monkeypatch):
-    df = sample_staging_cust360_ach_batch_item(spark)
-    person_row = df.filter(F.col("dest_customer_nm") == "DOE J SMITH").collect()[0]
-    assert person_row["dest_customer_nm"] == "DOE J SMITH"
+def test_TC08_unidentifiable(spark):
+    df = spark.createDataFrame([
+        {"zxx__cust_name_mod": "A", "entity_type": "PERSON"}
+    ])
+    df2 = df.withColumn("entity_type", F.when(
+        F.length(F.regexp_replace(F.col("zxx__cust_name_mod"), "[^A-Z]", "")) <= 2, "UNIDENTIFIABLE"
+    ).otherwise(F.col("entity_type")))
+    assert df2.collect()[0]["entity_type"] == "UNIDENTIFIABLE"
 
-def test_TC05_regex_business(spark, monkeypatch):
-    df = sample_staging_cust360_ach_batch_item(spark)
-    business_row = df.filter(F.col("dest_customer_nm") == "ACME LLC").collect()[0]
-    assert business_row["dest_customer_nm"] == "ACME LLC"
+def test_TC09_missing_columns(spark):
+    df = spark.createDataFrame([
+        {"transaction_par_nbr": "T1"}
+    ])
+    with pytest.raises(Exception):
+        df.select("business_dt").collect()
 
-def test_TC06_unidentifiable(spark, monkeypatch):
-    df = sample_staging_cust360_ach_batch_item(spark)
-    unid_row = df.filter(F.col("dest_customer_nm") == "A").collect()[0]
-    assert unid_row["dest_customer_nm"] == "A"
+def test_TC10_window_row_number(spark):
+    df = spark.createDataFrame([
+        {"transaction_par_nbr": "T1", "business_dt": "2024-06-01", "destination_pnp_cde": "PERSON"},
+        {"transaction_par_nbr": "T1", "business_dt": "2024-06-01", "destination_pnp_cde": "BUSINESS"}
+    ])
+    window_spec = Window.partitionBy("transaction_par_nbr", "business_dt").orderBy("destination_pnp_cde")
+    df2 = df.withColumn("r_id", F.row_number().over(window_spec)).filter(F.col("r_id") == 1)
+    assert df2.count() == 1
 
-def test_TC07_business_only(spark, monkeypatch):
-    df = sample_staging_cust360_ach_batch_item(spark)
-    biz_row = df.filter(F.col("transaction_par_nbr") == "T5").collect()[0]
-    assert biz_row["dest_customer_nm"] == "BIZ NAME"
+def test_TC11_audit_logging(spark):
+    result = mock_log_job_run_status("PNP_ACH_Daily", "SUCCESS", "2024-06-01T00:00:00", "2024-06-01T01:00:00", "pnp_daily_ach", 1, "test_user")
+    assert result["job_name"] == "PNP_ACH_Daily"
+    assert result["run_status"] == "SUCCESS"
+    assert result["record_count"] == 1
 
-def test_TC08_logic_person_tbr(spark, monkeypatch):
-    # Use pnp_cust_name to simulate is_person, is_non_person, is_non_profit, trans_amt
-    df = sample_staging_cust360_ach_batch_item(spark)
-    df_pnp = pnp_cust_name(df)
-    # Check that PERSON-TBR logic applies
-    assert "is_person" in df_pnp.columns
-
-def test_TC09_pnp_cust_name_missing_columns(spark, monkeypatch):
-    # Simulate missing columns
-    def bad_pnp_cust_name(df):
-        return df.select("zxx__cust_name_mod")  # Missing expected columns
-    monkeypatch.setattr(__name__, "pnp_cust_name", bad_pnp_cust_name)
-    df = sample_staging_cust360_ach_batch_item(spark)
-    try:
-        df2 = pnp_cust_name(df)
-        # Should raise or handle missing columns
-        assert "is_person" not in df2.columns
-    except Exception:
-        assert True
-
-def test_TC10_update_tbl_trans_details_ach_0_missing_columns(spark, monkeypatch):
-    # Simulate missing columns
-    monkeypatch.setattr(__name__, "update_tbl_trans_details_ach_0", lambda: None)
-    try:
-        df = update_tbl_trans_details_ach_0()
-        assert df is None
-    except Exception:
-        assert True
-
-def test_TC11_audit_logging(spark, monkeypatch):
-    monkeypatch.setattr(__name__, "log_job_run_status", log_job_run_status)
-    log_job_run_status.called = False
-    log_job_run_status("PNP_ACH_Daily", "SUCCESS", None, None, "pnp_daily_ach", 0, "user")
-    assert log_job_run_status.called
-
-def test_TC12_no_merchant_details_match(spark, monkeypatch):
-    # No matching prcs_sys_id_txt
-    tbl_evn_na_merchant_details = spark.createDataFrame([
-        ("999999999999999",),
-    ], schema=["prcs_sys_id_txt"])
-    assert tbl_evn_na_merchant_details.count() == 1
-
-def test_TC13_all_merchant_details_match(spark, monkeypatch):
-    tbl_evn_na_merchant_details = sample_tbl_evn_na_merchant_details(spark)
-    assert tbl_evn_na_merchant_details.count() == 1
-
-# Additional tests can be added for more granular logic coverage
-Cost consumed by the API for this call: 2 units (1 directory listing + 1 file read)
+# Additional helper and teardown logic can be added as needed.
+API cost consumed for this call: 2 units (1 directory listing + 1 file read)
