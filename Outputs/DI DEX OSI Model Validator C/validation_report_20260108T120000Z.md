@@ -2,10 +2,10 @@
 
 | Metric | Score (%) |
 |---------|-----------|
-| Overall Validation Score | 96.67 |
-| Accuracy Score | 95.00 |
-| Efficiency Score | 95.00 |
-| Completeness Score | 100.00 |
+| Overall Validation Score | 95.83 |
+| Accuracy Score | 100.0 |
+| Efficiency Score | 87.5 |
+| Completeness Score | 100.0 |
 | Overall Status | PASS |
 
 ---
@@ -14,7 +14,6 @@
 
 | Severity | Area | Issue | Recommendation |
 |----------|------|-------|-----------------|
-| (No issues found) | All Required Elements Present | All tables from the Data Glossary have corresponding datasets in the Semantic Model. All columns have business terms, descriptions, and types. All datasets have descriptions and business names. All relationships are documented with proper join conditions. All metrics reference existing columns. | Continue maintaining comprehensive documentation standards. |
 
 ---
 
@@ -22,9 +21,6 @@
 
 | Severity | Area | Issue | Recommendation |
 |----------|------|-------|-----------------|
-| Low | Type Consistency | The Data Glossary shows 'serial' type for auto-increment primary keys, while the Semantic Model uses 'serial' consistently. Both are aligned and accurate for PostgreSQL. | No action required - types are consistent. |
-| Medium | Relationship Cardinality | The Semantic Model documents 'orders_to_exchange_rates_asof' as an as-of temporal join, which is correctly described but the Data Glossary does not explicitly document this temporal relationship pattern in the EXCHANGE_RATES table description. | Consider adding explicit temporal join pattern documentation in the Data Glossary for EXCHANGE_RATES to match the Semantic Model's detailed as-of join guidance. |
-| Low | Business Definition Alignment | The Semantic Model's ai_context provides extensive guidance on double-counting prevention (e.g., "NEVER sum orders.total_amount_usd after joining orders to order_items"), but the Data Glossary does not include these critical usage warnings in column descriptions. | Enhance Data Glossary column descriptions to include usage warnings for aggregation-sensitive fields like total_amount_usd and total_cost_usd. |
 
 ---
 
@@ -32,6 +28,7 @@
 
 | Severity | Area | Issue | Recommendation |
 |----------|------|-------|-----------------|
-| Low | Documentation Redundancy | The Data Glossary repeats the phrase "Contains schema metadata, system-level attributes, and attribute definitions associated with the [table] dataset to support indexing and lookup" for CAMPAIGNS, CUSTOMER_ACCOUNT_MANAGERS, EXCHANGE_RATES, SHIPMENTS, STORES, and SUPPLIERS tables. This generic description provides limited business value. | Replace generic table descriptions with specific business context descriptions that explain the table's role in business processes, similar to the detailed descriptions in CUSTOMERS, ORDERS, and PRODUCTS tables. |
-| Medium | Metric Reusability | The Semantic Model defines separate metrics for 'product_revenue_rank' and 'customer_revenue_rank' using nearly identical DENSE_RANK logic. These could be generalized into a parameterized ranking pattern. | Consider creating a reusable ranking metric pattern or template that accepts entity type and measure as parameters to reduce code duplication. |
-| Low | Relationship Documentation | The Semantic Model documents 15 relationships with detailed resolution text. Some resolution descriptions repeat similar patterns (e.g., "Standard foreign key relationship linking..."). | Consider creating a standardized relationship documentation template with placeholders to reduce verbosity while maintaining clarity. |
+| Low | Metric Definitions | Multiple metrics compute similar aggregations with minor variations (e.g., total_revenue_usd, monthly_revenue_usd, running_total_revenue_usd all aggregate orders.total_amount_usd with different grouping/windowing) | Consider creating a base revenue CTE or view that can be reused across multiple metric definitions to reduce redundancy and improve maintainability |
+| Low | Metric Definitions | Repeated CASE WHEN division-by-zero protection logic appears in multiple metrics (gross_margin_pct, average_order_value_usd, revenue_per_customer_usd, orders_per_customer, average_selling_price_usd, average_discount_pct, on_time_delivery_pct, return_rate_pct, revenue_growth_mom_pct) | Consider creating a reusable SQL function or macro for safe division operations to eliminate code duplication and ensure consistent error handling across all metrics |
+| Low | Documentation | The ai_context instructions section contains extensive grain warnings and relationship guidance that is repeated in individual dataset and relationship descriptions, creating documentation redundancy | Consolidate grain warnings and relationship patterns into a single authoritative section, then reference that section from individual dataset/relationship descriptions to maintain a single source of truth |
+| Low | Relationship Definitions | Standard many-to-one foreign key relationships (orders_to_customers, orders_to_stores, order_items_to_orders, etc.) all contain similar boilerplate resolution text explaining the join pattern | Create a relationship type template or reference pattern for standard FK relationships to reduce repetitive documentation while maintaining clarity |
